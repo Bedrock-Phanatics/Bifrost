@@ -11,10 +11,13 @@ pub fn millis(ms: i64) std.Io.Timeout {
 
 pub const kick = "\xfekick";
 
-/// Echoes payloads, closes the session on `kick`, and greets new sessions if set.
+/// Answers with `replies` in order, then echoes. Closes the session on `kick`.
 pub const EchoBackend = struct {
     listener: *raknet.Server,
     greeting: ?[]const u8 = null,
+    replies: []const []const u8 = &.{},
+    replied: usize = 0,
+    received: std.atomic.Value(u32) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
     connects: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
@@ -45,9 +48,16 @@ pub const EchoBackend = struct {
         if (self.greeting) |greeting| session.send(greeting, .reliable_ordered, 0) catch return error.ApplicationFailure;
     }
 
-    fn onMessage(_: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
+    fn onMessage(context: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
+        const self: *EchoBackend = @ptrCast(@alignCast(context));
+        _ = self.received.fetchAdd(1, .release);
         if (std.mem.eql(u8, payload.bytes, kick)) return session.close();
-        session.send(payload.bytes, .reliable_ordered, 0) catch return error.ApplicationFailure;
+        var reply = payload.bytes;
+        if (self.replied < self.replies.len) {
+            reply = self.replies[self.replied];
+            self.replied += 1;
+        }
+        session.send(reply, .reliable_ordered, 0) catch return error.ApplicationFailure;
     }
 
     fn onDisconnected(context: *anyopaque, _: *raknet.Session) void {

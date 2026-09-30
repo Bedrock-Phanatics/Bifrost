@@ -77,6 +77,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
     var config: Config = .{};
     try readRoot(&config, &parsed.value, diag);
     if (config.backend_count == 0) return fail(diag, .{ .section = "backend" }, "at least one [[backend]] is required", .{});
+    if (config.auth == .verify and config.keysFile() == null)
+        return fail(diag, .{ .section = "auth", .name = "keys_file" }, "is required when mode = \"verify\"", .{});
     return config;
 }
 
@@ -90,6 +92,8 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
             try readServer(config, try table(diag, key, value), diag);
         } else if (eql(name, "limits")) {
             try readLimits(config, try table(diag, key, value), diag);
+        } else if (eql(name, "auth")) {
+            try readAuth(config, try table(diag, key, value), diag);
         } else if (eql(name, "backend")) {
             if (value != .array) return fail(diag, key, "expected [[backend]] tables", .{});
             for (value.array.items, 0..) |item, i| {
@@ -126,6 +130,22 @@ fn readLimits(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
             config.pending_packets = try integer(u32, diag, key, value, 1, 4096);
         } else if (eql(key.name.?, "pending_bytes")) {
             config.pending_bytes = try integer(u32, diag, key, value, 1, 64 * 1024 * 1024);
+        } else return fail(diag, key, "unknown key", .{});
+    }
+}
+
+fn readAuth(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "auth", .name = entry.key_ptr.* };
+        const value = entry.value_ptr.*;
+        if (eql(key.name.?, "mode")) {
+            const text = try string(diag, key, value);
+            config.auth = std.meta.stringToEnum(Config.Auth, text) orelse
+                return fail(diag, key, "expected \"off\" or \"verify\", got \"{s}\"", .{text});
+        } else if (eql(key.name.?, "keys_file")) {
+            config.setKeysFile(try string(diag, key, value)) catch
+                return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len});
         } else return fail(diag, key, "unknown key", .{});
     }
 }
@@ -250,6 +270,17 @@ test "invalid values name the offending key" {
     try expectInvalid("[[backend]]\naddress = \"127.0.0.1:1\"\nweight = 1\n", "backend[0].weight: unknown key");
     try expectInvalid(backend ++ backend, "backend[1].address: duplicates an earlier backend");
     try expectInvalid("backend = \"127.0.0.1:1\"\n", "backend: expected [[backend]] tables");
+    try expectInvalid("[auth]\nmode = \"strict\"\n" ++ backend, "auth.mode: expected \"off\" or \"verify\", got \"strict\"");
+    try expectInvalid("[auth]\nmode = \"verify\"\n" ++ backend, "auth.keys_file: is required when mode = \"verify\"");
+}
+
+test "auth section reads mode and keys file" {
+    var diag: Diagnostic = .{};
+    const config = try parse(std.testing.allocator, "[auth]\nmode = \"verify\"\nkeys_file = \"keys.json\"\n[[backend]]\naddress = \"127.0.0.1:1\"\n", &diag);
+    try std.testing.expectEqual(Config.Auth.verify, config.auth);
+    try std.testing.expectEqualStrings("keys.json", config.keysFile().?);
+    const defaults = try parse(std.testing.allocator, "[[backend]]\naddress = \"127.0.0.1:1\"\n", &diag);
+    try std.testing.expectEqual(Config.Auth.off, defaults.auth);
 }
 
 test "loadFile reports missing and oversized files" {

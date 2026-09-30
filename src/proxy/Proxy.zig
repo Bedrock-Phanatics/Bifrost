@@ -2,9 +2,11 @@
 
 const std = @import("std");
 const raknet = @import("raknet");
+const bedwire = @import("bedwire");
 const Config = @import("../config/Config.zig");
 const Router = @import("../backend/Router.zig");
 const Watch = @import("../net/watch.zig").Watch;
+const Observer = @import("../protocol/Observer.zig");
 const Link = @import("Link.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -20,6 +22,8 @@ config: Config,
 router: Router,
 listener: *raknet.Server,
 scheduler: Scheduler,
+observer_pool: bedwire.BufferPool,
+env: Link.Env,
 links: std.DoublyLinkedList = .{},
 by_session: std.AutoHashMapUnmanaged(*raknet.Session, *Link) = .empty,
 listener_watch: Watch(raknet.Server) = .{},
@@ -28,7 +32,7 @@ listener_failures: u8 = 0,
 stop_requested: std.atomic.Value(bool) = .init(false),
 stats: Stats = .{},
 
-pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config) !*Proxy {
+pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer.Auth) !*Proxy {
     try config.validate();
     const self = try gpa.create(Proxy);
     errdefer gpa.destroy(self);
@@ -39,6 +43,10 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config) !*Proxy {
         .advertisement = config.motd(),
         .config = raknet_config,
     });
+    errdefer listener.destroy();
+    var observer_pool = try Observer.initPool(gpa);
+    errdefer observer_pool.deinit();
+
     self.* = .{
         .gpa = gpa,
         .io = io,
@@ -46,13 +54,26 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config) !*Proxy {
         .router = undefined,
         .listener = listener,
         .scheduler = .{ .io = io },
+        .observer_pool = observer_pool,
+        .env = undefined,
     };
     self.router = .init(self.config.backends());
+    self.env = .{
+        .gpa = gpa,
+        .io = io,
+        .stats = &self.stats,
+        .scheduler = &self.scheduler,
+        .observer_pool = &self.observer_pool,
+        .auth = auth,
+        .pending_packets = config.pending_packets,
+        .pending_bytes = config.pending_bytes,
+    };
     return self;
 }
 
 pub fn destroy(self: *Proxy) void {
     self.closeAll();
+    self.observer_pool.deinit();
     self.listener.destroy();
     self.gpa.destroy(self);
 }
@@ -134,8 +155,7 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
 
 fn accept(self: *Proxy, session: *raknet.Session) !void {
     try self.by_session.ensureUnusedCapacity(self.gpa, 1);
-    const pending: @FieldType(Link, "pending") = .init(self.config.pending_packets, self.config.pending_bytes);
-    const link = try Link.create(self.gpa, self.io, &self.stats, &self.scheduler, session, pending);
+    const link = try Link.create(&self.env, session);
     errdefer link.destroy();
 
     try link.startDial(self.router.pick(), .{ .handshake_timeout_ms = self.config.connect_timeout_ms });

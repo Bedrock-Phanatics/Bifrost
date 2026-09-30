@@ -42,7 +42,7 @@ fn wakeOnly(context: *anyopaque) void {
 
 fn notifyLink(context: *anyopaque) void {
     const link: *Link = @ptrCast(@alignCast(context));
-    const self = link.scheduler;
+    const self = link.env.scheduler;
     self.schedule(link);
     self.wake.set(self.io);
 }

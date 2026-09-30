@@ -12,6 +12,13 @@ connect_timeout_ms = 5000
 pending_packets = 64
 pending_bytes = 1048576
 
+[auth]
+# "off" relays any login. "verify" rejects players whose Xbox login doesn't
+# verify, which needs Microsoft's signing keys saved locally from
+# https://authorization.franchise.minecraft-services.net/.well-known/keys
+mode = "off"
+# keys_file = "minecraft-keys.json"
+
 # Players are spread round-robin across backends
 [[backend]]
 address = "127.0.0.1:19133"

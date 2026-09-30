@@ -32,7 +32,7 @@ fn relayScenario(io: std.Io) !void {
         backend_task.await(io);
     }
 
-    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()));
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()), .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
     defer {
@@ -67,7 +67,7 @@ test "closes the player when the backend is unreachable" {
     const silent = try loopback.bind(io, .{ .mode = .dgram, .protocol = .udp });
     defer silent.close(io);
 
-    const proxy = try Proxy.create(gpa, io, try testConfig(silent.address));
+    const proxy = try Proxy.create(gpa, io, try testConfig(silent.address), .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
     defer {
@@ -96,7 +96,7 @@ test "stop cancels in-flight dials and frees every link" {
 
     var config = try testConfig(silent.address);
     config.connect_timeout_ms = 60_000;
-    const proxy = try Proxy.create(gpa, io, config);
+    const proxy = try Proxy.create(gpa, io, config, .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
 
@@ -119,7 +119,7 @@ test "stop cancels in-flight dials and frees every link" {
 test "stop is safe before run and destroy is idempotent with it" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const proxy = try Proxy.create(gpa, threaded.io(), try testConfig(loopback));
+    const proxy = try Proxy.create(gpa, threaded.io(), try testConfig(loopback), .off);
     proxy.stop();
     proxy.run();
     proxy.destroy();
@@ -147,7 +147,7 @@ test "backend disconnect closes the player" {
         backend_task.await(io);
     }
 
-    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()));
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()), .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
     defer {
@@ -180,7 +180,7 @@ test "stop with live links disconnects both sides" {
         backend_task.await(io);
     }
 
-    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()));
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()), .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
 
@@ -210,7 +210,7 @@ test "backend traffic reaches an idle player" {
         backend_task.await(io);
     }
 
-    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()));
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()), .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
     defer {
@@ -241,7 +241,7 @@ test "players are spread round-robin across backends" {
 
     var config = try testConfig(backends[0].address());
     try config.addBackend(backends[1].address());
-    const proxy = try Proxy.create(gpa, io, config);
+    const proxy = try Proxy.create(gpa, io, config, .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
     defer {
@@ -266,7 +266,7 @@ test "a player leaving mid-connect frees its link once the dial ends" {
 
     var config = try testConfig(silent.address);
     config.connect_timeout_ms = 500;
-    const proxy = try Proxy.create(gpa, io, config);
+    const proxy = try Proxy.create(gpa, io, config, .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
 
@@ -285,7 +285,7 @@ test "create cleans up after allocation failures" {
     defer threaded.deinit();
     try std.testing.checkAllAllocationFailures(gpa, struct {
         fn run(allocator: std.mem.Allocator, io: std.Io) !void {
-            const proxy = try Proxy.create(allocator, io, try testConfig(loopback));
+            const proxy = try Proxy.create(allocator, io, try testConfig(loopback), .off);
             proxy.destroy();
         }
     }.run, .{threaded.io()});
@@ -306,7 +306,7 @@ test "many players relay while others come and go" {
 
     var config = try testConfig(backend.address());
     config.max_players = 64;
-    const proxy = try Proxy.create(gpa, io, config);
+    const proxy = try Proxy.create(gpa, io, config, .off);
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
     defer {
@@ -327,4 +327,8 @@ test "many players relay while others come and go" {
     }
     try waitFor(io, &backend.disconnects, @intCast(players.len - alive));
     for (players[0..alive]) |*player| try player.roundTrip("\xfestill here");
+}
+
+test {
+    _ = @import("handshake.zig");
 }

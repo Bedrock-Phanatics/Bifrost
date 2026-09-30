@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zig_raknet = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig#57099812370085073d1e97a97ae2e1e3fcfc6635",
-            .hash = "zig_raknet-0.3.2-1HPoUzaxCgBnN0OHNwXBUIDbI0rNpGYOv7YEwaWBicfs",
+            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig#f1391ac9c70996787af969a2f6305c6dfe607bf0",
+            .hash = "zig_raknet-0.3.2-1HPoU2DCCgDeBYRc6BppdlyXcC2t4vDc2QVA0KwnVoc3",
         },
         .bedwire = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#4c48faedc18953850a64f2da6b9c26080b602032",
-            .hash = "bedwire-0.1.0-6vrYrXXMBQD20sadrZPOyZrOECzKWbLqLXu8vOYSN5Bn",
+            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#b0c6fa55d0d5ce4576f5a1604423c959e40e4f00",
+            .hash = "bedwire-0.2.0-6vrYrbYQBgDIb-BhraLaaldIOcasjgxPMLmZhtxRNFCV",
         },
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",

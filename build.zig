@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const raknet = dependencyModule(b, "zig_raknet", "raknet", target, optimize);
     const zio = dependencyModule(b, "zio", "zio", target, optimize);
+    const bedwire_module = dependencyModule(b, "bedwire", "bedwire", target, optimize);
 
     const bifrost = b.addModule("bifrost", .{
         .root_source_file = b.path("src/root.zig"),
@@ -18,7 +19,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "raknet", .module = raknet },
             .{ .name = "toml", .module = dependencyModule(b, "toml", "toml", target, optimize) },
-            .{ .name = "bedwire", .module = dependencyModule(b, "bedwire", "bedwire", target, optimize) },
+            .{ .name = "bedwire", .module = bedwire_module },
         },
     });
 
@@ -46,6 +47,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "bifrost", .module = bifrost },
             .{ .name = "raknet", .module = raknet },
+            .{ .name = "bedwire", .module = bedwire_module },
             .{ .name = "zio", .module = zio },
         },
     }) });

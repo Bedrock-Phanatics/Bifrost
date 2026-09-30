@@ -32,10 +32,20 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    var keys: ?bifrost.KeySet = if (config.keysFile()) |keys_path| bifrost.loadKeys(init.gpa, init.io, keys_path) catch |err| {
+        log.err("{s}: {t}", .{ keys_path, err });
+        std.process.exit(1);
+    } else null;
+    defer if (keys) |*set| set.deinit();
+    const auth: bifrost.Auth = switch (config.auth) {
+        .off => .off,
+        .verify => .{ .verify = &keys.? },
+    };
+
     const rt = try zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
 
-    const proxy = try bifrost.Proxy.create(init.gpa, rt.io(), config);
+    const proxy = try bifrost.Proxy.create(init.gpa, rt.io(), config, auth);
     defer proxy.destroy();
 
     var signals = try rt.spawn(stopOnSignal, .{proxy});
