@@ -290,3 +290,41 @@ test "create cleans up after allocation failures" {
         }
     }.run, .{threaded.io()});
 }
+
+test "many players relay while others come and go" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var backend: EchoBackend = try .start(io);
+    defer backend.listener.destroy();
+    var backend_task = try io.concurrent(EchoBackend.run, .{&backend});
+    defer {
+        backend.stop.store(true, .release);
+        backend_task.await(io);
+    }
+
+    var config = try testConfig(backend.address());
+    config.max_players = 64;
+    const proxy = try Proxy.create(gpa, io, config);
+    defer proxy.destroy();
+    var proxy_task = try io.concurrent(Proxy.run, .{proxy});
+    defer {
+        proxy.stop();
+        proxy_task.await(io);
+    }
+
+    var players: [24]Player = undefined;
+    for (&players) |*player| player.* = try .connect(io, proxy);
+    var alive: usize = players.len;
+    defer for (players[0..alive]) |*player| player.deinit();
+
+    for (0..3) |_| {
+        for (players[0..alive]) |*player| try player.roundTrip("\xfehello");
+        const leaving = alive / 3;
+        for (players[alive - leaving .. alive]) |*player| player.deinit();
+        alive -= leaving;
+    }
+    try waitFor(io, &backend.disconnects, @intCast(players.len - alive));
+    for (players[0..alive]) |*player| try player.roundTrip("\xfestill here");
+}

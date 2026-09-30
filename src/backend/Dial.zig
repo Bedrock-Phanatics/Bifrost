@@ -1,5 +1,6 @@
 const std = @import("std");
 const raknet = @import("raknet");
+const Notify = @import("../net/watch.zig").Notify;
 
 const Dial = @This();
 
@@ -8,10 +9,10 @@ pub const ConnectError = @typeInfo(@typeInfo(@TypeOf(raknet.Client.connect)).@"f
 done: std.atomic.Value(bool) = .init(false),
 result: ConnectError!*raknet.Client = undefined,
 
-pub fn run(self: *Dial, gpa: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, options: raknet.ClientOptions, wake: *std.Io.Event) void {
+pub fn run(self: *Dial, gpa: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, options: raknet.ClientOptions, notify: Notify) void {
     self.result = raknet.Client.connect(gpa, io, address, options);
     self.done.store(true, .release);
-    wake.set(io);
+    notify.send();
 }
 
 pub fn finished(self: *const Dial) ?(ConnectError!*raknet.Client) {

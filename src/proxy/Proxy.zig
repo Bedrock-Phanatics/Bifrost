@@ -1,12 +1,12 @@
-//! Only the `run` task touches raknet objects; other tasks talk to it through atomics and `wake`.
+//! Only the `run` task touches raknet objects; other tasks reach it through the scheduler.
 
 const std = @import("std");
 const raknet = @import("raknet");
 const Config = @import("../config/Config.zig");
-const Dial = @import("../backend/Dial.zig");
 const Router = @import("../backend/Router.zig");
 const Watch = @import("../net/watch.zig").Watch;
 const Link = @import("Link.zig");
+const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
 
 const Proxy = @This();
@@ -19,10 +19,9 @@ io: std.Io,
 config: Config,
 router: Router,
 listener: *raknet.Server,
-links: std.ArrayList(*Link) = .empty,
+scheduler: Scheduler,
+links: std.DoublyLinkedList = .{},
 by_session: std.AutoHashMapUnmanaged(*raknet.Session, *Link) = .empty,
-dials: std.Io.Group = .init,
-wake: std.Io.Event = .unset,
 listener_watch: Watch(raknet.Server) = .{},
 listener_busy: bool = false,
 listener_failures: u8 = 0,
@@ -40,14 +39,20 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config) !*Proxy {
         .advertisement = config.motd(),
         .config = raknet_config,
     });
-    self.* = .{ .gpa = gpa, .io = io, .config = config, .router = undefined, .listener = listener };
+    self.* = .{
+        .gpa = gpa,
+        .io = io,
+        .config = config,
+        .router = undefined,
+        .listener = listener,
+        .scheduler = .{ .io = io },
+    };
     self.router = .init(self.config.backends());
     return self;
 }
 
 pub fn destroy(self: *Proxy) void {
     self.closeAll();
-    self.links.deinit(self.gpa);
     self.listener.destroy();
     self.gpa.destroy(self);
 }
@@ -60,7 +65,7 @@ pub fn localAddress(self: *const Proxy) std.Io.net.IpAddress {
 /// Safe to call from any thread.
 pub fn stop(self: *Proxy) void {
     self.stop_requested.store(true, .release);
-    self.wake.set(self.io);
+    self.scheduler.wake.set(self.io);
 }
 
 pub fn run(self: *Proxy) void {
@@ -69,23 +74,18 @@ pub fn run(self: *Proxy) void {
 }
 
 fn turn(self: *Proxy) void {
-    self.armWatches() catch return self.stop();
-    self.wake.wait(self.io) catch return self.stop();
+    self.listener_watch.arm(self.io, self.listener, self.scheduler.wakeNotify()) catch |err| {
+        log.err("listener watch failed: {t}", .{err});
+        return self.stop();
+    };
+    self.scheduler.wake.wait(self.io) catch return self.stop();
     // Reset first so a wake that lands mid-turn isn't lost
-    self.wake.reset();
+    self.scheduler.wake.reset();
 
     const listener_ready = self.listener_watch.take(self.io);
     if (listener_ready or self.listener_busy) self.pollListener();
-    const links_busy = self.serviceLinks() catch return self.stop();
-    if (links_busy or self.listener_busy) self.wake.set(self.io);
-}
-
-fn armWatches(self: *Proxy) !void {
-    self.listener_watch.arm(self.io, self.listener, &self.wake) catch |err| {
-        log.err("listener watch failed: {t}", .{err});
-        return err;
-    };
-    for (self.links.items) |link| link.arm(&self.wake);
+    self.serviceReady() catch return self.stop();
+    if (self.listener_busy or self.scheduler.hasReady()) self.scheduler.wake.set(self.io);
 }
 
 fn pollListener(self: *Proxy) void {
@@ -108,22 +108,19 @@ fn pollListener(self: *Proxy) void {
     self.listener_busy = stats.datagrams != 0;
 }
 
-fn serviceLinks(self: *Proxy) error{Canceled}!bool {
-    var busy = false;
-    var i: usize = 0;
-    while (i < self.links.items.len) {
-        const link = self.links.items[i];
+fn serviceReady(self: *Proxy) error{Canceled}!void {
+    var next = self.scheduler.takeReady();
+    while (next) |link| {
+        // Read before clearing `queued`, after which another task may push it again
+        next = link.next_ready;
+        link.queued.store(false, .release);
         try link.service();
-        busy = busy or link.busy;
-        if (!link.isFinished()) {
-            i += 1;
-            continue;
+        if (link.isFinished() and !link.queued.load(.acquire)) {
+            self.links.remove(&link.node);
+            link.destroy();
+            self.stats.links_closed += 1;
         }
-        _ = self.links.swapRemove(i);
-        link.destroy();
-        self.stats.links_closed += 1;
     }
-    return busy;
 }
 
 fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationFailure}!void {
@@ -136,15 +133,13 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
 }
 
 fn accept(self: *Proxy, session: *raknet.Session) !void {
-    try self.links.ensureUnusedCapacity(self.gpa, 1);
     try self.by_session.ensureUnusedCapacity(self.gpa, 1);
-    const link = try Link.create(self.gpa, self.io, &self.stats, session, .init(self.config.pending_packets, self.config.pending_bytes));
+    const pending: @FieldType(Link, "pending") = .init(self.config.pending_packets, self.config.pending_bytes);
+    const link = try Link.create(self.gpa, self.io, &self.stats, &self.scheduler, session, pending);
     errdefer link.destroy();
 
-    const options: raknet.ClientOptions = .{ .handshake_timeout_ms = self.config.connect_timeout_ms };
-    try self.dials.concurrent(self.io, Dial.run, .{ &link.dial, self.gpa, self.io, self.router.pick(), options, &self.wake });
-    link.dialing = true;
-    self.links.appendAssumeCapacity(link);
+    try link.startDial(self.router.pick(), .{ .handshake_timeout_ms = self.config.connect_timeout_ms });
+    self.links.append(&link.node);
     self.by_session.putAssumeCapacity(session, link);
     self.stats.sessions_accepted += 1;
 }
@@ -168,11 +163,12 @@ fn closeAll(self: *Proxy) void {
     self.listener_watch.cancel(self.io);
     self.listener.close();
     self.by_session.clearAndFree(self.gpa);
-    self.dials.cancel(self.io);
-    for (self.links.items) |link| {
+    while (self.links.popFirst()) |node| {
+        const link: *Link = @fieldParentPtr("node", node);
         link.session = null;
         link.destroy();
         self.stats.links_closed += 1;
     }
-    self.links.clearRetainingCapacity();
+    // Every task that could push has been awaited, so stale entries are never read
+    self.scheduler.ready.store(null, .monotonic);
 }
