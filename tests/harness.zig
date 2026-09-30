@@ -39,7 +39,7 @@ pub const EchoBackend = struct {
     }
 
     pub fn address(self: *const EchoBackend) std.Io.net.IpAddress {
-        return self.listener.socket.value.address;
+        return self.listener.localAddress();
     }
 
     fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationFailure}!void {

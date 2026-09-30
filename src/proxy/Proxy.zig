@@ -25,7 +25,6 @@ scheduler: Scheduler,
 observer_pool: bedwire.BufferPool,
 env: Link.Env,
 links: std.DoublyLinkedList = .{},
-by_session: std.AutoHashMapUnmanaged(*raknet.Session, *Link) = .empty,
 listener_watch: Watch(raknet.Server) = .{},
 listener_busy: bool = false,
 listener_failures: u8 = 0,
@@ -79,8 +78,7 @@ pub fn destroy(self: *Proxy) void {
 }
 
 pub fn localAddress(self: *const Proxy) std.Io.net.IpAddress {
-    // TODO: switch to a public accessor once raknet-zig has one
-    return self.listener.socket.value.address;
+    return self.listener.localAddress();
 }
 
 /// Safe to call from any thread.
@@ -154,37 +152,40 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
 }
 
 fn accept(self: *Proxy, session: *raknet.Session) !void {
-    try self.by_session.ensureUnusedCapacity(self.gpa, 1);
     const link = try Link.create(&self.env, session);
     errdefer link.destroy();
 
     try link.startDial(self.router.pick(), .{ .handshake_timeout_ms = self.config.connect_timeout_ms });
     self.links.append(&link.node);
-    self.by_session.putAssumeCapacity(session, link);
+    session.setUserData(link);
     self.stats.sessions_accepted += 1;
 }
 
-fn onMessage(context: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-    const self: *Proxy = @ptrCast(@alignCast(context));
-    const link = self.by_session.get(session) orelse return error.ApplicationFailure;
+fn linkOf(session: *const raknet.Session) ?*Link {
+    return @ptrCast(@alignCast(session.userData() orelse return null));
+}
+
+fn onMessage(_: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
+    const link = linkOf(session) orelse return error.ApplicationFailure;
     link.forwardToBackend(payload.bytes) catch |err| {
         log.debug("dropping player: {t}", .{err});
         return error.ApplicationFailure;
     };
 }
 
-fn onDisconnected(context: *anyopaque, session: *raknet.Session) void {
-    const self: *Proxy = @ptrCast(@alignCast(context));
-    const entry = self.by_session.fetchRemove(session) orelse return;
-    entry.value.detachSession();
+fn onDisconnected(_: *anyopaque, session: *raknet.Session) void {
+    const link = linkOf(session) orelse return;
+    session.setUserData(null);
+    link.detachSession();
 }
 
 fn closeAll(self: *Proxy) void {
     self.listener_watch.cancel(self.io);
     self.listener.close();
-    self.by_session.clearAndFree(self.gpa);
     while (self.links.popFirst()) |node| {
         const link: *Link = @fieldParentPtr("node", node);
+        // Closed sessions live until listener.destroy(), so drop their pointer to the link
+        if (link.session) |session| session.setUserData(null);
         link.session = null;
         link.destroy();
         self.stats.links_closed += 1;

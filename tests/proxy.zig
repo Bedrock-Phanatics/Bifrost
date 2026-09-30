@@ -319,14 +319,51 @@ test "many players relay while others come and go" {
     var alive: usize = players.len;
     defer for (players[0..alive]) |*player| player.deinit();
 
+    // Everyone sends before anyone reads, so a player bound to the wrong link gets the wrong echo
+    var tags: [players.len][16]u8 = undefined;
     for (0..3) |_| {
-        for (players[0..alive]) |*player| try player.roundTrip("\xfehello");
+        for (players[0..alive], 0..) |*player, i| {
+            try player.client.send(try std.fmt.bufPrint(&tags[i], "\xfeplayer-{d}", .{i}), .reliable_ordered, 0);
+        }
+        for (players[0..alive], 0..) |*player, i| {
+            try player.expect(try std.fmt.bufPrint(&tags[i], "\xfeplayer-{d}", .{i}));
+        }
         const leaving = alive / 3;
         for (players[alive - leaving .. alive]) |*player| player.deinit();
         alive -= leaving;
     }
     try waitFor(io, &backend.disconnects, @intCast(players.len - alive));
     for (players[0..alive]) |*player| try player.roundTrip("\xfestill here");
+}
+
+test "repeated connect and disconnect leaves no stale links" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var backend: EchoBackend = try .start(io);
+    defer backend.listener.destroy();
+    var backend_task = try io.concurrent(EchoBackend.run, .{&backend});
+    defer {
+        backend.stop.store(true, .release);
+        backend_task.await(io);
+    }
+
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()), .off);
+    defer proxy.destroy();
+    var proxy_task = try io.concurrent(Proxy.run, .{proxy});
+
+    const cycles = 20;
+    for (0..cycles) |_| {
+        var player: Player = try .connect(io, proxy);
+        defer player.deinit();
+        try player.roundTrip("\xfehello");
+    }
+    try waitFor(io, &backend.disconnects, cycles);
+    proxy.stop();
+    proxy_task.await(io);
+    try std.testing.expectEqual(@as(u64, cycles), proxy.stats.sessions_accepted);
+    try std.testing.expectEqual(@as(u64, cycles), proxy.stats.links_closed);
 }
 
 test {
