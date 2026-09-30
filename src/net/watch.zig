@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// How a background task tells the proxy loop it has work.
 pub const Notify = struct {
     context: *anyopaque,
     call: *const fn (*anyopaque) void,

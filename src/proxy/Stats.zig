@@ -11,3 +11,9 @@ observer_gave_up: u64 = 0,
 logins_verified: u64 = 0,
 logins_rejected: u64 = 0,
 auth_unavailable: u64 = 0,
+
+const Stats = @This();
+
+pub fn add(self: *Stats, other: Stats) void {
+    inline for (@typeInfo(Stats).@"struct".fields) |field| @field(self, field.name) += @field(other, field.name);
+}

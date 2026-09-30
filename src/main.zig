@@ -42,18 +42,19 @@ pub fn main(init: std.process.Init) !void {
         .verify => .{ .verify = &keys.? },
     };
 
-    const rt = try zio.Runtime.init(init.gpa, .{});
+    const rt = try zio.Runtime.init(init.gpa, .{ .executors = .exact(config.workers) });
     defer rt.deinit();
 
-    const proxy = try bifrost.Proxy.create(init.gpa, rt.io(), config, auth);
-    defer proxy.destroy();
+    const workers = try bifrost.Workers.create(init.gpa, rt.io(), config, auth);
+    defer workers.destroy();
 
-    var signals = try rt.spawn(stopOnSignal, .{proxy});
+    var signals = try rt.spawn(stopOnSignal, .{workers});
     defer signals.cancel();
 
-    log.info("listening on {f}, {d} backend(s)", .{ proxy.localAddress(), config.backends().len });
-    proxy.run();
-    log.info("stopped", .{});
+    log.info("listening on {f} with {d} worker(s), {d} backend(s)", .{ workers.localAddress(), config.workers, config.backends().len });
+    try workers.run();
+    const totals = workers.totals();
+    log.info("stopped after {d} players", .{totals.sessions_accepted});
 }
 
 fn configPath(args: []const []const u8) ?[]const u8 {
@@ -62,12 +63,12 @@ fn configPath(args: []const []const u8) ?[]const u8 {
     return null;
 }
 
-fn stopOnSignal(proxy: *bifrost.Proxy) void {
+fn stopOnSignal(workers: *bifrost.Workers) void {
     var interrupt = zio.Signal.init(.interrupt) catch |err| return log.warn("signal handling unavailable: {t}", .{err});
     defer interrupt.deinit();
     var terminate = zio.Signal.init(.terminate) catch |err| return log.warn("signal handling unavailable: {t}", .{err});
     defer terminate.deinit();
     _ = zio.select(.{ .interrupt = &interrupt, .terminate = &terminate }) catch return;
     log.info("shutting down", .{});
-    proxy.stop();
+    workers.stop();
 }

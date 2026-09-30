@@ -11,7 +11,6 @@ pub fn millis(ms: i64) std.Io.Timeout {
 
 pub const kick = "\xfekick";
 
-/// Answers with `replies` in order, then echoes. Closes the session on `kick`.
 pub const EchoBackend = struct {
     listener: *raknet.Server,
     greeting: ?[]const u8 = null,

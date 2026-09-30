@@ -7,7 +7,6 @@ pub const max_file_size = 64 * 1024;
 
 pub const Error = error{ InvalidSyntax, InvalidConfig, OutOfMemory };
 
-/// Filled in when loading fails with `InvalidSyntax` or `InvalidConfig`.
 pub const Diagnostic = struct {
     line: usize = 0,
     column: usize = 0,
@@ -113,6 +112,10 @@ fn readServer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
         } else if (eql(key.name.?, "motd")) {
             config.setMotd(try string(diag, key, value)) catch
                 return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_motd_len});
+        } else if (eql(key.name.?, "workers")) {
+            config.workers = try integer(u8, diag, key, value, 1, Config.max_workers);
+            if (config.workers > 1 and !Config.multi_worker_supported)
+                return fail(diag, key, "more than 1 needs Linux (SO_REUSEPORT)", .{});
         } else if (eql(key.name.?, "max_players")) {
             config.max_players = try integer(u32, diag, key, value, 1, 100_000);
         } else return fail(diag, key, "unknown key", .{});
@@ -223,6 +226,7 @@ test "full config reads every key" {
         \\bind = "127.0.0.1:1000"
         \\motd = "MCPE;Test"
         \\max_players = 10
+        \\workers = 1
         \\
         \\[limits]
         \\connect_timeout_ms = 2000
@@ -260,6 +264,8 @@ test "invalid values name the offending key" {
     try expectInvalid("[server]\nport = 1\n" ++ backend, "server.port: unknown key");
     try expectInvalid("[server]\nbind = \"localhost:1\"\n" ++ backend, "server.bind: expected \"ip:port\", got \"localhost:1\"");
     try expectInvalid("[server]\nbind = 19132\n" ++ backend, "server.bind: expected a string");
+    try expectInvalid("[server]\nworkers = 0\n" ++ backend, "server.workers: must be between 1 and 64");
+    if (!Config.multi_worker_supported) try expectInvalid("[server]\nworkers = 2\n" ++ backend, "server.workers: more than 1 needs Linux (SO_REUSEPORT)");
     try expectInvalid("[server]\nmax_players = 0\n" ++ backend, "server.max_players: must be between 1 and 100000");
     try expectInvalid("[server]\nmotd = \"\"\n" ++ backend, "server.motd: must be 1 to 256 bytes");
     try expectInvalid("[limits]\nconnect_timeout_ms = \"5s\"\n" ++ backend, "limits.connect_timeout_ms: expected an integer");

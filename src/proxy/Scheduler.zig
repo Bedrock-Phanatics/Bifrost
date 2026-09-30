@@ -6,10 +6,8 @@ const Scheduler = @This();
 
 io: std.Io,
 wake: std.Io.Event = .unset,
-/// Lock-free stack of links waiting for the loop; only the loop pops, all at once.
 ready: std.atomic.Value(?*Link) = .init(null),
 
-/// Safe from any thread. Doesn't wake the loop; see `notifyLink`.
 pub fn schedule(self: *Scheduler, link: *Link) void {
     if (link.queued.swap(true, .acq_rel)) return;
     var head = self.ready.load(.monotonic);

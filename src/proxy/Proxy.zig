@@ -1,5 +1,3 @@
-//! Only the `run` task touches raknet objects; other tasks reach it through the scheduler.
-
 const std = @import("std");
 const raknet = @import("raknet");
 const bedwire = @import("bedwire");
@@ -7,6 +5,7 @@ const Config = @import("../config/Config.zig");
 const Router = @import("../backend/Router.zig");
 const Watch = @import("../net/watch.zig").Watch;
 const Observer = @import("../protocol/Observer.zig");
+const Admission = @import("Admission.zig");
 const Link = @import("Link.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -22,6 +21,8 @@ config: Config,
 router: Router,
 listener: *raknet.Server,
 scheduler: Scheduler,
+admission: *Admission,
+own_admission: Admission,
 observer_pool: bedwire.BufferPool,
 env: Link.Env,
 links: std.DoublyLinkedList = .{},
@@ -31,7 +32,12 @@ listener_failures: u8 = 0,
 stop_requested: std.atomic.Value(bool) = .init(false),
 stats: Stats = .{},
 
-pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer.Auth) !*Proxy {
+pub const Options = struct {
+    auth: Observer.Auth = .off,
+    admission: ?*Admission = null,
+};
+
+pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Proxy {
     try config.validate();
     const self = try gpa.create(Proxy);
     errdefer gpa.destroy(self);
@@ -41,6 +47,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer
     const listener = try raknet.Server.listen(gpa, io, config.bind, .{
         .advertisement = config.motd(),
         .config = raknet_config,
+        .reuse_port = config.workers > 1,
     });
     errdefer listener.destroy();
     var observer_pool = try Observer.initPool(gpa);
@@ -53,9 +60,12 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer
         .router = undefined,
         .listener = listener,
         .scheduler = .{ .io = io },
+        .admission = undefined,
+        .own_admission = .init(config.max_players),
         .observer_pool = observer_pool,
         .env = undefined,
     };
+    self.admission = options.admission orelse &self.own_admission;
     self.router = .init(self.config.backends());
     self.env = .{
         .gpa = gpa,
@@ -63,7 +73,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer
         .stats = &self.stats,
         .scheduler = &self.scheduler,
         .observer_pool = &self.observer_pool,
-        .auth = auth,
+        .auth = options.auth,
         .pending_packets = config.pending_packets,
         .pending_bytes = config.pending_bytes,
     };
@@ -81,7 +91,6 @@ pub fn localAddress(self: *const Proxy) std.Io.net.IpAddress {
     return self.listener.localAddress();
 }
 
-/// Safe to call from any thread.
 pub fn stop(self: *Proxy) void {
     self.stop_requested.store(true, .release);
     self.scheduler.wake.set(self.io);
@@ -98,7 +107,7 @@ fn turn(self: *Proxy) void {
         return self.stop();
     };
     self.scheduler.wake.wait(self.io) catch return self.stop();
-    // Reset first so a wake that lands mid-turn isn't lost
+    // Reset before checking, or we could miss a wake
     self.scheduler.wake.reset();
 
     const listener_ready = self.listener_watch.take(self.io);
@@ -130,7 +139,7 @@ fn pollListener(self: *Proxy) void {
 fn serviceReady(self: *Proxy) error{Canceled}!void {
     var next = self.scheduler.takeReady();
     while (next) |link| {
-        // Read before clearing `queued`, after which another task may push it again
+        // Grab next first, another task can push this link again once queued is cleared
         next = link.next_ready;
         link.queued.store(false, .release);
         try link.service();
@@ -147,11 +156,14 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
     self.accept(session) catch |err| {
         log.warn("rejecting player: {t}", .{err});
         self.stats.sessions_rejected += 1;
-        return error.ApplicationFailure;
+        // Returning an error here drops the player without telling them
+        session.close();
     };
 }
 
 fn accept(self: *Proxy, session: *raknet.Session) !void {
+    if (!self.admission.tryEnter()) return error.ServerFull;
+    errdefer self.admission.leave();
     const link = try Link.create(&self.env, session);
     errdefer link.destroy();
 
@@ -169,14 +181,16 @@ fn onMessage(_: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPa
     const link = linkOf(session) orelse return error.ApplicationFailure;
     link.forwardToBackend(payload.bytes) catch |err| {
         log.debug("dropping player: {t}", .{err});
-        return error.ApplicationFailure;
+        session.close();
     };
 }
 
-fn onDisconnected(_: *anyopaque, session: *raknet.Session) void {
+fn onDisconnected(context: *anyopaque, session: *raknet.Session) void {
+    const self: *Proxy = @ptrCast(@alignCast(context));
     const link = linkOf(session) orelse return;
     session.setUserData(null);
     link.detachSession();
+    self.admission.leave();
 }
 
 fn closeAll(self: *Proxy) void {
@@ -184,12 +198,14 @@ fn closeAll(self: *Proxy) void {
     self.listener.close();
     while (self.links.popFirst()) |node| {
         const link: *Link = @fieldParentPtr("node", node);
-        // Closed sessions live until listener.destroy(), so drop their pointer to the link
-        if (link.session) |session| session.setUserData(null);
+        // The session outlives the link until listener.destroy()
+        if (link.session) |session| {
+            session.setUserData(null);
+            self.admission.leave();
+        }
         link.session = null;
         link.destroy();
         self.stats.links_closed += 1;
     }
-    // Every task that could push has been awaited, so stale entries are never read
     self.scheduler.ready.store(null, .monotonic);
 }

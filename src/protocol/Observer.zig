@@ -4,7 +4,7 @@ const bedwire = @import("bedwire");
 const Observer = @This();
 const log = std.log.scoped(.observer);
 
-/// Sized for Login, the largest packet before encryption.
+// Login is the biggest thing we see before encryption
 pub const limits: bedwire.Limits = .{
     .max_frame_bytes = 512 * 1024,
     .max_batch_bytes = 2 * 1024 * 1024,
@@ -25,11 +25,9 @@ pub const Context = struct {
 pub const Event = enum {
     none,
     encrypted,
-    /// Relayed opaquely from here.
     gave_up,
     login_verified,
     login_rejected,
-    /// Couldn't verify at all, unlike a bad login.
     auth_unavailable,
 
     pub fn rejects(self: Event) bool {
@@ -38,7 +36,6 @@ pub const Event = enum {
 };
 
 tap: bedwire.Tap,
-/// Off once there's nothing left to learn, so the hot path skips bedwire.
 watching: bool = true,
 verified: bool = false,
 
@@ -62,7 +59,7 @@ pub fn deinit(self: *Observer) void {
 
 pub fn observe(self: *Observer, ctx: Context, direction: bedwire.TapDirection, payload: []const u8) Event {
     std.debug.assert(self.watching);
-    // TODO: pick a TapWithProfile per protocol version for multiversion
+    // TODO: multiversion needs a TapWithProfile per protocol version
     var packets = self.tap.observe(direction, payload) catch |err| return self.giveUp(ctx, err);
     defer packets.deinit();
 

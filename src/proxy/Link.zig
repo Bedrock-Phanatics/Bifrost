@@ -26,7 +26,7 @@ pub const Env = struct {
 };
 
 env: *const Env,
-/// Owned by the listener, gone after `detachSession`.
+// The listener owns this, don't touch it after detachSession
 session: ?*raknet.Session,
 backend: ?*raknet.Client = null,
 dial: Dial = .{},
@@ -35,7 +35,7 @@ pending: PacketQueue,
 observer: Observer,
 watch: Watch(raknet.Client) = .{},
 node: std.DoublyLinkedList.Node = .{},
-/// Set while the link is on the scheduler's ready stack, so it can't be freed yet.
+// Can't free the link while it's still on the ready stack
 queued: std.atomic.Value(bool) = .init(false),
 next_ready: ?*Link = null,
 
@@ -78,7 +78,6 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
     if (self.backend) |client| {
         try client.send(payload, .reliable_ordered, 0);
         self.env.stats.bytes_to_backend += payload.len;
-        // The send may have moved the next retransmit deadline
         self.env.scheduler.schedule(self);
     } else if (self.dial_task != null) {
         try self.pending.push(self.env.gpa, payload);

@@ -14,8 +14,14 @@ const Rig = struct {
     backend_task: std.Io.Future(void),
     proxy: *Proxy,
     proxy_task: std.Io.Future(void),
+    silent: ?std.Io.net.Socket = null,
 
     fn start(self: *Rig, replies: []const []const u8, auth: bifrost.Auth) !void {
+        return self.startWith(replies, auth, false);
+    }
+
+    fn startWith(self: *Rig, replies: []const []const u8, auth: bifrost.Auth, silent_backend: bool) !void {
+        self.silent = null;
         self.threaded = .init(gpa, .{});
         errdefer self.threaded.deinit();
         const rig_io = self.threaded.io();
@@ -24,7 +30,14 @@ const Rig = struct {
         self.backend.replies = replies;
         self.backend_task = try rig_io.concurrent(EchoBackend.run, .{&self.backend});
         errdefer self.stopBackend();
-        self.proxy = try Proxy.create(gpa, rig_io, try harness.testConfig(self.backend.address()), auth);
+        var backend_address = self.backend.address();
+        if (silent_backend) {
+            const socket = try harness.loopback.bind(rig_io, .{ .mode = .dgram, .protocol = .udp });
+            self.silent = socket;
+            backend_address = socket.address;
+        }
+        errdefer if (self.silent) |socket| socket.close(rig_io);
+        self.proxy = try Proxy.create(gpa, rig_io, try harness.testConfig(backend_address), .{ .auth = auth });
         errdefer self.proxy.destroy();
         self.proxy_task = try rig_io.concurrent(Proxy.run, .{self.proxy});
     }
@@ -48,6 +61,7 @@ const Rig = struct {
         self.proxy.destroy();
         self.stopBackend();
         self.backend.listener.destroy();
+        if (self.silent) |socket| socket.close(self.io());
         self.threaded.deinit();
     }
 };
@@ -123,7 +137,7 @@ test "verify mode fails closed when the handshake can't be followed" {
     var keys = try testKeys();
     defer keys.deinit();
     var rig: Rig = undefined;
-    try rig.start(&.{}, .{ .verify = &keys });
+    try rig.startWith(&.{}, .{ .verify = &keys }, true);
     defer rig.deinit();
 
     var player: Player = try .connect(rig.io(), rig.proxy);
@@ -133,10 +147,10 @@ test "verify mode fails closed when the handshake can't be followed" {
 
     rig.stopProxy();
     try std.testing.expectEqual(@as(u64, 1), rig.proxy.stats.auth_unavailable);
-    try std.testing.expectEqual(@as(u32, 0), rig.backend.received.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), rig.proxy.stats.bytes_to_backend);
 }
 
-/// A structurally valid JWKS; no real token will ever verify against it.
+// Parses fine, but nothing will ever verify against it
 fn testKeys() !bifrost.KeySet {
     var modulus: [256]u8 = @splat(0xab);
     modulus[255] = 0x01;

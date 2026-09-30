@@ -1,25 +1,21 @@
-# Copy to bifrost.toml, or run: bifrost --config <path>
-
 [server]
 bind = "0.0.0.0:19132"
-# Raw RakNet pong shown in the server list
+# More than 1 only works on Linux
+workers = 1
 motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;"
 max_players = 4096
 
 [limits]
 connect_timeout_ms = 5000
-# Buffered per player while its backend connects
 pending_packets = 64
 pending_bytes = 1048576
 
 [auth]
-# "off" relays any login. "verify" rejects players whose Xbox login doesn't
-# verify, which needs Microsoft's signing keys saved locally from
+# "verify" needs Microsoft's keys from
 # https://authorization.franchise.minecraft-services.net/.well-known/keys
 mode = "off"
 # keys_file = "minecraft-keys.json"
 
-# Players are spread round-robin across backends
 [[backend]]
 address = "127.0.0.1:19133"
 

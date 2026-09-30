@@ -1,16 +1,20 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const IpAddress = std.Io.net.IpAddress;
 
 const Config = @This();
 
 pub const max_backends = 64;
+pub const max_workers = 64;
+pub const multi_worker_supported = builtin.os.tag == .linux;
 pub const max_motd_len = 256;
 pub const max_path_len = 1024;
-/// raknet rejects handshake timeouts shorter than its 500 ms retry interval.
+// raknet retries every 500 ms and rejects anything shorter
 pub const min_connect_timeout_ms = 500;
 pub const default_motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;";
 
 bind: IpAddress = .{ .ip4 = .unspecified(19132) },
+workers: u8 = 1,
 max_players: u32 = 4096,
 connect_timeout_ms: u32 = 5_000,
 pending_packets: u32 = 64,
@@ -64,6 +68,8 @@ pub fn addBackend(self: *Config, address: IpAddress) error{ TooManyBackends, Dup
 pub fn validate(self: *const Config) error{ NoBackends, InvalidLimit, MissingKeysFile }!void {
     if (self.backend_count == 0) return error.NoBackends;
     if (self.auth == .verify and self.keys_file_len == 0) return error.MissingKeysFile;
+    if (self.workers == 0 or self.workers > max_workers) return error.InvalidLimit;
+    if (self.workers > 1 and !multi_worker_supported) return error.InvalidLimit;
     if (self.max_players == 0 or self.connect_timeout_ms < min_connect_timeout_ms) return error.InvalidLimit;
     if (self.pending_packets == 0 or self.pending_bytes == 0) return error.InvalidLimit;
 }
