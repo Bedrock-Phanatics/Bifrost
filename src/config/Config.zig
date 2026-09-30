@@ -5,6 +5,8 @@ const Config = @This();
 
 pub const max_backends = 64;
 pub const max_motd_len = 256;
+/// raknet rejects handshake timeouts shorter than its 500 ms retry interval.
+pub const min_connect_timeout_ms = 500;
 pub const default_motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;";
 
 bind: IpAddress = .{ .ip4 = .unspecified(19132) },
@@ -42,7 +44,7 @@ pub fn addBackend(self: *Config, address: IpAddress) error{ TooManyBackends, Dup
 
 pub fn validate(self: *const Config) error{ NoBackends, InvalidLimit }!void {
     if (self.backend_count == 0) return error.NoBackends;
-    if (self.max_players == 0 or self.connect_timeout_ms == 0) return error.InvalidLimit;
+    if (self.max_players == 0 or self.connect_timeout_ms < min_connect_timeout_ms) return error.InvalidLimit;
     if (self.pending_packets == 0 or self.pending_bytes == 0) return error.InvalidLimit;
 }
 

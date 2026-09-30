@@ -32,7 +32,7 @@ fn relayScenario(io: std.Io) !void {
         backend_task.await(io);
     }
 
-    const proxy = try Proxy.create(gpa, io, try testConfig(backend.listener.socket.value.address));
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()));
     defer proxy.destroy();
     var proxy_task = try io.concurrent(Proxy.run, .{proxy});
     defer {
@@ -132,4 +132,161 @@ test "example config parses" {
         return err;
     };
     try std.testing.expectEqual(@as(usize, 2), config.backends().len);
+}
+
+test "backend disconnect closes the player" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var backend: EchoBackend = try .start(io);
+    defer backend.listener.destroy();
+    var backend_task = try io.concurrent(EchoBackend.run, .{&backend});
+    defer {
+        backend.stop.store(true, .release);
+        backend_task.await(io);
+    }
+
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()));
+    defer proxy.destroy();
+    var proxy_task = try io.concurrent(Proxy.run, .{proxy});
+    defer {
+        proxy.stop();
+        proxy_task.await(io);
+    }
+
+    var player: Player = try .connect(io, proxy);
+    defer player.deinit();
+    try player.roundTrip("\xfehello");
+    try player.client.send(harness.kick, .reliable_ordered, 0);
+    try player.awaitClosed();
+
+    proxy.stop();
+    proxy_task.await(io);
+    try std.testing.expectEqual(@as(u64, 1), proxy.stats.links_closed);
+    try std.testing.expectEqual(@as(u64, 0), proxy.stats.backend_failures);
+}
+
+test "stop with live links disconnects both sides" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var backend: EchoBackend = try .start(io);
+    defer backend.listener.destroy();
+    var backend_task = try io.concurrent(EchoBackend.run, .{&backend});
+    defer {
+        backend.stop.store(true, .release);
+        backend_task.await(io);
+    }
+
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()));
+    defer proxy.destroy();
+    var proxy_task = try io.concurrent(Proxy.run, .{proxy});
+
+    var players: [2]Player = undefined;
+    for (&players) |*player| player.* = try .connect(io, proxy);
+    defer for (&players) |*player| player.deinit();
+    for (&players) |*player| try player.roundTrip("\xfehello");
+
+    proxy.stop();
+    proxy_task.await(io);
+    for (&players) |*player| try player.awaitClosed();
+    try waitFor(io, &backend.disconnects, 2);
+    try std.testing.expectEqual(@as(u64, 2), proxy.stats.links_closed);
+}
+
+test "backend traffic reaches an idle player" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var backend: EchoBackend = try .start(io);
+    backend.greeting = "\xfewelcome";
+    defer backend.listener.destroy();
+    var backend_task = try io.concurrent(EchoBackend.run, .{&backend});
+    defer {
+        backend.stop.store(true, .release);
+        backend_task.await(io);
+    }
+
+    const proxy = try Proxy.create(gpa, io, try testConfig(backend.address()));
+    defer proxy.destroy();
+    var proxy_task = try io.concurrent(Proxy.run, .{proxy});
+    defer {
+        proxy.stop();
+        proxy_task.await(io);
+    }
+
+    var player: Player = try .connect(io, proxy);
+    defer player.deinit();
+    try player.expect("\xfewelcome");
+}
+
+test "players are spread round-robin across backends" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var backends: [2]EchoBackend = .{ try .start(io), try .start(io) };
+    defer for (&backends) |*backend| backend.listener.destroy();
+    var tasks: [2]std.Io.Future(void) = .{
+        try io.concurrent(EchoBackend.run, .{&backends[0]}),
+        try io.concurrent(EchoBackend.run, .{&backends[1]}),
+    };
+    defer for (&backends, &tasks) |*backend, *task| {
+        backend.stop.store(true, .release);
+        task.await(io);
+    };
+
+    var config = try testConfig(backends[0].address());
+    try config.addBackend(backends[1].address());
+    const proxy = try Proxy.create(gpa, io, config);
+    defer proxy.destroy();
+    var proxy_task = try io.concurrent(Proxy.run, .{proxy});
+    defer {
+        proxy.stop();
+        proxy_task.await(io);
+    }
+
+    var players: [4]Player = undefined;
+    for (&players) |*player| player.* = try .connect(io, proxy);
+    defer for (&players) |*player| player.deinit();
+    for (&players) |*player| try player.roundTrip("\xfehello");
+    for (&backends) |*backend| try std.testing.expectEqual(@as(u32, 2), backend.connects.load(.acquire));
+}
+
+test "a player leaving mid-connect frees its link once the dial ends" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const silent = try loopback.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer silent.close(io);
+
+    var config = try testConfig(silent.address);
+    config.connect_timeout_ms = 500;
+    const proxy = try Proxy.create(gpa, io, config);
+    defer proxy.destroy();
+    var proxy_task = try io.concurrent(Proxy.run, .{proxy});
+
+    var player: Player = try .connect(io, proxy);
+    player.deinit();
+    try io.sleep(.fromMilliseconds(1_000), .awake);
+
+    proxy.stop();
+    proxy_task.await(io);
+    try std.testing.expectEqual(@as(u64, 1), proxy.stats.backend_failures);
+    try std.testing.expectEqual(@as(u64, 1), proxy.stats.links_closed);
+}
+
+test "create cleans up after allocation failures" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    try std.testing.checkAllAllocationFailures(gpa, struct {
+        fn run(allocator: std.mem.Allocator, io: std.Io) !void {
+            const proxy = try Proxy.create(allocator, io, try testConfig(loopback));
+            proxy.destroy();
+        }
+    }.run, .{threaded.io()});
 }

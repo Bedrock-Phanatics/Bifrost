@@ -121,7 +121,7 @@ fn readLimits(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
         const key: Key = .{ .section = "limits", .name = entry.key_ptr.* };
         const value = entry.value_ptr.*;
         if (eql(key.name.?, "connect_timeout_ms")) {
-            config.connect_timeout_ms = try integer(u32, diag, key, value, 100, 60_000);
+            config.connect_timeout_ms = try integer(u32, diag, key, value, Config.min_connect_timeout_ms, 60_000);
         } else if (eql(key.name.?, "pending_packets")) {
             config.pending_packets = try integer(u32, diag, key, value, 1, 4096);
         } else if (eql(key.name.?, "pending_bytes")) {
@@ -243,6 +243,7 @@ test "invalid values name the offending key" {
     try expectInvalid("[server]\nmax_players = 0\n" ++ backend, "server.max_players: must be between 1 and 100000");
     try expectInvalid("[server]\nmotd = \"\"\n" ++ backend, "server.motd: must be 1 to 256 bytes");
     try expectInvalid("[limits]\nconnect_timeout_ms = \"5s\"\n" ++ backend, "limits.connect_timeout_ms: expected an integer");
+    try expectInvalid("[limits]\nconnect_timeout_ms = 100\n" ++ backend, "limits.connect_timeout_ms: must be between 500 and 60000");
     try expectInvalid("server = 1\n" ++ backend, "server: expected a table");
     try expectInvalid("[[backend]]\n", "backend[0].address: is required");
     try expectInvalid("[[backend]]\naddress = \"127.0.0.1:0\"\n", "backend[0].address: needs a non-zero port, got \"127.0.0.1:0\"");

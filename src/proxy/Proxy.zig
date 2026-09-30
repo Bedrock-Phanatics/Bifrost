@@ -12,6 +12,8 @@ const Stats = @import("Stats.zig");
 const Proxy = @This();
 const log = std.log.scoped(.proxy);
 
+const max_listener_failures = 32;
+
 gpa: std.mem.Allocator,
 io: std.Io,
 config: Config,
@@ -23,6 +25,7 @@ dials: std.Io.Group = .init,
 wake: std.Io.Event = .unset,
 listener_watch: Watch(raknet.Server) = .{},
 listener_busy: bool = false,
+listener_failures: u8 = 0,
 stop_requested: std.atomic.Value(bool) = .init(false),
 stats: Stats = .{},
 
@@ -96,9 +99,12 @@ fn pollListener(self: *Proxy) void {
         self.listener_busy = false;
         if (err == error.Canceled) return self.stop();
         self.stats.listener_errors += 1;
-        log.warn("listener poll failed: {t}", .{err});
-        return;
+        self.listener_failures += 1;
+        if (self.listener_failures < max_listener_failures) return log.warn("listener poll failed: {t}", .{err});
+        log.err("listener keeps failing, stopping: {t}", .{err});
+        return self.stop();
     };
+    self.listener_failures = 0;
     self.listener_busy = stats.datagrams != 0;
 }
 

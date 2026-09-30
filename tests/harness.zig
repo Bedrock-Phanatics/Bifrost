@@ -9,9 +9,14 @@ pub fn millis(ms: i64) std.Io.Timeout {
     return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
 }
 
+pub const kick = "\xfekick";
+
+/// Echoes payloads, closes the session on `kick`, and greets new sessions if set.
 pub const EchoBackend = struct {
     listener: *raknet.Server,
+    greeting: ?[]const u8 = null,
     stop: std.atomic.Value(bool) = .init(false),
+    connects: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
 
     pub fn start(io: std.Io) !EchoBackend {
@@ -30,9 +35,18 @@ pub const EchoBackend = struct {
         }
     }
 
-    fn onConnected(_: *anyopaque, _: *raknet.Session) error{ApplicationFailure}!void {}
+    pub fn address(self: *const EchoBackend) std.Io.net.IpAddress {
+        return self.listener.socket.value.address;
+    }
+
+    fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationFailure}!void {
+        const self: *EchoBackend = @ptrCast(@alignCast(context));
+        _ = self.connects.fetchAdd(1, .release);
+        if (self.greeting) |greeting| session.send(greeting, .reliable_ordered, 0) catch return error.ApplicationFailure;
+    }
 
     fn onMessage(_: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
+        if (std.mem.eql(u8, payload.bytes, kick)) return session.close();
         session.send(payload.bytes, .reliable_ordered, 0) catch return error.ApplicationFailure;
     }
 
@@ -65,8 +79,12 @@ pub const Player = struct {
     }
 
     pub fn roundTrip(self: *Player, payload: []const u8) !void {
-        self.got_message = false;
         try self.client.send(payload, .reliable_ordered, 0);
+        try self.expect(payload);
+    }
+
+    pub fn expect(self: *Player, payload: []const u8) !void {
+        self.got_message = false;
         for (0..400) |_| {
             _ = self.client.poll(millis(10), self, collect) catch |err| switch (err) {
                 error.Timeout => {},
@@ -74,7 +92,7 @@ pub const Player = struct {
             };
             if (self.got_message) return std.testing.expectEqualSlices(u8, payload, self.received.items);
         }
-        return error.NoEcho;
+        return error.NoMessage;
     }
 
     pub fn awaitClosed(self: *Player) !void {
