@@ -1,0 +1,9 @@
+zig-cache/
+.zig-cache/
+zig-out/
+.deps/
+*.pdb
+*.ilk
+*.exe
+.DS_Store
+zig-pkg/
