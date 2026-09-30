@@ -32,9 +32,9 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config) !*Proxy {
     errdefer gpa.destroy(self);
 
     var raknet_config: raknet.Config = .{};
-    raknet_config.listener.maximum_connections = config.max_connections;
-    const listener = try raknet.Server.listen(gpa, io, config.listen, .{
-        .advertisement = config.advertisement,
+    raknet_config.listener.maximum_connections = config.max_players;
+    const listener = try raknet.Server.listen(gpa, io, config.bind, .{
+        .advertisement = config.motd(),
         .config = raknet_config,
     });
     self.* = .{ .gpa = gpa, .io = io, .config = config, .router = undefined, .listener = listener };
@@ -132,7 +132,7 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
 fn accept(self: *Proxy, session: *raknet.Session) !void {
     try self.links.ensureUnusedCapacity(self.gpa, 1);
     try self.by_session.ensureUnusedCapacity(self.gpa, 1);
-    const link = try Link.create(self.gpa, self.io, &self.stats, session, .init(self.config.max_pending_packets, self.config.max_pending_bytes));
+    const link = try Link.create(self.gpa, self.io, &self.stats, session, .init(self.config.pending_packets, self.config.pending_bytes));
     errdefer link.destroy();
 
     const options: raknet.ClientOptions = .{ .handshake_timeout_ms = self.config.connect_timeout_ms };

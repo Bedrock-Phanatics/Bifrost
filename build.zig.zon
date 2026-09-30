@@ -16,11 +16,16 @@
             .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",
             .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
         },
+        .toml = .{
+            .url = "git+https://github.com/sam701/zig-toml#8685923e32e8b8a795eb2715684236975a70faed",
+            .hash = "toml-0.3.0-bV14BRmKAQAWR0FT0KUKFwVJTImaFhWjSe6HfSMtNZOH",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "bifrost.example.toml",
         "README.md",
         "LICENSE",
         "NOTICE",

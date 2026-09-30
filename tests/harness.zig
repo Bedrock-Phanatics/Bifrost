@@ -90,7 +90,7 @@ pub const Player = struct {
 };
 
 pub fn testConfig(backend: std.Io.net.IpAddress) !bifrost.Config {
-    var config: bifrost.Config = .{ .listen = loopback, .max_connections = 8, .connect_timeout_ms = 500 };
+    var config: bifrost.Config = .{ .bind = loopback, .max_players = 8, .connect_timeout_ms = 500 };
     try config.addBackend(backend);
     return config;
 }

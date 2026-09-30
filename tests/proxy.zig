@@ -124,3 +124,12 @@ test "stop is safe before run and destroy is idempotent with it" {
     proxy.run();
     proxy.destroy();
 }
+
+test "example config parses" {
+    var diag: bifrost.Diagnostic = .{};
+    const config = bifrost.parseConfig(gpa, @embedFile("example_config"), &diag) catch |err| {
+        std.debug.print("{f}\n", .{diag});
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 2), config.backends().len);
+}

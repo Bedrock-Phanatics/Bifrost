@@ -7,3 +7,4 @@ zig-out/
 *.exe
 .DS_Store
 zig-pkg/
+bifrost.toml
