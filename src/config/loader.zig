@@ -76,6 +76,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
     var config: Config = .{};
     try readRoot(&config, &parsed.value, diag);
     if (config.backend_count == 0) return fail(diag, .{ .section = "backend" }, "at least one [[backend]] is required", .{});
+    if (config.max_players_per_ip > config.max_players)
+        return fail(diag, .{ .section = "server", .name = "max_players_per_ip" }, "can't be more than max_players", .{});
     if (config.health_timeout_ms >= config.health_interval_ms)
         return fail(diag, .{ .section = "health", .name = "timeout_ms" }, "must be shorter than interval_ms", .{});
     if (config.auth == .verify and config.keysFile() == null)
@@ -122,6 +124,8 @@ fn readServer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
                 return fail(diag, key, "more than 1 needs Linux (SO_REUSEPORT)", .{});
         } else if (eql(key.name.?, "max_players")) {
             config.max_players = try integer(u32, diag, key, value, 1, 100_000);
+        } else if (eql(key.name.?, "max_players_per_ip")) {
+            config.max_players_per_ip = try integer(u32, diag, key, value, 0, 100_000);
         } else return fail(diag, key, "unknown key", .{});
     }
 }
@@ -284,6 +288,7 @@ test "invalid values name the offending key" {
     try expectInvalid("[server]\nbind = 19132\n" ++ backend, "server.bind: expected a string");
     try expectInvalid("[server]\nworkers = 0\n" ++ backend, "server.workers: must be between 1 and 64");
     if (!Config.multi_worker_supported) try expectInvalid("[server]\nworkers = 2\n" ++ backend, "server.workers: more than 1 needs Linux (SO_REUSEPORT)");
+    try expectInvalid("[server]\nmax_players = 2\nmax_players_per_ip = 3\n" ++ backend, "server.max_players_per_ip: can't be more than max_players");
     try expectInvalid("[server]\nmax_players = 0\n" ++ backend, "server.max_players: must be between 1 and 100000");
     try expectInvalid("[server]\nmotd = \"\"\n" ++ backend, "server.motd: must be 1 to 256 bytes");
     try expectInvalid("[limits]\nconnect_timeout_ms = \"5s\"\n" ++ backend, "limits.connect_timeout_ms: expected an integer");

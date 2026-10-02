@@ -27,7 +27,8 @@ test "max_players is shared by proxies using one admission" {
     var backend: Backend = undefined;
     try backend.start(io, .{});
     defer backend.deinit();
-    var admission: bifrost.Admission = .init(2);
+    var admission: bifrost.Admission = try .init(gpa, 2, 0);
+    defer admission.deinit();
     var proxies: [2]Running = undefined;
     try proxies[0].start(io, try fixtures.config(&.{backend.address()}), .{ .admission = &admission });
     defer proxies[0].deinit();
@@ -149,4 +150,28 @@ test "workers clean up after allocation failures" {
             workers.destroy();
         }
     }.run, .{});
+}
+
+test "max_players_per_ip turns away extra players from one address" {
+    var backend: Backend = undefined;
+    try backend.start(io, .{});
+    defer backend.deinit();
+    var proxy_config = try fixtures.config(&.{backend.address()});
+    proxy_config.max_players_per_ip = 2;
+    var running: Running = undefined;
+    try running.start(io, proxy_config, .{});
+    defer running.deinit();
+
+    var players: [2]Player = undefined;
+    for (&players) |*player| player.* = try .connect(io, running.address());
+    defer for (&players) |*player| player.deinit();
+    for (&players) |*player| try player.roundTrip("\xfehello");
+
+    var extra: Player = try .connect(io, running.address());
+    defer extra.deinit();
+    try extra.awaitClosed();
+
+    running.stop();
+    try std.testing.expectEqual(@as(u64, 2), running.stats().sessions_accepted);
+    try std.testing.expectEqual(@as(u64, 1), running.stats().sessions_rejected);
 }

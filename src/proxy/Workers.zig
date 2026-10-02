@@ -28,11 +28,12 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer
         .gpa = gpa,
         .io = io,
         .config = config,
-        .admission = .init(config.max_players),
+        .admission = try .init(gpa, config.max_players, config.max_players_per_ip),
         .health = undefined,
         .watchers = &.{},
         .proxies = &.{},
     };
+    errdefer self.admission.deinit();
     self.health = .init(self.config.backends(), config.health_interval_ms, config.health_timeout_ms);
     self.proxies = try gpa.alloc(*Proxy, config.workers);
     errdefer gpa.free(self.proxies);
@@ -55,6 +56,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer
 
 pub fn destroy(self: *Workers) void {
     for (self.proxies) |proxy| proxy.destroy();
+    self.admission.deinit();
     self.gpa.free(self.watchers);
     self.gpa.free(self.proxies);
     self.gpa.destroy(self);

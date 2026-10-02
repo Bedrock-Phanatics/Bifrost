@@ -16,6 +16,7 @@ pub const default_motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;191
 bind: IpAddress = .{ .ip4 = .unspecified(19132) },
 workers: u8 = 1,
 max_players: u32 = 4096,
+max_players_per_ip: u32 = 0,
 connect_timeout_ms: u32 = 5_000,
 pending_packets: u32 = 64,
 pending_bytes: u32 = 1024 * 1024,
@@ -74,6 +75,7 @@ pub fn validate(self: *const Config) error{ NoBackends, InvalidLimit, MissingKey
     if (self.workers == 0 or self.workers > max_workers) return error.InvalidLimit;
     if (self.workers > 1 and !multi_worker_supported) return error.InvalidLimit;
     if (self.max_players == 0 or self.connect_timeout_ms < min_connect_timeout_ms) return error.InvalidLimit;
+    if (self.max_players_per_ip > self.max_players) return error.InvalidLimit;
     if (self.pending_packets == 0 or self.pending_bytes == 0) return error.InvalidLimit;
     if (self.health_timeout_ms == 0 or self.health_timeout_ms >= self.health_interval_ms) return error.InvalidLimit;
 }

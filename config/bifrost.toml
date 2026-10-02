@@ -4,6 +4,8 @@ bind = "0.0.0.0:19132"
 workers = 1
 motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;"
 max_players = 4096
+# 0 turns it off
+max_players_per_ip = 0
 
 [limits]
 connect_timeout_ms = 5000

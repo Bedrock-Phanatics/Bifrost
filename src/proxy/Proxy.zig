@@ -59,6 +59,9 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
     errdefer listener.destroy();
     var observer_pool = try Observer.initPool(gpa);
     errdefer observer_pool.deinit();
+    const own_per_ip = if (options.admission == null) config.max_players_per_ip else 0;
+    var own_admission: Admission = try .init(gpa, config.max_players, own_per_ip);
+    errdefer own_admission.deinit();
 
     self.* = .{
         .gpa = gpa,
@@ -68,7 +71,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .listener = listener,
         .scheduler = .{ .io = io },
         .admission = undefined,
-        .own_admission = .init(config.max_players),
+        .own_admission = own_admission,
         .observer_pool = observer_pool,
         .env = undefined,
     };
@@ -90,6 +93,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
 
 pub fn destroy(self: *Proxy) void {
     self.closeAll();
+    self.own_admission.deinit();
     self.observer_pool.deinit();
     self.listener.destroy();
     self.gpa.destroy(self);
@@ -194,8 +198,8 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
 }
 
 fn accept(self: *Proxy, session: *raknet.Session) !void {
-    if (!self.admission.tryEnter()) return error.ServerFull;
-    errdefer self.admission.leave();
+    try self.admission.enter(self.io, session.address);
+    errdefer self.admission.leave(self.io, session.address);
     const link = try Link.create(&self.env, session);
     errdefer link.destroy();
 
@@ -223,7 +227,7 @@ fn onDisconnected(context: *anyopaque, session: *raknet.Session) void {
     const link = linkOf(session) orelse return;
     session.setUserData(null);
     link.detachSession();
-    self.admission.leave();
+    self.admission.leave(self.io, session.address);
 }
 
 fn closeAll(self: *Proxy) void {
@@ -234,7 +238,7 @@ fn closeAll(self: *Proxy) void {
         // The session outlives the link until listener.destroy()
         if (link.session) |session| {
             session.setUserData(null);
-            self.admission.leave();
+            self.admission.leave(self.io, session.address);
         }
         link.session = null;
         link.destroy();
