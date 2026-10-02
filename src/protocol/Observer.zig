@@ -59,7 +59,6 @@ pub fn deinit(self: *Observer) void {
 
 pub fn observe(self: *Observer, ctx: Context, direction: bedwire.TapDirection, payload: []const u8) Event {
     std.debug.assert(self.watching);
-    // TODO: multiversion needs a TapWithProfile per protocol version
     var packets = self.tap.observe(direction, payload) catch |err| return self.giveUp(ctx, err);
     defer packets.deinit();
 
