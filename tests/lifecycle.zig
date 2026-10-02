@@ -117,3 +117,25 @@ test "create cleans up after allocation failures" {
         }
     }.run, .{});
 }
+
+test "a leaving player's last packets still reach the backend" {
+    var backend: Backend = undefined;
+    try backend.start(io, .{});
+    defer backend.deinit();
+    var running: Running = undefined;
+    try running.start(io, try fixtures.config(&.{backend.address()}), .{});
+    defer running.deinit();
+
+    var player: Player = try .connect(io, running.address());
+    defer player.deinit();
+    try player.roundTrip("\xfehello");
+    var payload: [8000]u8 = @splat(7);
+    payload[0] = 0xfe;
+    const burst = 200;
+    for (0..burst) |_| try player.send(&payload);
+    player.client.close();
+    try player.awaitClosed();
+
+    try fixtures.waitFor(io, &backend.received, burst + 1);
+    try fixtures.waitFor(io, &backend.disconnects, 1);
+}

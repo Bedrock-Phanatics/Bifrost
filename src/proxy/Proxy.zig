@@ -158,7 +158,7 @@ fn pollListener(self: *Proxy) void {
     const stats = result catch |err| {
         self.listener_busy = false;
         if (err == error.Canceled) return self.stop();
-        self.stats.listener_errors += 1;
+        self.stats.bump(.listener_errors, 1);
         self.listener_failures += 1;
         if (self.listener_failures < max_listener_failures) return log.warn("listener poll failed: {t}", .{err});
         log.err("listener keeps failing, stopping: {t}", .{err});
@@ -178,7 +178,7 @@ fn serviceReady(self: *Proxy) error{Canceled}!void {
         if (link.isFinished() and !link.queued.load(.acquire)) {
             self.links.remove(&link.node);
             link.destroy();
-            self.stats.links_closed += 1;
+            self.stats.bump(.links_closed, 1);
         }
     }
 }
@@ -187,7 +187,7 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
     const self: *Proxy = @ptrCast(@alignCast(context));
     self.accept(session) catch |err| {
         log.warn("rejecting player: {t}", .{err});
-        self.stats.sessions_rejected += 1;
+        self.stats.bump(.sessions_rejected, 1);
         // Returning an error here drops the player without telling them
         session.close();
     };
@@ -203,7 +203,7 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     try link.startDial(backend.index, backend.address, .{ .handshake_timeout_ms = self.config.connect_timeout_ms });
     self.links.append(&link.node);
     session.setUserData(link);
-    self.stats.sessions_accepted += 1;
+    self.stats.bump(.sessions_accepted, 1);
 }
 
 fn linkOf(session: *const raknet.Session) ?*Link {
@@ -238,7 +238,7 @@ fn closeAll(self: *Proxy) void {
         }
         link.session = null;
         link.destroy();
-        self.stats.links_closed += 1;
+        self.stats.bump(.links_closed, 1);
     }
     self.scheduler.ready.store(null, .monotonic);
 }

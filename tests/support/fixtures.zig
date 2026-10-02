@@ -19,7 +19,6 @@ pub fn config(backends: []const IpAddress) !bifrost.Config {
     return result;
 }
 
-// Never answers, so dials and pings to it time out
 pub fn silent(io: std.Io) !std.Io.net.Socket {
     return loopback.bind(io, .{ .mode = .dgram, .protocol = .udp });
 }
@@ -40,7 +39,6 @@ pub fn eventually(io: std.Io, context: anytype, comptime check: fn (@TypeOf(cont
     return error.WaitTimedOut;
 }
 
-// Echoes, but sends `replies` first and closes on `kick`
 pub const Backend = struct {
     io: std.Io,
     listener: *raknet.Server,
@@ -198,12 +196,13 @@ pub const RunningWorkers = struct {
 };
 
 pub const Player = struct {
+    io: std.Io,
     client: *raknet.Client,
     received: std.ArrayList(u8) = .empty,
     got_message: bool = false,
 
     pub fn connect(io: std.Io, address: IpAddress) !Player {
-        return .{ .client = try raknet.Client.connect(gpa, io, address, .{ .handshake_retry_ms = 10 }) };
+        return .{ .io = io, .client = try raknet.Client.connect(gpa, io, address, .{ .handshake_retry_ms = 10 }) };
     }
 
     pub fn deinit(self: *Player) void {
@@ -222,7 +221,8 @@ pub const Player = struct {
 
     pub fn expect(self: *Player, payload: []const u8) !void {
         self.got_message = false;
-        for (0..400) |_| {
+        const started = std.Io.Clock.awake.now(self.io);
+        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < 4_000) {
             _ = self.client.poll(millis(10), self, collect) catch |err| switch (err) {
                 error.Timeout => {},
                 else => return err,
@@ -233,7 +233,8 @@ pub const Player = struct {
     }
 
     pub fn awaitClosed(self: *Player) !void {
-        for (0..1000) |_| {
+        const started = std.Io.Clock.awake.now(self.io);
+        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < 10_000) {
             _ = self.client.poll(millis(10), self, collect) catch |err| switch (err) {
                 error.Timeout => {},
                 else => return,

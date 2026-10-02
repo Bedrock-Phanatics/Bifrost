@@ -8,6 +8,9 @@ const Proxy = @import("Proxy.zig");
 const Stats = @import("Stats.zig");
 
 const Workers = @This();
+const log = std.log.scoped(.stats);
+
+const report_interval_s = 60;
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -68,6 +71,8 @@ pub fn stop(self: *Workers) void {
 pub fn run(self: *Workers) !void {
     var health_task = try self.io.concurrent(Health.run, .{ &self.health, self.io });
     defer health_task.cancel(self.io);
+    var report_task = try self.io.concurrent(report, .{self});
+    defer report_task.cancel(self.io);
 
     const tasks = try self.gpa.alloc(std.Io.Future(void), self.proxies.len);
     defer self.gpa.free(tasks);
@@ -83,8 +88,24 @@ pub fn run(self: *Workers) !void {
 
 pub fn totals(self: *const Workers) Stats {
     var sum: Stats = .{};
-    for (self.proxies) |proxy| sum.add(proxy.stats);
+    for (self.proxies) |proxy| sum.add(proxy.stats.snapshot());
     return sum;
+}
+
+fn report(self: *Workers) void {
+    while (true) {
+        self.io.sleep(.fromSeconds(report_interval_s), .awake) catch return;
+        const totals_now = self.totals();
+        log.info("{d} online, {d} joined, {d}/{d} backends up, {d} backend failures, {Bi:.1} to backends, {Bi:.1} to players", .{
+            self.admission.active.load(.monotonic),
+            totals_now.sessions_accepted,
+            self.health.healthyCount(),
+            self.health.backends.len,
+            totals_now.backend_failures,
+            totals_now.bytes_to_backend,
+            totals_now.bytes_to_player,
+        });
+    }
 }
 
 fn runWorker(self: *Workers, proxy: *Proxy) void {
