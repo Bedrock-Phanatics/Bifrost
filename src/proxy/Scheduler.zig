@@ -1,6 +1,6 @@
 const std = @import("std");
 const Link = @import("Link.zig");
-const Notify = @import("../net/watch.zig").Notify;
+const Notify = @import("../net/Notify.zig");
 
 const Scheduler = @This();
 

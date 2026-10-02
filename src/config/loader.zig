@@ -76,6 +76,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
     var config: Config = .{};
     try readRoot(&config, &parsed.value, diag);
     if (config.backend_count == 0) return fail(diag, .{ .section = "backend" }, "at least one [[backend]] is required", .{});
+    if (config.health_timeout_ms >= config.health_interval_ms)
+        return fail(diag, .{ .section = "health", .name = "timeout_ms" }, "must be shorter than interval_ms", .{});
     if (config.auth == .verify and config.keysFile() == null)
         return fail(diag, .{ .section = "auth", .name = "keys_file" }, "is required when mode = \"verify\"", .{});
     return config;
@@ -91,6 +93,8 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
             try readServer(config, try table(diag, key, value), diag);
         } else if (eql(name, "limits")) {
             try readLimits(config, try table(diag, key, value), diag);
+        } else if (eql(name, "health")) {
+            try readHealth(config, try table(diag, key, value), diag);
         } else if (eql(name, "auth")) {
             try readAuth(config, try table(diag, key, value), diag);
         } else if (eql(name, "backend")) {
@@ -137,6 +141,19 @@ fn readLimits(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
     }
 }
 
+fn readHealth(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "health", .name = entry.key_ptr.* };
+        const value = entry.value_ptr.*;
+        if (eql(key.name.?, "interval_ms")) {
+            config.health_interval_ms = try integer(u32, diag, key, value, 1_000, 600_000);
+        } else if (eql(key.name.?, "timeout_ms")) {
+            config.health_timeout_ms = try integer(u32, diag, key, value, 100, 10_000);
+        } else return fail(diag, key, "unknown key", .{});
+    }
+}
+
 fn readAuth(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
     var it = section.iterator();
     while (it.next()) |entry| {
@@ -164,6 +181,7 @@ fn readBackend(config: *Config, section: *const toml.Table, index: usize, diag: 
     }
     const key: Key = .{ .section = "backend", .index = index, .name = "address" };
     config.addBackend(backend orelse return fail(diag, key, "is required", .{})) catch |err| return switch (err) {
+        error.InvalidPort => fail(diag, key, "needs a non-zero port", .{}),
         error.DuplicateBackend => fail(diag, key, "duplicates an earlier backend", .{}),
         error.TooManyBackends => fail(diag, key, "more than {d} backends", .{Config.max_backends}),
     };
@@ -277,6 +295,8 @@ test "invalid values name the offending key" {
     try expectInvalid(backend ++ backend, "backend[1].address: duplicates an earlier backend");
     try expectInvalid("backend = \"127.0.0.1:1\"\n", "backend: expected [[backend]] tables");
     try expectInvalid("[auth]\nmode = \"strict\"\n" ++ backend, "auth.mode: expected \"off\" or \"verify\", got \"strict\"");
+    try expectInvalid("[health]\ntimeout_ms = 50\n" ++ backend, "health.timeout_ms: must be between 100 and 10000");
+    try expectInvalid("[health]\ninterval_ms = 1000\ntimeout_ms = 1000\n" ++ backend, "health.timeout_ms: must be shorter than interval_ms");
     try expectInvalid("[auth]\nmode = \"verify\"\n" ++ backend, "auth.keys_file: is required when mode = \"verify\"");
 }
 

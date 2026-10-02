@@ -2,7 +2,9 @@ const std = @import("std");
 const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const Dial = @import("../backend/Dial.zig");
+const Health = @import("../backend/Health.zig");
 const Watch = @import("../net/watch.zig").Watch;
+const no_wait = @import("../net/watch.zig").no_wait;
 const Observer = @import("../protocol/Observer.zig");
 const PacketQueue = @import("PacketQueue.zig");
 const Scheduler = @import("Scheduler.zig");
@@ -12,7 +14,6 @@ const Link = @This();
 const log = std.log.scoped(.link);
 
 const max_polls_per_turn = 4;
-const no_wait: std.Io.Timeout = .{ .duration = .{ .raw = .zero, .clock = .awake } };
 
 pub const Env = struct {
     gpa: std.mem.Allocator,
@@ -21,6 +22,7 @@ pub const Env = struct {
     scheduler: *Scheduler,
     observer_pool: *bedwire.BufferPool,
     auth: Observer.Auth,
+    health: ?*Health,
     pending_packets: u32,
     pending_bytes: u32,
 };
@@ -30,6 +32,7 @@ env: *const Env,
 session: ?*raknet.Session,
 backend: ?*raknet.Client = null,
 dial: Dial = .{},
+backend_index: usize = 0,
 dial_task: ?std.Io.Future(void) = null,
 pending: PacketQueue,
 observer: Observer,
@@ -65,7 +68,8 @@ pub fn destroy(self: *Link) void {
     self.env.gpa.destroy(self);
 }
 
-pub fn startDial(self: *Link, address: std.Io.net.IpAddress, options: raknet.ClientOptions) std.Io.ConcurrentError!void {
+pub fn startDial(self: *Link, backend_index: usize, address: std.Io.net.IpAddress, options: raknet.ClientOptions) std.Io.ConcurrentError!void {
+    self.backend_index = backend_index;
     self.dial_task = try self.env.io.concurrent(Dial.run, .{ &self.dial, self.env.gpa, self.env.io, address, options, Scheduler.linkNotify(self) });
 }
 
@@ -133,6 +137,7 @@ fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
     const client = result catch |err| {
         log.warn("backend connect failed: {t}", .{err});
         self.env.stats.backend_failures += 1;
+        if (err != error.Canceled) if (self.env.health) |health| health.markFailed(self.backend_index);
         return self.closeSession();
     };
     self.backend = client;

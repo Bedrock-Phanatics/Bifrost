@@ -2,9 +2,13 @@ const std = @import("std");
 const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const Config = @import("../config/Config.zig");
+const Health = @import("../backend/Health.zig");
 const Router = @import("../backend/Router.zig");
+const Notify = @import("../net/Notify.zig");
 const Watch = @import("../net/watch.zig").Watch;
+const no_wait = @import("../net/watch.zig").no_wait;
 const Observer = @import("../protocol/Observer.zig");
+const advertisement = @import("../protocol/advertisement.zig");
 const Admission = @import("Admission.zig");
 const Link = @import("Link.zig");
 const Scheduler = @import("Scheduler.zig");
@@ -30,11 +34,13 @@ listener_watch: Watch(raknet.Server) = .{},
 listener_busy: bool = false,
 listener_failures: u8 = 0,
 stop_requested: std.atomic.Value(bool) = .init(false),
+health_changed: std.atomic.Value(bool) = .init(false),
 stats: Stats = .{},
 
 pub const Options = struct {
     auth: Observer.Auth = .off,
     admission: ?*Admission = null,
+    health: ?*Health = null,
 };
 
 pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Proxy {
@@ -44,8 +50,9 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
 
     var raknet_config: raknet.Config = .{};
     raknet_config.listener.maximum_connections = config.max_players;
+    var ad_buffer: [advertisement_capacity]u8 = undefined;
     const listener = try raknet.Server.listen(gpa, io, config.bind, .{
-        .advertisement = config.motd(),
+        .advertisement = renderAdvertisement(&config, &ad_buffer, 0),
         .config = raknet_config,
         .reuse_port = config.workers > 1,
     });
@@ -66,7 +73,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .env = undefined,
     };
     self.admission = options.admission orelse &self.own_admission;
-    self.router = .init(self.config.backends());
+    self.router = .init(self.config.backends(), options.health);
     self.env = .{
         .gpa = gpa,
         .io = io,
@@ -74,6 +81,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .scheduler = &self.scheduler,
         .observer_pool = &self.observer_pool,
         .auth = options.auth,
+        .health = options.health,
         .pending_packets = config.pending_packets,
         .pending_bytes = config.pending_bytes,
     };
@@ -89,6 +97,16 @@ pub fn destroy(self: *Proxy) void {
 
 pub fn localAddress(self: *const Proxy) std.Io.net.IpAddress {
     return self.listener.localAddress();
+}
+
+pub fn healthNotify(self: *Proxy) Notify {
+    return .{ .context = self, .call = onHealthChanged };
+}
+
+fn onHealthChanged(context: *anyopaque) void {
+    const self: *Proxy = @ptrCast(@alignCast(context));
+    self.health_changed.store(true, .release);
+    self.scheduler.wake.set(self.io);
 }
 
 pub fn stop(self: *Proxy) void {
@@ -110,14 +128,28 @@ fn turn(self: *Proxy) void {
     // Reset before checking, or we could miss a wake
     self.scheduler.wake.reset();
 
+    if (self.health_changed.swap(false, .acquire)) self.refreshAdvertisement();
     const listener_ready = self.listener_watch.take(self.io);
     if (listener_ready or self.listener_busy) self.pollListener();
     self.serviceReady() catch return self.stop();
     if (self.listener_busy or self.scheduler.hasReady()) self.scheduler.wake.set(self.io);
 }
 
+const advertisement_capacity = Config.max_motd_len + 32;
+
+fn renderAdvertisement(config: *const Config, buffer: *[advertisement_capacity]u8, online: u32) []const u8 {
+    return advertisement.render(buffer, config.motd(), online, config.max_players) catch config.motd();
+}
+
+fn refreshAdvertisement(self: *Proxy) void {
+    const health = self.env.health orelse return;
+    var buffer: [advertisement_capacity]u8 = undefined;
+    self.listener.setAdvertisement(renderAdvertisement(&self.config, &buffer, health.onlinePlayers())) catch |err|
+        log.warn("advertisement not updated: {t}", .{err});
+}
+
 fn pollListener(self: *Proxy) void {
-    const result = self.listener.poll(.{ .duration = .{ .raw = .zero, .clock = .awake } }, .{
+    const result = self.listener.poll(no_wait, .{
         .context = self,
         .connected = onConnected,
         .message = onMessage,
@@ -167,7 +199,8 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     const link = try Link.create(&self.env, session);
     errdefer link.destroy();
 
-    try link.startDial(self.router.pick(), .{ .handshake_timeout_ms = self.config.connect_timeout_ms });
+    const backend = self.router.pick() orelse return error.NoBackendAvailable;
+    try link.startDial(backend.index, backend.address, .{ .handshake_timeout_ms = self.config.connect_timeout_ms });
     self.links.append(&link.node);
     session.setUserData(link);
     self.stats.sessions_accepted += 1;

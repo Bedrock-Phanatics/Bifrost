@@ -1,16 +1,16 @@
 .{
     .name = .bifrost,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0x690b25d757c41963,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zig_raknet = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig#f1391ac9c70996787af969a2f6305c6dfe607bf0",
-            .hash = "zig_raknet-0.3.2-1HPoU2DCCgDeBYRc6BppdlyXcC2t4vDc2QVA0KwnVoc3",
+            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig#4f2f411f3f640881cb33300c69b8d2723a3893ab",
+            .hash = "zig_raknet-0.3.3-1HPoUzriCgB0JtjF-v_OyVx2HXyaaNEAIxjAFAJTwEMK",
         },
         .bedwire = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#b0c6fa55d0d5ce4576f5a1604423c959e40e4f00",
-            .hash = "bedwire-0.2.0-6vrYrbYQBgDIb-BhraLaaldIOcasjgxPMLmZhtxRNFCV",
+            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#0f2a67167a29df4560c7ac9af9cb34a1e765ab94",
+            .hash = "bedwire-0.2.3-6vrYrUNKBgDoNKZ-3I-wMxNs4_tRzbQ5fUdQrHvhhpeH",
         },
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",
@@ -25,7 +25,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "bifrost.example.toml",
+        "config",
         "README.md",
         "LICENSE",
         "NOTICE",

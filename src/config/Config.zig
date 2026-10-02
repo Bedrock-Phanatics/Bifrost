@@ -19,6 +19,8 @@ max_players: u32 = 4096,
 connect_timeout_ms: u32 = 5_000,
 pending_packets: u32 = 64,
 pending_bytes: u32 = 1024 * 1024,
+health_interval_ms: u32 = 5_000,
+health_timeout_ms: u32 = 1_000,
 auth: Auth = .off,
 keys_file_storage: [max_path_len]u8 = undefined,
 keys_file_len: usize = 0,
@@ -56,7 +58,8 @@ pub fn backends(self: *const Config) []const IpAddress {
     return self.backend_storage[0..self.backend_count];
 }
 
-pub fn addBackend(self: *Config, address: IpAddress) error{ TooManyBackends, DuplicateBackend }!void {
+pub fn addBackend(self: *Config, address: IpAddress) error{ InvalidPort, TooManyBackends, DuplicateBackend }!void {
+    if (address.getPort() == 0) return error.InvalidPort;
     for (self.backends()) |existing| {
         if (existing.eql(&address)) return error.DuplicateBackend;
     }
@@ -72,6 +75,7 @@ pub fn validate(self: *const Config) error{ NoBackends, InvalidLimit, MissingKey
     if (self.workers > 1 and !multi_worker_supported) return error.InvalidLimit;
     if (self.max_players == 0 or self.connect_timeout_ms < min_connect_timeout_ms) return error.InvalidLimit;
     if (self.pending_packets == 0 or self.pending_bytes == 0) return error.InvalidLimit;
+    if (self.health_timeout_ms == 0 or self.health_timeout_ms >= self.health_interval_ms) return error.InvalidLimit;
 }
 
 test "setMotd copies and bounds the value" {
@@ -85,8 +89,9 @@ test "setMotd copies and bounds the value" {
     try std.testing.expectError(error.InvalidMotd, config.setMotd(&(.{'a'} ** (max_motd_len + 1))));
 }
 
-test "addBackend rejects duplicates and overflow" {
+test "addBackend rejects port 0, duplicates and overflow" {
     var config: Config = .{};
+    try std.testing.expectError(error.InvalidPort, config.addBackend(.{ .ip4 = .loopback(0) }));
     try config.addBackend(.{ .ip4 = .loopback(1) });
     try std.testing.expectError(error.DuplicateBackend, config.addBackend(.{ .ip4 = .loopback(1) }));
     for (2..max_backends + 1) |port| try config.addBackend(.{ .ip4 = .loopback(@intCast(port)) });

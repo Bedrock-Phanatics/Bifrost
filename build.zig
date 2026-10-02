@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio },
         },
     }) });
+    exe.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -41,7 +42,7 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = bifrost });
     const integration_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("tests/proxy.zig"),
+        .root_source_file = b.path("tests/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -51,7 +52,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio },
         },
     }) });
-    integration_tests.root_module.addAnonymousImport("example_config", .{ .root_source_file = b.path("bifrost.example.toml") });
+    integration_tests.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);

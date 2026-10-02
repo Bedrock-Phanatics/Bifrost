@@ -1,6 +1,6 @@
 const std = @import("std");
 const raknet = @import("raknet");
-const Notify = @import("../net/watch.zig").Notify;
+const Notify = @import("../net/Notify.zig");
 
 const Dial = @This();
 

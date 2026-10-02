@@ -1,6 +1,6 @@
 [server]
 bind = "0.0.0.0:19132"
-# More than 1 only works on Linux
+# Linux only above 1
 workers = 1
 motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;"
 max_players = 4096
@@ -10,8 +10,12 @@ connect_timeout_ms = 5000
 pending_packets = 64
 pending_bytes = 1048576
 
+[health]
+interval_ms = 5000
+timeout_ms = 1000
+
 [auth]
-# "verify" needs Microsoft's keys from
+# verify needs Microsoft's keys:
 # https://authorization.franchise.minecraft-services.net/.well-known/keys
 mode = "off"
 # keys_file = "minecraft-keys.json"

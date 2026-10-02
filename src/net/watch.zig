@@ -1,13 +1,7 @@
 const std = @import("std");
+const Notify = @import("Notify.zig");
 
-pub const Notify = struct {
-    context: *anyopaque,
-    call: *const fn (*anyopaque) void,
-
-    pub fn send(self: Notify) void {
-        self.call(self.context);
-    }
-};
+pub const no_wait: std.Io.Timeout = .{ .duration = .{ .raw = .zero, .clock = .awake } };
 
 pub fn Watch(comptime T: type) type {
     return struct {
