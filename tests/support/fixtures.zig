@@ -132,7 +132,11 @@ pub const Running = struct {
     stopped: bool = false,
 
     pub fn start(self: *Running, io: std.Io, proxy_config: bifrost.Config, options: bifrost.Proxy.Options) !void {
-        const proxy = try bifrost.Proxy.create(gpa, io, proxy_config, options);
+        return self.startWith(io, gpa, proxy_config, options);
+    }
+
+    pub fn startWith(self: *Running, io: std.Io, allocator: std.mem.Allocator, proxy_config: bifrost.Config, options: bifrost.Proxy.Options) !void {
+        const proxy = try bifrost.Proxy.create(allocator, io, proxy_config, options);
         errdefer proxy.destroy();
         self.* = .{ .io = io, .proxy = proxy, .task = try io.concurrent(bifrost.Proxy.run, .{proxy}) };
     }

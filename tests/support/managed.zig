@@ -7,7 +7,7 @@ const oidc_key = @import("oidc_key.zig");
 
 const protocol = bedwire.protocol;
 const Current = protocol.Current;
-const Ecdsa = bedwire.crypto.spki.Ecdsa;
+pub const Ecdsa = bedwire.crypto.spki.Ecdsa;
 const IpAddress = std.Io.net.IpAddress;
 const gpa = std.testing.allocator;
 
@@ -79,6 +79,10 @@ fn signRsa(allocator: std.mem.Allocator, header: []const u8, payload: []const u8
 }
 
 pub fn loginRequest(allocator: std.mem.Allocator, key: Ecdsa.KeyPair, name: []const u8, xuid: []const u8, now: i64) ![]u8 {
+    return loginRequestSigned(allocator, key, key, name, xuid, now);
+}
+
+pub fn loginRequestSigned(allocator: std.mem.Allocator, key: Ecdsa.KeyPair, client_data_signer: Ecdsa.KeyPair, name: []const u8, xuid: []const u8, now: i64) ![]u8 {
     const claims = try std.fmt.allocPrint(
         allocator,
         "{{\"iss\":\"https://authorization.franchise.minecraft-services.net/\",\"aud\":\"api://auth-minecraft-services/multiplayer\",\"exp\":{d},\"cpk\":\"{s}\",\"xname\":\"{s}\",\"xid\":\"{s}\"}}",
@@ -87,7 +91,7 @@ pub fn loginRequest(allocator: std.mem.Allocator, key: Ecdsa.KeyPair, name: []co
     defer allocator.free(claims);
     const token = try signRsa(allocator, "{\"alg\":\"RS256\",\"kid\":\"" ++ oidc_key.kid ++ "\"}", claims);
     defer allocator.free(token);
-    const client_data = try bedwire.auth.login.sign(allocator, key, "{\"alg\":\"ES384\"}", "{\"SkinId\":\"bifrost-test\",\"ServerAddress\":\"proxy\"}", .{});
+    const client_data = try bedwire.auth.login.sign(allocator, client_data_signer, "{\"alg\":\"ES384\"}", "{\"SkinId\":\"bifrost-test\",\"ServerAddress\":\"proxy\"}", .{});
     defer allocator.free(client_data);
     const envelope = try std.fmt.allocPrint(allocator, "{{\"AuthenticationType\":0,\"Token\":\"{s}\"}}", .{token});
     defer allocator.free(envelope);
@@ -108,6 +112,7 @@ pub const Player = struct {
     key: Ecdsa.KeyPair,
     inbox: std.ArrayList(u8) = .empty,
     got: bool = false,
+    timeout_ms: i64 = 5_000,
 
     pub fn connect(io: std.Io, address: IpAddress, seed: u8) !*Player {
         const self = try gpa.create(Player);
@@ -136,30 +141,48 @@ pub const Player = struct {
     }
 
     pub fn login(self: *Player, name: []const u8, xuid: []const u8) !void {
+        try self.settings(@intCast(Current.protocol_number));
+        try self.sendLogin(name, xuid, self.key);
+        try self.finishHandshake();
+        try self.awaitLoginStatus();
+    }
+
+    pub fn settings(self: *Player, version: i32) !void {
         var buffer: [64]u8 = undefined;
-        try self.send(&.{try typedPacket(&buffer, .{ .request_network_settings = .{ .client_network_version = @intCast(Current.protocol_number) } })});
-        {
-            var packets = try self.receive();
-            defer packets.deinit();
-            try self.session.negotiateFromSettings(packets.next() orelse return error.NoPacket);
-        }
-        const request = try loginRequest(gpa, self.key, name, xuid, std.Io.Clock.real.now(self.io).toSeconds());
+        try self.send(&.{try typedPacket(&buffer, .{ .request_network_settings = .{ .client_network_version = version } })});
+        var packets = try self.receive();
+        defer packets.deinit();
+        try self.session.negotiateFromSettings(packets.next() orelse return error.NoPacket);
+    }
+
+    // Signing ClientData with another key forges it
+    pub fn sendLogin(self: *Player, name: []const u8, xuid: []const u8, client_data_signer: Ecdsa.KeyPair) !void {
+        const request = try loginRequestSigned(gpa, self.key, client_data_signer, name, xuid, std.Io.Clock.real.now(self.io).toSeconds());
         defer gpa.free(request);
         const storage = try gpa.alloc(u8, request.len + 32);
         defer gpa.free(storage);
         try self.send(&.{try bedwire.auth.login.encodeLoginPacket(Current, storage, request, limits)});
+    }
+
+    pub fn finishHandshake(self: *Player) !void {
         {
             var packets = try self.receive();
             defer packets.deinit();
             try self.session.acceptServerHandshakePacket(gpa, packets.next() orelse return error.NoPacket, self.key.secret_key);
         }
+        var buffer: [8]u8 = undefined;
         try self.send(&.{try typedPacket(&buffer, .{ .client_to_server_handshake = .{} })});
         try self.session.advance(.resource_packs);
-        // Only the backend sends this, so both handshakes are done
+    }
+
+    // Only the backend sends this, so both handshakes are done
+    pub fn awaitLoginStatus(self: *Player) !void {
         var packets = try self.receive();
         defer packets.deinit();
-        const status = packets.next() orelse return error.NoPacket;
-        if (status.kind != .play_status) return error.UnexpectedPacket;
+        const packet = packets.next() orelse return error.NoPacket;
+        if (packet.kind != .play_status) return error.UnexpectedPacket;
+        const status = (try self.session.decodePacket(packet)).value.typed.play_status.status;
+        if (status != .loginsuccess) return error.LoginRefused;
     }
 
     pub fn spawn(self: *Player) !void {
@@ -200,7 +223,7 @@ pub const Player = struct {
     fn awaitFrame(self: *Player) ![]const u8 {
         self.got = false;
         const started = std.Io.Clock.awake.now(self.io);
-        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < 5_000) {
+        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < self.timeout_ms) {
             _ = self.client.poll(fixtures.millis(10), self, collect) catch |err| switch (err) {
                 error.Timeout => {},
                 else => return err,
@@ -347,6 +370,7 @@ pub const Backend = struct {
         defer packets.deinit();
         var buffer: [512]u8 = undefined;
         while (packets.next()) |packet| switch (packet.kind orelse {
+            if (std.mem.endsWith(u8, packet.bytes, "kick")) return carrier.close();
             try sendFrame(session, carrier, &.{packet.bytes});
             _ = self.echoes.fetchAdd(1, .release);
             continue;
