@@ -2,8 +2,8 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const version = @import("builtin").zig_version;
-    if (comptime version.major != 0 or version.minor != 16 or version.patch != 0) {
-        @compileError("Bifrost requires Zig 0.16.0");
+    if (comptime version.major != 0 or version.minor != 17 or version.patch != 0) {
+        @compileError("Bifrost requires Zig 0.17.0");
     }
 
     const target = b.standardTargetOptions(.{});
@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     b.step("run", "Run Bifrost").dependOn(&run_cmd.step);
 
     const unit_tests = b.addTest(.{ .root_module = bifrost });
@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     const bench_cmd = b.addRunArtifact(bench);
-    if (b.args) |args| bench_cmd.addArgs(args);
+    bench_cmd.addPassthruArgs();
     b.step("bench", "Run the proxy benchmarks (use -Doptimize=ReleaseFast)").dependOn(&bench_cmd.step);
 }
 

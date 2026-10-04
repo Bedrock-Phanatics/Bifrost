@@ -66,7 +66,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
                 diag.line = position.line;
                 diag.column = position.pos;
             },
-            .struct_mapping => {},
+            .struct_mapping, .unknown_fields => {},
         };
         diag.set("invalid TOML ({t})", .{err});
         return error.InvalidSyntax;

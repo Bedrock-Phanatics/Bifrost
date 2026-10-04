@@ -74,6 +74,6 @@ fn compressed(packet: []const u8) ![]u8 {
     var frame: [2048]u8 = undefined;
     const framed = try codec.encode(writer.written(), frame[2..], scratch);
     frame[0] = bedwire.framing.batch.header;
-    frame[1] = @intFromEnum(framed.algorithm);
+    frame[1] = @backingInt(framed.algorithm);
     return gpa.dupe(u8, frame[0 .. 2 + framed.bytes.len]);
 }

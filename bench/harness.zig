@@ -44,7 +44,7 @@ pub const Snapshot = struct {
     const scalar_fields = 12;
 
     pub fn write(self: Snapshot, w: *std.Io.Writer) !void {
-        inline for (@typeInfo(Snapshot).@"struct".fields[0..scalar_fields]) |field| try w.print("{d} ", .{@field(self, field.name)});
+        inline for (@typeInfo(Snapshot).@"struct".field_names[0..scalar_fields]) |name| try w.print("{d} ", .{@field(self, name)});
         for (self.per_worker[0..self.workers]) |count| try w.print("{d} ", .{count});
         try w.writeByte('\n');
     }
@@ -52,8 +52,8 @@ pub const Snapshot = struct {
     pub fn parse(line: []const u8) !Snapshot {
         var result: Snapshot = .{};
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
-        inline for (@typeInfo(Snapshot).@"struct".fields[0..scalar_fields]) |field| {
-            @field(result, field.name) = try std.fmt.parseInt(u64, fields.next() orelse return error.BadStats, 10);
+        inline for (@typeInfo(Snapshot).@"struct".field_names[0..scalar_fields]) |name| {
+            @field(result, name) = try std.fmt.parseInt(u64, fields.next() orelse return error.BadStats, 10);
         }
         while (fields.next()) |count| {
             if (result.workers == max_workers) return error.BadStats;
@@ -309,7 +309,7 @@ pub const Frames = struct {
         errdefer gpa.free(frame);
         const framed = try codec.encode(writer.written(), frame[2..], scratch);
         frame[0] = bedwire.framing.batch.header;
-        frame[1] = @intFromEnum(framed.algorithm);
+        frame[1] = @backingInt(framed.algorithm);
         return gpa.realloc(frame, 2 + framed.bytes.len);
     }
 };

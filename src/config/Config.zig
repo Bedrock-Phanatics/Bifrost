@@ -88,7 +88,7 @@ test "setMotd copies and bounds the value" {
     source[0] = 'X';
     try std.testing.expectEqualStrings("MCPE;Test", config.motd());
     try std.testing.expectError(error.InvalidMotd, config.setMotd(""));
-    try std.testing.expectError(error.InvalidMotd, config.setMotd(&(.{'a'} ** (max_motd_len + 1))));
+    try std.testing.expectError(error.InvalidMotd, config.setMotd(&@as([max_motd_len + 1]u8, @splat('a'))));
 }
 
 test "addBackend rejects port 0, duplicates and overflow" {

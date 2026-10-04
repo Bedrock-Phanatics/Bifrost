@@ -2,23 +2,23 @@
     .name = .bifrost,
     .version = "0.3.0",
     .fingerprint = 0x690b25d757c41963,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zig_raknet = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig#4f2f411f3f640881cb33300c69b8d2723a3893ab",
-            .hash = "zig_raknet-0.3.3-1HPoUzriCgB0JtjF-v_OyVx2HXyaaNEAIxjAFAJTwEMK",
+            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig?ref=main#04315f4910ea59435f4a86ba653b042bb546423d",
+            .hash = "zig_raknet-0.3.3-1HPoU6DrCgDbXA68GKRvuTsvSU7O22WObsMqUksBHoaX",
         },
         .bedwire = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#0f2a67167a29df4560c7ac9af9cb34a1e765ab94",
-            .hash = "bedwire-0.2.3-6vrYrUNKBgDoNKZ-3I-wMxNs4_tRzbQ5fUdQrHvhhpeH",
+            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#0781fd690a01baeb4cee39b8264d338ab8b3b6a5",
+            .hash = "bedwire-0.2.3-6vrYrZJMBgAcEinPNCufQhD2A8-MqTxgAGfkCifx1fuu",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",
-            .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
+            .url = "git+https://github.com/EuroZig/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",
+            .hash = "zio-0.18.0-xHbVVNFVKwBpESpBmSGH8QcqCp1M6MrRbdRK8hXipsFr",
         },
         .toml = .{
-            .url = "git+https://github.com/sam701/zig-toml#8685923e32e8b8a795eb2715684236975a70faed",
-            .hash = "toml-0.3.0-bV14BRmKAQAWR0FT0KUKFwVJTImaFhWjSe6HfSMtNZOH",
+            .url = "git+https://github.com/sam701/zig-toml?ref=main#c661327bd9f02f774426c4fe78f60621411b7173",
+            .hash = "toml-0.3.0-bV14BRmkAQDSILPPyXc31aAXPtJa1Uh8Frug3i6InAUc",
         },
     },
     .paths = .{

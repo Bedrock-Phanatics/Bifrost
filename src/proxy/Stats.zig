@@ -24,12 +24,12 @@ pub fn bump(self: *Stats, comptime field: std.meta.FieldEnum(Stats), amount: u64
 
 pub fn snapshot(self: *const Stats) Stats {
     var copy: Stats = .{};
-    inline for (@typeInfo(Stats).@"struct".fields) |field| {
-        @field(copy, field.name) = @atomicLoad(u64, &@field(self, field.name), .monotonic);
+    inline for (@typeInfo(Stats).@"struct".field_names) |name| {
+        @field(copy, name) = @atomicLoad(u64, &@field(self, name), .monotonic);
     }
     return copy;
 }
 
 pub fn add(self: *Stats, other: Stats) void {
-    inline for (@typeInfo(Stats).@"struct".fields) |field| @field(self, field.name) += @field(other, field.name);
+    inline for (@typeInfo(Stats).@"struct".field_names) |name| @field(self, name) += @field(other, name);
 }

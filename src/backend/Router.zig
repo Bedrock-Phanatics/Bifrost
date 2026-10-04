@@ -28,7 +28,7 @@ pub fn pick(self: *Router, skip: Set) ?Pick {
     return null;
 }
 
-const none: Set = .initEmpty();
+const none: Set = .empty;
 
 test "pick cycles through backends in order" {
     const backends = [_]IpAddress{ .{ .ip4 = .loopback(1) }, .{ .ip4 = .loopback(2) } };
@@ -39,7 +39,7 @@ test "pick cycles through backends in order" {
 test "pick never returns a skipped backend" {
     const backends = [_]IpAddress{ .{ .ip4 = .loopback(1) }, .{ .ip4 = .loopback(2) }, .{ .ip4 = .loopback(3) } };
     var router: Router = .init(&backends, null);
-    var tried: Set = .initEmpty();
+    var tried: Set = .empty;
     for (0..backends.len) |_| tried.set(router.pick(tried).?.index);
     try std.testing.expectEqual(backends.len, tried.count());
     try std.testing.expectEqual(@as(?Pick, null), router.pick(tried));
