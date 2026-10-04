@@ -48,7 +48,6 @@ pub const Shared = struct {
     batch: [][]const u8,
 
     pub fn init(gpa: std.mem.Allocator, key: Ecdsa.KeyPair, keys: *const bedwire.auth.KeySet) !Shared {
-        // Calls never overlap, so one slot each is enough
         var pool: bedwire.BufferPool = try .init(gpa, limits, .{ .rx_slots = 1, .tx_slots = 1 });
         errdefer pool.deinit();
         return .{ .pool = pool, .key = key, .keys = keys, .batch = try gpa.alloc([]const u8, limits.max_packets_per_batch) };
@@ -139,7 +138,6 @@ pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
 
     const packet = packets.next() orelse return error.MalformedBatch;
     if (packet.kind == .disconnect or packet.kind == .play_status) {
-        // Pass the reason on if we can
         if (self.player_phase == .ready) self.sendToPlayer(ends, &.{packet.bytes}) catch {};
         return error.BackendRefused;
     }
@@ -274,7 +272,6 @@ fn sendToBackend(self: *Managed, ends: Ends, packets: []const []const u8) !void 
     try send(&self.backend, ends.backend orelse return error.BackendClosed, ends.stats, .bytes_to_backend, packets);
 }
 
-// Halves the batch until it fits in a frame
 fn send(session: anytype, sink: anytype, stats: *Stats, comptime counter: std.meta.FieldEnum(Stats), packets: []const []const u8) !void {
     var rest = packets;
     var chunk = packets.len;

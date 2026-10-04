@@ -52,7 +52,6 @@ test "a managed player logs in to a backend as the proxy and relays game packets
     try player.spawn();
     try player.echo("hello");
     try player.echo(&@as([3000]u8, @splat('x')));
-    // Spans many datagrams and gets compressed
     try player.echo(&@as([64 * 1024]u8, @splat('y')));
 
     try std.testing.expectEqualStrings("Steve", setup.backend.name());
@@ -260,7 +259,6 @@ test "an allocation failure anywhere in a managed login fails cleanly" {
     const options: bifrost.Proxy.Options = .{ .auth = .{ .verify = &keys }, .proxy_key = proxy_key };
     const proxy_config = try managed.config(&.{backend.address()});
 
-    // Fail each allocation of a full session, one at a time
     var counting: FailOnce = .{ .child = gpa, .fail_at = std.math.maxInt(usize) };
     try std.testing.expect(try playThrough(&counting, proxy_config, options));
     for (0..counting.allocations()) |fail_at| {

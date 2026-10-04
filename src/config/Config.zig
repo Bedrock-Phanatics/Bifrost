@@ -87,7 +87,6 @@ pub fn findBackend(self: *const Config, name: []const u8) ?Backend.Id {
 
 pub const AddBackendError = Backend.InitError || error{ TooManyBackends, DuplicateBackend, DuplicateName };
 
-/// A null name uses the address text.
 pub fn addBackend(self: *Config, name: ?[]const u8, address: IpAddress) AddBackendError!void {
     const backend: Backend = try .init(name, address);
     for (self.backends()) |*existing| {

@@ -65,7 +65,6 @@ pub fn create(env: *const Env, session: *raknet.Session) !*Link {
         .observer = try .init(env.observer_pool),
         .managed = managed,
     };
-    // Managed mode verifies the login itself
     if (managed != null) self.observer.watching = false;
     return self;
 }

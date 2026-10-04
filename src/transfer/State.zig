@@ -1,0 +1,136 @@
+const std = @import("std");
+
+const State = @This();
+const log = std.log.scoped(.transfer);
+
+pub const Epoch = u32;
+
+pub const Phase = enum {
+    dialing,
+    logging_in,
+    joining,
+    preparing_client,
+    syncing_client,
+    closing_source,
+
+    pub fn committed(self: Phase) bool {
+        return @backingInt(self) >= @backingInt(Phase.syncing_client);
+    }
+};
+
+pub const Event = enum {
+    dialed,
+    logged_in,
+    target_ready,
+    client_prepared,
+    client_synced,
+    source_closed,
+    target_failed,
+    source_failed,
+    expired,
+    player_left,
+    shutdown,
+};
+
+pub const Action = enum {
+    none,
+    stale,
+    prepare_client,
+    commit,
+    close_source,
+    finish,
+    roll_back,
+    disconnect,
+    abandon,
+};
+
+pub const Outcome = enum { committed, failed_before_commit, failed_after_commit, timed_out };
+
+pub const Step = struct {
+    action: Action,
+    outcome: ?Outcome = null,
+};
+
+pub const Limits = struct {
+    dial_ms: u32,
+    phase_ms: u32,
+    total_ms: u32,
+};
+
+epoch: Epoch,
+phase: Phase = .dialing,
+limits: Limits,
+phase_deadline_ns: u64,
+deadline_ns: u64,
+
+pub fn init(epoch: Epoch, limits: Limits, now_ns: u64) State {
+    return .{
+        .epoch = epoch,
+        .limits = limits,
+        .phase_deadline_ns = now_ns + ms(limits.dial_ms),
+        .deadline_ns = now_ns + ms(limits.total_ms),
+    };
+}
+
+pub fn nextDeadline(self: *const State) u64 {
+    return @min(self.phase_deadline_ns, self.deadline_ns);
+}
+
+pub fn expired(self: *const State, now_ns: u64) bool {
+    return now_ns >= self.nextDeadline();
+}
+
+pub fn applyFrom(self: *State, epoch: Epoch, event: Event, now_ns: u64) Step {
+    if (epoch != self.epoch) return .{ .action = .stale };
+    return self.apply(event, now_ns);
+}
+
+pub fn apply(self: *State, event: Event, now_ns: u64) Step {
+    const from = self.phase;
+    const step = self.decide(event, now_ns);
+    log.debug("transfer {d}: {t} in {t} -> {t} ({t})", .{ self.epoch, event, from, self.phase, step.action });
+    return step;
+}
+
+fn decide(self: *State, event: Event, now_ns: u64) Step {
+    const committed = self.phase.committed();
+    switch (event) {
+        .player_left, .shutdown => return .{
+            .action = .abandon,
+            .outcome = if (committed) .failed_after_commit else .failed_before_commit,
+        },
+        .expired => return .{
+            .action = if (committed) .disconnect else .roll_back,
+            .outcome = .timed_out,
+        },
+        .target_failed => return if (committed)
+            .{ .action = .disconnect, .outcome = .failed_after_commit }
+        else
+            .{ .action = .roll_back, .outcome = .failed_before_commit },
+        .source_failed => return switch (self.phase) {
+            .syncing_client => .{ .action = .none },
+            .closing_source => finished,
+            else => .{ .action = .disconnect, .outcome = .failed_before_commit },
+        },
+        else => {},
+    }
+    const expected: Event, const next: ?Phase, const action: Action = switch (self.phase) {
+        .dialing => .{ .dialed, .logging_in, .none },
+        .logging_in => .{ .logged_in, .joining, .none },
+        .joining => .{ .target_ready, .preparing_client, .prepare_client },
+        .preparing_client => .{ .client_prepared, .syncing_client, .commit },
+        .syncing_client => .{ .client_synced, .closing_source, .close_source },
+        .closing_source => .{ .source_closed, null, .finish },
+    };
+    if (event != expected) return self.decide(.target_failed, now_ns);
+    const phase = next orelse return finished;
+    self.phase = phase;
+    self.phase_deadline_ns = now_ns + ms(self.limits.phase_ms);
+    return .{ .action = action };
+}
+
+const finished: Step = .{ .action = .finish, .outcome = .committed };
+
+fn ms(value: u32) u64 {
+    return @as(u64, value) * std.time.ns_per_ms;
+}

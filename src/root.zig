@@ -31,4 +31,5 @@ test {
     _ = @import("protocol/advertisement.zig");
     _ = @import("proxy/PacketQueue.zig");
     _ = @import("session/proxy_key.zig");
+    _ = @import("transfer/State.zig");
 }
