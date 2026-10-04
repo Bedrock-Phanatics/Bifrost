@@ -57,20 +57,40 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
-    const bench = b.addExecutable(.{ .name = "bifrost-bench", .root_module = b.createModule(.{
-        .root_source_file = b.path("bench/main.zig"),
+    const scheduling = b.option(enum { work_stealing, pinned }, "scheduling", "ZIO scheduling of the benchmarked proxy (default: work_stealing)") orelse .work_stealing;
+    const bench_options = b.addOptions();
+    bench_options.addOption([]const u8, "scheduling", @tagName(scheduling));
+    const bench_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "bifrost", .module = bifrost },
+        .{ .name = "raknet", .module = raknet },
+        .{ .name = "bedwire", .module = bedwire_module },
+        .{ .name = "bench_options", .module = bench_options.createModule() },
+    };
+    // The driver keeps the default scheduler so only the proxy under test changes
+    const bench = addBench(b, "bifrost-bench", target, optimize, bench_imports, zio);
+    const bench_proxy = addBench(b, "bifrost-bench-proxy", target, optimize, bench_imports, b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "bifrost", .module = bifrost },
-            .{ .name = "raknet", .module = raknet },
-            .{ .name = "bedwire", .module = bedwire_module },
-            .{ .name = "zio", .module = zio },
-        },
-    }) });
+        .scheduling = scheduling,
+    }).module("zio"));
     const bench_cmd = b.addRunArtifact(bench);
+    bench_cmd.addArg("--proxy-exe");
+    bench_cmd.addArtifactArg(bench_proxy);
     bench_cmd.addPassthruArgs();
     b.step("bench", "Run the proxy benchmarks (use -Doptimize=ReleaseFast)").dependOn(&bench_cmd.step);
+}
+
+fn addBench(
+    b: *std.Build,
+    name: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    imports: []const std.Build.Module.Import,
+    zio: *std.Build.Module,
+) *std.Build.Step.Compile {
+    const module = b.createModule(.{ .root_source_file = b.path("bench/main.zig"), .target = target, .optimize = optimize, .imports = imports });
+    module.addImport("zio", zio);
+    return b.addExecutable(.{ .name = name, .root_module = module });
 }
 
 fn dependencyModule(

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const bifrost = @import("bifrost");
+const bench_options = @import("bench_options");
 const harness = @import("harness.zig");
 
 const Backend = harness.Backend;
@@ -18,7 +19,7 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|handshake|connections|workers|backends ...] [--quick] [--driver-threads N]
+    \\usage: bench [relay|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
@@ -32,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
 
     var driver_threads: u8 = 4;
     var quick = false;
+    var proxy_exe: ?[]const u8 = null;
     var selected: std.ArrayList([]const u8) = .empty;
     defer selected.deinit(gpa);
     var i: usize = 1;
@@ -45,6 +47,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--driver-threads") and i + 1 < args.len) {
             i += 1;
             driver_threads = try std.fmt.parseInt(u8, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--proxy-exe") and i + 1 < args.len) {
+            i += 1;
+            proxy_exe = args[i];
         } else if (for (all_scenarios) |name| {
             if (std.mem.eql(u8, arg, name)) break true;
         } else false) {
@@ -68,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
         .gpa = gpa,
         .io = io,
         .process_io = init.io,
-        .exe = try std.process.executablePathAlloc(init.io, gpa),
+        .exe = if (proxy_exe) |path| try gpa.dupeSentinel(u8, path, 0) else try std.process.executablePathAlloc(init.io, gpa),
         .frames = &frames,
         .out = &stdout.interface,
         .quick = quick,
@@ -76,8 +81,14 @@ pub fn main(init: std.process.Init) !void {
     };
     defer gpa.free(env.exe);
 
-    try env.out.print("# Bifrost benchmark\n\n{t}-{t}, {t} build, {d} CPUs, driver threads {d}{s}\n", .{
-        builtin.os.tag, builtin.cpu.arch, builtin.mode, env.cpus, driver_threads, if (quick) ", quick" else "",
+    try env.out.print("# Bifrost benchmark\n\n{t}-{t}, {t} build, {d} CPUs, driver threads {d}, proxy scheduling {s}{s}\n", .{
+        builtin.os.tag,
+        builtin.cpu.arch,
+        builtin.mode,
+        env.cpus,
+        driver_threads,
+        if (proxy_exe == null) "work_stealing" else bench_options.scheduling,
+        if (quick) ", quick" else "",
     });
     try env.out.print("Login frame {d} B, {d} iterations of {d} ms after {d} ms warmup\n", .{
         frames.login.len, env.iterations(), env.iterationMs(), env.warmupMs(),

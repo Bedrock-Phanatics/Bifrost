@@ -14,7 +14,10 @@ Settings live in [`config/bifrost.toml`](config/bifrost.toml).
 ```sh
 zig build bench -Doptimize=ReleaseFast                          # full suite, about 4 minutes
 zig build bench -Doptimize=ReleaseFast -- relay workers --quick # pick scenarios, shorter runs
+zig build bench -Doptimize=ReleaseFast -Dscheduling=pinned      # proxy without ZIO work stealing
 ```
+
+[`bench/baseline.md`](bench/baseline.md) records the numbers later changes are compared against.
 
 The suite starts the real proxy (`Workers` on the same runtime as `bifrost`) as a child process, and drives it with
 RakNet clients and echo backends from the parent. Scenarios: `relay`, `handshake`, `connections`, `workers`, `backends`.
