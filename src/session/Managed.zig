@@ -3,6 +3,7 @@ const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const PacketQueue = @import("../proxy/PacketQueue.zig");
 const Stats = @import("../proxy/Stats.zig");
+const packs = @import("../content/packs.zig");
 pub const Upstream = @import("Upstream.zig");
 
 const protocol = bedwire.protocol;
@@ -76,6 +77,7 @@ upstream: Upstream,
 player_phase: PlayerPhase = .settings,
 identity: ?bedwire.Identity = null,
 client_data: ?[]u8 = null,
+initial_packs: packs.Fingerprint = .{},
 // Player packets sent before the backend is ready
 early: PacketQueue,
 
@@ -240,11 +242,20 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
     var count: usize = 0;
     while (packets.next()) |packet| {
         if (packet.kind == .start_game) start_game = true;
+        if (self.player.state == .resource_packs) try self.capturePacks(packet);
         self.shared.batch[count] = packet.bytes;
         count += 1;
     }
     try self.sendToPlayer(ends, self.shared.batch[0..count]);
     if (start_game) try self.advance(.spawn_ready);
+}
+
+fn capturePacks(self: *Managed, packet: BackendSession.Packet) !void {
+    switch (packet.kind orelse return) {
+        .resource_packs_info => self.initial_packs.info = try packs.infoHash(try typed(try self.upstream.session.decodePacket(packet), .resource_packs_info)),
+        .resource_pack_stack => self.initial_packs.stack = try packs.stackHash(try typed(try self.upstream.session.decodePacket(packet), .resource_pack_stack)),
+        else => {},
+    }
 }
 
 fn playerMilestone(self: *Managed, packet: PlayerSession.Packet) !?bedwire.State {

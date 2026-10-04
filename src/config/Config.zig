@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Backend = @import("../backend/Backend.zig");
+const content = @import("../content/policy.zig");
 const IpAddress = std.Io.net.IpAddress;
 
 const Config = @This();
@@ -25,6 +26,7 @@ health_interval_ms: u32 = 5_000,
 health_timeout_ms: u32 = 1_000,
 transfer_phase_timeout_ms: u32 = 5_000,
 transfer_timeout_ms: u32 = 15_000,
+content_policy: content.Policy = .initial,
 auth: Auth = .off,
 keys_file_storage: [max_path_len]u8 = undefined,
 keys_file_len: usize = 0,

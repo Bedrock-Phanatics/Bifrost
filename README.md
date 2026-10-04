@@ -27,6 +27,9 @@ for its StartGame while the player stays on the old backend; only then does it s
 before the switch leaves the player where they were. Moving the client's world across is not implemented yet, so
 world packets from the new backend are held back for now.
 
+`[transfer] content = "initial"` keeps the packs the player accepted from their first backend for the whole session;
+Bifrost answers each target's pack negotiation itself. `"match"` also refuses targets whose packs differ.
+
 ## Benchmarks
 
 ```sh

@@ -34,7 +34,7 @@ pub const Env = struct {
     pending_packets: u32,
     pending_bytes: u32,
     managed: ?*Managed.Shared = null,
-    transfer_limits: Transfer.State.Limits = .{ .dial_ms = 5_000, .phase_ms = 5_000, .total_ms = 15_000 },
+    transfer: Transfer.Settings = .{ .limits = .{ .dial_ms = 5_000, .phase_ms = 5_000, .total_ms = 15_000 }, .queue_packets = 64, .queue_bytes = 1024 * 1024 },
     next_epoch: ?*Transfer.State.Epoch = null,
 };
 
@@ -206,7 +206,7 @@ pub fn startTransfer(self: *Link, target: Backend.Id) !void {
     if (self.env.health) |health| if (health.status(target) == .unhealthy) return error.BackendDown;
     const epoch = self.env.next_epoch.?;
     epoch.* +%= 1;
-    self.transfer = try Transfer.create(self.transferHost(session), target, self.env.router.get(target).address, epoch.*, self.env.transfer_limits, self.env.pending_packets, self.env.pending_bytes);
+    self.transfer = try Transfer.create(self.transferHost(session), target, self.env.router.get(target).address, epoch.*, self.env.transfer);
     self.env.scheduler.schedule(self);
 }
 

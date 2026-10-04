@@ -196,6 +196,10 @@ fn readTransfer(config: *Config, section: *const toml.Table, diag: *Diagnostic) 
             config.transfer_phase_timeout_ms = try integer(u32, diag, key, value, 100, 60_000);
         } else if (eql(key.name.?, "timeout_ms")) {
             config.transfer_timeout_ms = try integer(u32, diag, key, value, 100, 300_000);
+        } else if (eql(key.name.?, "content")) {
+            const text = try string(diag, key, value);
+            config.content_policy = std.meta.stringToEnum(@TypeOf(config.content_policy), text) orelse
+                return fail(diag, key, "expected \"initial\" or \"match\", got \"{s}\"", .{text});
         } else return fail(diag, key, "unknown key", .{});
     }
 }
@@ -391,6 +395,9 @@ test "transfer section sets the timeouts" {
     try expectInvalid("[transfer]\nphase_timeout_ms = 50\n" ++ backend, "transfer.phase_timeout_ms: must be between 100 and 60000");
     try expectInvalid("[transfer]\nphase_timeout_ms = 6000\ntimeout_ms = 5000\n" ++ backend, "transfer.timeout_ms: can't be shorter than phase_timeout_ms");
     try expectInvalid("[transfer]\nretries = 1\n" ++ backend, "transfer.retries: unknown key");
+    try expectInvalid("[transfer]\ncontent = \"latest\"\n" ++ backend, "transfer.content: expected \"initial\" or \"match\", got \"latest\"");
+    const matching = try parse(std.testing.allocator, "[transfer]\ncontent = \"match\"\n" ++ backend, &diag);
+    try std.testing.expectEqual(.match, matching.content_policy);
 }
 
 test "loadFile reports missing and oversized files" {

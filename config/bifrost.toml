@@ -30,6 +30,8 @@ mode = "passthrough"
 [transfer]
 phase_timeout_ms = 5000
 timeout_ms = 15000
+# "initial" keeps the first backend's packs for the whole session; "match" also needs every target to offer the same
+content = "initial"
 
 [[backend]]
 # Defaults to the address

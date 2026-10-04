@@ -9,6 +9,8 @@ const no_wait = @import("../net/watch.zig").no_wait;
 const Managed = @import("../session/Managed.zig");
 const Upstream = Managed.Upstream;
 const Stats = @import("../proxy/Stats.zig");
+const content = @import("../content/policy.zig");
+const packs = @import("../content/packs.zig");
 pub const State = @import("State.zig");
 
 const Transfer = @This();
@@ -33,6 +35,13 @@ pub const Host = struct {
 };
 
 pub const Result = enum { running, finished, rolled_back, disconnect, abandoned };
+
+pub const Settings = struct {
+    limits: State.Limits,
+    queue_packets: u32,
+    queue_bytes: u32,
+    content_policy: content.Policy = .initial,
+};
 
 const Queue = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -81,19 +90,23 @@ queue: Queue,
 source: ?*raknet.Client = null,
 seen: Seen = .{},
 result: Result = .running,
+content_policy: content.Policy,
+target_packs: packs.Fingerprint = .{},
+mismatch: ?content.Mismatch = null,
 host: ?Host = null,
 
-pub fn create(host: Host, target: Backend.Id, address: std.Io.net.IpAddress, epoch: State.Epoch, limits: State.Limits, queue_packets: u32, queue_bytes: u32) !*Transfer {
+pub fn create(host: Host, target: Backend.Id, address: std.Io.net.IpAddress, epoch: State.Epoch, settings: Settings) !*Transfer {
     const self = try host.gpa.create(Transfer);
     errdefer host.gpa.destroy(self);
     self.* = .{
-        .state = .init(epoch, limits, now(host.io)),
+        .state = .init(epoch, settings.limits, now(host.io)),
         .target = target,
         .upstream = try .init(host.managed.shared),
-        .queue = .{ .max_packets = @min(queue_packets, max_queued_packets), .max_bytes = queue_bytes },
+        .queue = .{ .max_packets = @min(settings.queue_packets, max_queued_packets), .max_bytes = settings.queue_bytes },
+        .content_policy = settings.content_policy,
     };
     errdefer self.upstream.deinit();
-    const options: raknet.ClientOptions = .{ .handshake_timeout_ms = limits.dial_ms };
+    const options: raknet.ClientOptions = .{ .handshake_timeout_ms = settings.limits.dial_ms };
     self.dial_task = try host.io.concurrent(Dial.run, .{ &self.dial, host.gpa, host.io, address, options, host.notify });
     errdefer self.cancelTasks(host.io);
     try self.armTimer(host);
@@ -163,7 +176,21 @@ pub fn service(self: *Transfer, host: Host) error{Canceled}!Result {
 fn settle(self: *Transfer, host: Host) void {
     if (self.seen.failed) return self.on(host, .target_failed);
     if (self.seen.logged_in and self.state.phase == .logging_in) self.on(host, .logged_in);
-    if (self.seen.joined and self.state.phase == .joining) self.on(host, .target_ready);
+    if (self.seen.joined and self.state.phase == .joining) {
+        if (self.incompatibility(host.managed)) |mismatch| {
+            self.mismatch = mismatch;
+            log.info("transfer {d}: target content is incompatible: {t}", .{ self.state.epoch, mismatch });
+            return self.on(host, .target_failed);
+        }
+        self.on(host, .target_ready);
+    }
+}
+
+fn incompatibility(self: *const Transfer, managed: *const Managed) ?content.Mismatch {
+    return switch (self.content_policy) {
+        .initial => null,
+        .match => if (self.target_packs.eql(managed.initial_packs)) null else .packs,
+    };
 }
 
 fn onTargetMessage(opaque_self: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
@@ -194,8 +221,12 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
             continue;
         }
         switch (packet.kind orelse continue) {
-            .resource_packs_info => try self.upstream.send(ctx, &.{try Managed.encodeTyped(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .downloading_finished = "" } } })}),
+            .resource_packs_info => {
+                self.target_packs.info = try packs.infoHash(try Managed.typed(try self.upstream.session.decodePacket(packet), .resource_packs_info));
+                try self.upstream.send(ctx, &.{try Managed.encodeTyped(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .downloading_finished = "" } } })});
+            },
             .resource_pack_stack => {
+                self.target_packs.stack = try packs.stackHash(try Managed.typed(try self.upstream.session.decodePacket(packet), .resource_pack_stack));
                 try self.upstream.send(ctx, &.{try Managed.encodeTyped(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .resource_pack_stack_finished = "" } } })});
                 try self.upstream.session.advance(.waiting_for_start_game);
             },

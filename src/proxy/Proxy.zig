@@ -117,10 +117,15 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .pending_packets = config.pending_packets,
         .pending_bytes = config.pending_bytes,
         .managed = if (self.managed) |*shared| shared else null,
-        .transfer_limits = .{
-            .dial_ms = config.connect_timeout_ms,
-            .phase_ms = config.transfer_phase_timeout_ms,
-            .total_ms = config.transfer_timeout_ms,
+        .transfer = .{
+            .limits = .{
+                .dial_ms = config.connect_timeout_ms,
+                .phase_ms = config.transfer_phase_timeout_ms,
+                .total_ms = config.transfer_timeout_ms,
+            },
+            .queue_packets = config.pending_packets,
+            .queue_bytes = config.pending_bytes,
+            .content_policy = config.content_policy,
         },
         .next_epoch = &self.next_epoch,
     };
