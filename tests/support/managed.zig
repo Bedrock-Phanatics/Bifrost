@@ -347,7 +347,11 @@ pub const Backend = struct {
             },
             .client_to_server_handshake => {
                 try session.advance(.resource_packs);
-                try sendFrame(session, carrier, &.{try typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } })});
+                var stack: [16]u8 = undefined;
+                try sendFrame(session, carrier, &.{
+                    try typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } }),
+                    try rawPacket(&stack, Current.packetId(.resource_pack_stack).?, &@as([9]u8, @splat(0))),
+                });
             },
             .resource_pack_client_response => {
                 try session.advance(.waiting_for_start_game);

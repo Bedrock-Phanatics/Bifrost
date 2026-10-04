@@ -12,6 +12,8 @@ const Managed = @import("../session/Managed.zig");
 const proxy_key = @import("../session/proxy_key.zig");
 const advertisement = @import("../protocol/advertisement.zig");
 const Admission = @import("Admission.zig");
+const Backend = @import("../backend/Backend.zig");
+const Transfer = @import("../transfer/Transfer.zig");
 const Link = @import("Link.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -20,6 +22,9 @@ const Proxy = @This();
 const log = std.log.scoped(.proxy);
 
 const max_listener_failures = 32;
+const mailbox_capacity = 64;
+
+pub const TransferRequest = struct { player: u64, target: Backend.Id };
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -39,6 +44,11 @@ listener_failures: u8 = 0,
 stop_requested: std.atomic.Value(bool) = .init(false),
 health_changed: std.atomic.Value(bool) = .init(false),
 stats: Stats = .{},
+next_player: u64 = 0,
+next_epoch: Transfer.State.Epoch = 0,
+mailbox_mutex: std.Io.Mutex = .init,
+mailbox: [mailbox_capacity]TransferRequest = undefined,
+mailbox_len: usize = 0,
 
 pub const Options = struct {
     auth: Observer.Auth = .off,
@@ -107,6 +117,12 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .pending_packets = config.pending_packets,
         .pending_bytes = config.pending_bytes,
         .managed = if (self.managed) |*shared| shared else null,
+        .transfer_limits = .{
+            .dial_ms = config.connect_timeout_ms,
+            .phase_ms = config.transfer_phase_timeout_ms,
+            .total_ms = config.transfer_timeout_ms,
+        },
+        .next_epoch = &self.next_epoch,
     };
     return self;
 }
@@ -134,6 +150,46 @@ fn onHealthChanged(context: *anyopaque) void {
     self.scheduler.wake.set(self.io);
 }
 
+// Any thread; the player's own worker runs it
+pub fn requestTransfer(self: *Proxy, player: u64, target: Backend.Id) error{MailboxFull}!void {
+    {
+        self.mailbox_mutex.lockUncancelable(self.io);
+        defer self.mailbox_mutex.unlock(self.io);
+        if (self.mailbox_len == mailbox_capacity) return error.MailboxFull;
+        self.mailbox[self.mailbox_len] = .{ .player = player, .target = target };
+        self.mailbox_len += 1;
+    }
+    self.scheduler.wake.set(self.io);
+}
+
+fn drainMailbox(self: *Proxy) void {
+    var requests: [mailbox_capacity]TransferRequest = undefined;
+    const count = count: {
+        self.mailbox_mutex.lockUncancelable(self.io);
+        defer self.mailbox_mutex.unlock(self.io);
+        const count = self.mailbox_len;
+        @memcpy(requests[0..count], self.mailbox[0..count]);
+        self.mailbox_len = 0;
+        break :count count;
+    };
+    for (requests[0..count]) |request| self.startTransfer(request);
+}
+
+fn startTransfer(self: *Proxy, request: TransferRequest) void {
+    var it = self.links.first;
+    const link = while (it) |node| : (it = node.next) {
+        const link: *Link = @fieldParentPtr("node", node);
+        if (link.id == request.player) break link;
+    } else null;
+    const found = link orelse return self.rejectTransfer(request, error.UnknownPlayer);
+    found.startTransfer(request.target) catch |err| self.rejectTransfer(request, err);
+}
+
+fn rejectTransfer(self: *Proxy, request: TransferRequest, err: anyerror) void {
+    log.info("transfer of player {d} to backend {d} rejected: {t}", .{ request.player, request.target.index(), err });
+    self.stats.bump(.transfers_rejected, 1);
+}
+
 pub fn stop(self: *Proxy) void {
     self.stop_requested.store(true, .release);
     self.scheduler.wake.set(self.io);
@@ -154,6 +210,7 @@ fn turn(self: *Proxy) void {
     self.scheduler.wake.reset();
 
     if (self.health_changed.swap(false, .acquire)) self.refreshAdvertisement();
+    self.drainMailbox();
     const listener_ready = self.listener_watch.take(self.io);
     if (listener_ready or self.listener_busy) self.pollListener();
     self.serviceReady() catch return self.stop();
@@ -225,6 +282,8 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     errdefer link.destroy();
 
     try link.connect();
+    self.next_player += 1;
+    link.id = self.next_player;
     self.links.append(&link.node);
     session.setUserData(link);
     self.stats.bump(.sessions_accepted, 1);

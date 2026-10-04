@@ -3,10 +3,11 @@ const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const PacketQueue = @import("../proxy/PacketQueue.zig");
 const Stats = @import("../proxy/Stats.zig");
+pub const Upstream = @import("Upstream.zig");
 
 const protocol = bedwire.protocol;
 const Current = protocol.Current;
-const Ecdsa = bedwire.crypto.spki.Ecdsa;
+pub const Ecdsa = bedwire.crypto.spki.Ecdsa;
 
 const Managed = @This();
 const log = std.log.scoped(.managed);
@@ -38,7 +39,7 @@ pub const limits: bedwire.Limits = .{
 const player_compression: bedwire.compression.Algorithm = .deflate;
 const player_compression_threshold = 256;
 // Used once, right away
-const login_lifetime_s = 60;
+pub const login_lifetime_s = 60;
 
 // One per worker, used by one call at a time
 pub const Shared = struct {
@@ -67,14 +68,12 @@ pub const Ends = struct {
 };
 
 pub const PlayerPhase = enum { settings, login, handshake, ready };
-pub const BackendPhase = enum { dialing, settings, waiting_for_player, handshake, ready };
 
 gpa: std.mem.Allocator,
 shared: *Shared,
 player: PlayerSession,
-backend: BackendSession,
+upstream: Upstream,
 player_phase: PlayerPhase = .settings,
-backend_phase: BackendPhase = .dialing,
 identity: ?bedwire.Identity = null,
 client_data: ?[]u8 = null,
 // Player packets sent before the backend is ready
@@ -89,7 +88,7 @@ pub fn create(gpa: std.mem.Allocator, shared: *Shared, early_packets: u32, early
         .gpa = gpa,
         .shared = shared,
         .player = player,
-        .backend = try .init(.client, .{ .pool = &shared.pool }),
+        .upstream = try .init(shared),
         .early = .init(early_packets, early_bytes),
     };
     return self;
@@ -97,19 +96,46 @@ pub fn create(gpa: std.mem.Allocator, shared: *Shared, early_packets: u32, early
 
 pub fn destroy(self: *Managed) void {
     self.player.deinit();
-    self.backend.deinit();
+    self.upstream.deinit();
     if (self.identity) |*identity| identity.deinit();
     if (self.client_data) |json| self.gpa.free(json);
     self.early.deinit(self.gpa);
     self.gpa.destroy(self);
 }
 
+pub fn inGame(self: *const Managed) bool {
+    return self.upstream.phase == .ready and self.player.state == .in_game;
+}
+
+pub fn upstreamContext(self: *Managed, ends: Ends, client: *raknet.Client) Upstream.Context {
+    return .{ .gpa = self.gpa, .io = ends.io, .stats = ends.stats, .shared = self.shared, .client = client };
+}
+
+pub fn loginUpstream(self: *Managed, upstream: *Upstream, ctx: Upstream.Context) !void {
+    try upstream.login(ctx, &self.identity.?, self.client_data.?);
+}
+
+pub fn swapUpstream(self: *Managed, next: Upstream) Upstream {
+    const previous = self.upstream;
+    self.upstream = next;
+    return previous;
+}
+
+pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
+    var count: usize = 0;
+    for (packets) |packet| {
+        const header = protocol.packet.decode(packet, .{ .max_packet_bytes = @max(packet.len, 1) }) catch continue;
+        const kind = Current.packetKind(header.header.packet_id);
+        if (!self.player.state.permits(Current.features, .server, kind)) continue;
+        self.shared.batch[count] = packet;
+        count += 1;
+    }
+    if (count != 0) try self.sendToPlayer(ends, self.shared.batch[0..count]);
+    return packets.len - count;
+}
+
 pub fn backendConnected(self: *Managed, ends: Ends) !void {
-    std.debug.assert(self.backend_phase == .dialing);
-    var buffer: [16]u8 = undefined;
-    const request = try encodeTyped(&buffer, .{ .request_network_settings = .{ .client_network_version = @intCast(Current.protocol_number) } });
-    try self.sendToBackend(ends, &.{request});
-    self.backend_phase = .settings;
+    try self.upstream.connected(self.upstreamContext(ends, ends.backend.?));
 }
 
 pub fn fromPlayer(self: *Managed, ends: Ends, payload: []const u8) !void {
@@ -125,39 +151,29 @@ pub fn fromPlayer(self: *Managed, ends: Ends, payload: []const u8) !void {
         .handshake => {
             try self.player.advance(.resource_packs);
             self.player_phase = .ready;
-            if (self.backend_phase == .waiting_for_player) try self.sendBackendLogin(ends);
+            if (self.upstream.phase == .waiting_for_login) try self.loginUpstream(&self.upstream, self.upstreamContext(ends, ends.backend.?));
         },
         .ready => unreachable,
     }
 }
 
 pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
-    var packets = try self.backend.ingest(payload);
+    var packets = try self.upstream.session.ingest(payload);
     defer packets.deinit();
-    if (self.backend_phase == .ready) return self.relayFromBackend(ends, &packets);
+    if (self.upstream.phase == .ready) return self.relayFromBackend(ends, &packets);
 
     const packet = packets.next() orelse return error.MalformedBatch;
-    if (packet.kind == .disconnect or packet.kind == .play_status) {
-        if (self.player_phase == .ready) self.sendToPlayer(ends, &.{packet.bytes}) catch {};
-        return error.BackendRefused;
-    }
-    switch (self.backend_phase) {
-        .settings => {
-            try self.backend.negotiateFromSettings(packet);
-            self.backend_phase = .waiting_for_player;
-            if (self.player_phase == .ready) try self.sendBackendLogin(ends);
-        },
-        .handshake => {
-            try self.backend.acceptServerHandshakePacket(self.gpa, packet, self.shared.key.secret_key);
-            var buffer: [8]u8 = undefined;
-            try self.sendToBackend(ends, &.{try encodeTyped(&buffer, .{ .client_to_server_handshake = .{} })});
-            try self.backend.advance(.resource_packs);
-            self.backend_phase = .ready;
+    const ctx = self.upstreamContext(ends, ends.backend orelse return error.BackendClosed);
+    const progress = self.upstream.receive(ctx, packet) catch |err| {
+        if (err == error.BackendRefused and self.player_phase == .ready) self.sendToPlayer(ends, &.{packet.bytes}) catch {};
+        return err;
+    };
+    switch (progress) {
+        .wants_login => if (self.player_phase == .ready) try self.loginUpstream(&self.upstream, ctx),
+        .logged_in => {
             defer self.early.clear(self.gpa);
-            if (self.early.items().len != 0) try self.sendToBackend(ends, self.early.items());
+            if (self.early.items().len != 0) try self.upstream.send(ctx, self.early.items());
         },
-        .dialing, .waiting_for_player => return error.UnexpectedPacket,
-        .ready => unreachable,
     }
 }
 
@@ -203,35 +219,19 @@ fn authenticate(self: *Managed, ends: Ends, packet: PlayerSession.Packet) !void 
     self.player_phase = .handshake;
 }
 
-fn sendBackendLogin(self: *Managed, ends: Ends) !void {
-    const client_data = self.client_data.?;
-    defer {
-        self.gpa.free(client_data);
-        self.client_data = null;
-    }
-    const expires = std.Io.Clock.real.now(ends.io).toSeconds() + login_lifetime_s;
-    const request = try bedwire.auth.login.buildProxyConnectionRequest(BackendProfile, self.gpa, self.shared.key, &self.identity.?, client_data, expires, .envelope, limits);
-    defer self.gpa.free(request);
-    const storage = try self.gpa.alloc(u8, request.len + 32);
-    defer self.gpa.free(storage);
-    try self.sendToBackend(ends, &.{try bedwire.auth.login.encodeLoginPacket(BackendProfile, storage, request, limits)});
-    ends.stats.bump(.proxy_logins, 1);
-    self.backend_phase = .handshake;
-}
-
 fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) !void {
     var next_state: ?bedwire.State = null;
     var count: usize = 0;
     while (packets.next()) |packet| {
         if (try self.playerMilestone(packet)) |state| next_state = state;
-        if (self.backend_phase != .ready) {
+        if (self.upstream.phase != .ready) {
             try self.early.push(self.gpa, packet.bytes);
             continue;
         }
         self.shared.batch[count] = packet.bytes;
         count += 1;
     }
-    if (count != 0) try self.sendToBackend(ends, self.shared.batch[0..count]);
+    if (count != 0) try self.upstream.send(self.upstreamContext(ends, ends.backend orelse return error.BackendClosed), self.shared.batch[0..count]);
     if (next_state) |state| try self.advance(state);
 }
 
@@ -259,20 +259,16 @@ fn playerMilestone(self: *Managed, packet: PlayerSession.Packet) !?bedwire.State
 }
 
 fn advance(self: *Managed, state: bedwire.State) !void {
-    if (self.backend_phase != .ready) return error.UnexpectedPacket;
+    if (self.upstream.phase != .ready) return error.UnexpectedPacket;
     try self.player.advance(state);
-    try self.backend.advance(state);
+    try self.upstream.session.advance(state);
 }
 
 fn sendToPlayer(self: *Managed, ends: Ends, packets: []const []const u8) !void {
     try send(&self.player, ends.player, ends.stats, .bytes_to_player, packets);
 }
 
-fn sendToBackend(self: *Managed, ends: Ends, packets: []const []const u8) !void {
-    try send(&self.backend, ends.backend orelse return error.BackendClosed, ends.stats, .bytes_to_backend, packets);
-}
-
-fn send(session: anytype, sink: anytype, stats: *Stats, comptime counter: std.meta.FieldEnum(Stats), packets: []const []const u8) !void {
+pub fn send(session: anytype, sink: anytype, stats: *Stats, comptime counter: std.meta.FieldEnum(Stats), packets: []const []const u8) !void {
     var rest = packets;
     var chunk = packets.len;
     while (rest.len != 0) {
@@ -294,13 +290,13 @@ fn send(session: anytype, sink: anytype, stats: *Stats, comptime counter: std.me
     }
 }
 
-fn encodeTyped(buffer: []u8, packet: protocol.typed.Packet) ![]const u8 {
+pub fn encodeTyped(buffer: []u8, packet: protocol.typed.Packet) ![]const u8 {
     var writer = protocol.Writer.init(buffer);
     try protocol.typed.encode(&writer, .{ .header = .{ .packet_id = Current.packetId(protocol.typed.packetKind(packet)).? }, .packet = packet });
     return writer.written();
 }
 
-fn typed(envelope: protocol.BorrowedEnvelope, comptime kind: bedwire.PacketKind) !@FieldType(protocol.typed.Packet, @tagName(kind)) {
+pub fn typed(envelope: protocol.BorrowedEnvelope, comptime kind: bedwire.PacketKind) !@FieldType(protocol.typed.Packet, @tagName(kind)) {
     if (envelope.value != .typed or envelope.value.typed != kind) return error.InvalidProfile;
     return @field(envelope.value.typed, @tagName(kind));
 }

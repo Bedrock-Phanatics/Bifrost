@@ -22,6 +22,11 @@ Settings live in [`config/bifrost.toml`](config/bifrost.toml).
 - A backend must trust exactly that key as its issuer and keep offline logins disabled. A backend that does not
   will refuse managed players.
 
+Managed players can be moved between backends with `Proxy.requestTransfer`. Bifrost logs in to the target and waits
+for its StartGame while the player stays on the old backend; only then does it switch over. Anything that fails
+before the switch leaves the player where they were. Moving the client's world across is not implemented yet, so
+world packets from the new backend are held back for now.
+
 ## Benchmarks
 
 ```sh

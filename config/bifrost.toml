@@ -27,6 +27,10 @@ mode = "off"
 mode = "passthrough"
 # proxy_key_file = "bifrost-proxy.key"
 
+[transfer]
+phase_timeout_ms = 5000
+timeout_ms = 15000
+
 [[backend]]
 # Defaults to the address
 name = "lobby"

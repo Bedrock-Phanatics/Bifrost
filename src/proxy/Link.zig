@@ -9,6 +9,7 @@ const Watch = @import("../net/watch.zig").Watch;
 const no_wait = @import("../net/watch.zig").no_wait;
 const Observer = @import("../protocol/Observer.zig");
 const Managed = @import("../session/Managed.zig");
+const Transfer = @import("../transfer/Transfer.zig");
 const PacketQueue = @import("PacketQueue.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -33,6 +34,8 @@ pub const Env = struct {
     pending_packets: u32,
     pending_bytes: u32,
     managed: ?*Managed.Shared = null,
+    transfer_limits: Transfer.State.Limits = .{ .dial_ms = 5_000, .phase_ms = 5_000, .total_ms = 15_000 },
+    next_epoch: ?*Transfer.State.Epoch = null,
 };
 
 env: *const Env,
@@ -47,6 +50,8 @@ tried: Router.Set = .{},
 pending: PacketQueue,
 observer: Observer,
 managed: ?*Managed = null,
+transfer: ?*Transfer = null,
+id: u64 = 0,
 watch: Watch(raknet.Client) = .{},
 node: std.DoublyLinkedList.Node = .{},
 // Can't free the link while it's still on the ready stack
@@ -70,6 +75,7 @@ pub fn create(env: *const Env, session: *raknet.Session) !*Link {
 }
 
 pub fn destroy(self: *Link) void {
+    self.endTransfer(.player_left);
     self.cancelDial();
     self.dropBackend();
     if (self.managed) |managed| managed.destroy();
@@ -112,6 +118,7 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
 }
 
 pub fn detachSession(self: *Link) void {
+    self.endTransfer(.player_left);
     self.session = null;
     self.cancelDial();
     self.closeBackend();
@@ -123,6 +130,18 @@ pub fn service(self: *Link) error{Canceled}!void {
         task.await(self.env.io);
         self.dial_task = null;
         self.adopt(result);
+    };
+    if (self.transfer) |transfer| if (self.session) |session| switch (try transfer.service(self.transferHost(session))) {
+        .running => {},
+        .finished => {
+            self.backend_id = transfer.target;
+            self.endTransfer(null);
+        },
+        .rolled_back, .abandoned => self.endTransfer(null),
+        .disconnect => {
+            self.endTransfer(null);
+            self.closeSession();
+        },
     };
     _ = self.watch.take(self.env.io);
     const client = self.backend orelse return;
@@ -177,6 +196,40 @@ fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
     self.flushPending(client) catch |err| self.fail(err);
 }
 
+pub fn startTransfer(self: *Link, target: Backend.Id) !void {
+    const managed = self.managed orelse return error.NotManaged;
+    if (self.transfer != null) return error.TransferInProgress;
+    const session = self.session orelse return error.NotInGame;
+    if (self.backend == null or self.backend_closing or !managed.inGame()) return error.NotInGame;
+    if (target.index() >= self.env.router.backends.len) return error.UnknownBackend;
+    if (target == self.backend_id) return error.AlreadyThere;
+    if (self.env.health) |health| if (health.status(target) == .unhealthy) return error.BackendDown;
+    const epoch = self.env.next_epoch.?;
+    epoch.* +%= 1;
+    self.transfer = try Transfer.create(self.transferHost(session), target, self.env.router.get(target).address, epoch.*, self.env.transfer_limits, self.env.pending_packets, self.env.pending_bytes);
+    self.env.scheduler.schedule(self);
+}
+
+fn transferHost(self: *Link, session: *raknet.Session) Transfer.Host {
+    return .{
+        .gpa = self.env.gpa,
+        .io = self.env.io,
+        .stats = self.env.stats,
+        .managed = self.managed.?,
+        .player = session,
+        .notify = Scheduler.linkNotify(self),
+        .backend = &self.backend,
+        .backend_watch = &self.watch,
+    };
+}
+
+fn endTransfer(self: *Link, event: ?Transfer.State.Event) void {
+    const transfer = self.transfer orelse return;
+    self.transfer = null;
+    if (event) |cause| transfer.end(self.env.io, self.env.stats, cause);
+    transfer.destroy(self.env.gpa, self.env.io);
+}
+
 fn ends(self: *Link, session: *raknet.Session) Managed.Ends {
     return .{ .io = self.env.io, .stats = self.env.stats, .player = session, .backend = if (self.backend_closing) null else self.backend };
 }
@@ -212,6 +265,7 @@ fn cancelDial(self: *Link) void {
 
 fn fail(self: *Link, err: anyerror) void {
     log.debug("closing link: {t}", .{err});
+    self.endTransfer(.source_failed);
     self.dropBackend();
     self.closeSession();
 }

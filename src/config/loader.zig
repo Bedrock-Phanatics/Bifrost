@@ -83,6 +83,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
         return fail(diag, .{ .section = "health", .name = "timeout_ms" }, "must be shorter than interval_ms", .{});
     if (config.auth == .verify and config.keysFile() == null)
         return fail(diag, .{ .section = "auth", .name = "keys_file" }, "is required when mode = \"verify\"", .{});
+    if (config.transfer_timeout_ms < config.transfer_phase_timeout_ms)
+        return fail(diag, .{ .section = "transfer", .name = "timeout_ms" }, "can't be shorter than phase_timeout_ms", .{});
     if (config.session_mode == .managed) {
         if (config.auth != .verify)
             return fail(diag, .{ .section = "session", .name = "mode" }, "\"managed\" needs [auth] mode = \"verify\"", .{});
@@ -106,6 +108,8 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
             try readHealth(config, try table(diag, key, value), diag);
         } else if (eql(name, "auth")) {
             try readAuth(config, try table(diag, key, value), diag);
+        } else if (eql(name, "transfer")) {
+            try readTransfer(config, try table(diag, key, value), diag);
         } else if (eql(name, "session")) {
             try readSession(config, try table(diag, key, value), diag);
         } else if (eql(name, "backend")) {
@@ -179,6 +183,19 @@ fn readAuth(config: *Config, section: *const toml.Table, diag: *Diagnostic) Erro
         } else if (eql(key.name.?, "keys_file")) {
             config.setKeysFile(try string(diag, key, value)) catch
                 return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len});
+        } else return fail(diag, key, "unknown key", .{});
+    }
+}
+
+fn readTransfer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "transfer", .name = entry.key_ptr.* };
+        const value = entry.value_ptr.*;
+        if (eql(key.name.?, "phase_timeout_ms")) {
+            config.transfer_phase_timeout_ms = try integer(u32, diag, key, value, 100, 60_000);
+        } else if (eql(key.name.?, "timeout_ms")) {
+            config.transfer_timeout_ms = try integer(u32, diag, key, value, 100, 300_000);
         } else return fail(diag, key, "unknown key", .{});
     }
 }

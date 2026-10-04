@@ -23,6 +23,8 @@ pending_packets: u32 = 64,
 pending_bytes: u32 = 1024 * 1024,
 health_interval_ms: u32 = 5_000,
 health_timeout_ms: u32 = 1_000,
+transfer_phase_timeout_ms: u32 = 5_000,
+transfer_timeout_ms: u32 = 15_000,
 auth: Auth = .off,
 keys_file_storage: [max_path_len]u8 = undefined,
 keys_file_len: usize = 0,
@@ -107,6 +109,7 @@ pub fn validate(self: *const Config) error{ NoBackends, InvalidLimit, MissingKey
     if (self.max_players_per_ip > self.max_players) return error.InvalidLimit;
     if (self.pending_packets == 0 or self.pending_bytes == 0) return error.InvalidLimit;
     if (self.health_timeout_ms == 0 or self.health_timeout_ms >= self.health_interval_ms) return error.InvalidLimit;
+    if (self.transfer_phase_timeout_ms == 0 or self.transfer_timeout_ms < self.transfer_phase_timeout_ms) return error.InvalidLimit;
 }
 
 test "setMotd copies and bounds the value" {
