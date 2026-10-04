@@ -48,8 +48,8 @@ pub const Player = struct {
     pool: *bedwire.BufferPool,
     session: bedwire.Session,
     key: Ecdsa.KeyPair,
-    inbox: std.ArrayList(u8) = .empty,
-    got: bool = false,
+    frames: std.ArrayList([]u8) = .empty,
+    current: ?[]u8 = null,
     timeout_ms: i64 = 5_000,
 
     pub fn connect(io: std.Io, address: IpAddress, seed: u8) !*Player {
@@ -74,7 +74,9 @@ pub const Player = struct {
         self.client.destroy();
         self.pool.deinit();
         gpa.destroy(self.pool);
-        self.inbox.deinit(gpa);
+        if (self.current) |frame| gpa.free(frame);
+        for (self.frames.items) |frame| gpa.free(frame);
+        self.frames.deinit(gpa);
         gpa.destroy(self);
     }
 
@@ -158,18 +160,50 @@ pub const Player = struct {
         try std.testing.expectEqualSlices(u8, payload, packet.bytes[packet.bytes.len - payload.len ..]);
     }
 
-    fn awaitFrame(self: *Player) ![]const u8 {
-        self.got = false;
+    pub fn nextGamePacket(self: *Player, out: []u8) ![]const u8 {
+        while (true) {
+            var packets = try self.receive();
+            defer packets.deinit();
+            while (packets.next()) |packet| {
+                if (packet.kind != null) continue;
+                const payload = packet.bytes[2..];
+                @memcpy(out[0..payload.len], payload);
+                return out[0..payload.len];
+            }
+        }
+    }
+
+    pub fn countGamePackets(self: *Player, suffix: []const u8, ms: i64) !usize {
+        const saved = self.timeout_ms;
+        defer self.timeout_ms = saved;
+        self.timeout_ms = 20;
+        var count: usize = 0;
+        var buffer: [64]u8 = undefined;
         const started = std.Io.Clock.awake.now(self.io);
-        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < self.timeout_ms) {
+        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < ms) {
+            const payload = self.nextGamePacket(&buffer) catch |err| switch (err) {
+                error.NoMessage => continue,
+                else => return err,
+            };
+            if (std.mem.endsWith(u8, payload, suffix)) count += 1;
+        }
+        return count;
+    }
+
+    fn awaitFrame(self: *Player) ![]const u8 {
+        if (self.current) |frame| gpa.free(frame);
+        self.current = null;
+        const started = std.Io.Clock.awake.now(self.io);
+        while (self.frames.items.len == 0) {
+            if (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() >= self.timeout_ms) return error.NoMessage;
             _ = self.client.poll(fixtures.millis(10), self, collect) catch |err| switch (err) {
                 error.Timeout => {},
                 else => return err,
             };
-            if (self.got) return self.inbox.items;
-            if (self.client.isClosed()) return error.ConnectionClosed;
+            if (self.frames.items.len == 0 and self.client.isClosed()) return error.ConnectionClosed;
         }
-        return error.NoMessage;
+        self.current = self.frames.orderedRemove(0);
+        return self.current.?;
     }
 
     pub fn awaitClosed(self: *Player) !void {
@@ -186,10 +220,8 @@ pub const Player = struct {
 
     fn collect(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
         const self: *Player = @ptrCast(@alignCast(context));
-        if (self.got) return;
-        self.inbox.clearRetainingCapacity();
-        self.inbox.appendSlice(gpa, payload.bytes) catch return error.ApplicationFailure;
-        self.got = true;
+        self.frames.ensureUnusedCapacity(gpa, 1) catch return error.ApplicationFailure;
+        self.frames.appendAssumeCapacity(gpa.dupe(u8, payload.bytes) catch return error.ApplicationFailure);
     }
 };
 
@@ -199,7 +231,10 @@ pub const Backend = struct {
     const Connection = struct {
         session: Session,
         key: Ecdsa.KeyPair,
+        carrier: *raknet.Session,
     };
+
+    pub const Mode = enum { normal, silent_login, kick_login, silent_stack, welcome, flood, chatter };
 
     io: std.Io,
     listener: *raknet.Server,
@@ -210,8 +245,11 @@ pub const Backend = struct {
     connections: std.ArrayList(*Connection) = .empty,
     logins: std.atomic.Value(u32) = .init(0),
     echoes: std.atomic.Value(u32) = .init(0),
+    handshakes: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
     refuse: bool = false,
+    mode: Mode = .normal,
+    chattered_ns: u64 = 0,
     identity_name: [64]u8 = undefined,
     identity_name_len: usize = 0,
     identity_xuid_len: usize = 0,
@@ -260,6 +298,19 @@ pub const Backend = struct {
                 .message = onMessage,
                 .disconnected = onDisconnected,
             }) catch {};
+            if (self.mode == .chatter) self.chatter();
+        }
+    }
+
+    fn chatter(self: *Backend) void {
+        const now: u64 = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds);
+        if (now - self.chattered_ns < 5 * std.time.ns_per_ms) return;
+        self.chattered_ns = now;
+        var buffer: [16]u8 = undefined;
+        const packet = rawPacket(&buffer, game_packet_id, "chatter") catch unreachable;
+        for (self.connections.items) |connection| {
+            if (connection.session.state != .in_game and connection.session.state != .spawn_ready) continue;
+            sendFrame(&connection.session, connection.carrier, &.{packet}) catch {};
         }
     }
 
@@ -273,6 +324,7 @@ pub const Backend = struct {
                 return error.ApplicationFailure;
             },
             .key = proxyKey(99) catch unreachable,
+            .carrier = session,
         };
         self.connections.appendAssumeCapacity(connection);
         session.setUserData(connection);
@@ -308,8 +360,8 @@ pub const Backend = struct {
         var buffer: [512]u8 = undefined;
         while (packets.next()) |packet| switch (packet.kind orelse {
             if (std.mem.endsWith(u8, packet.bytes, "kick")) return carrier.close();
-            try sendFrame(session, carrier, &.{packet.bytes});
             _ = self.echoes.fetchAdd(1, .release);
+            try sendFrame(session, carrier, &.{packet.bytes});
             continue;
         }) {
             .request_network_settings => {
@@ -333,6 +385,8 @@ pub const Backend = struct {
                 self.identity_xuid_len = identity.xuid.len;
                 self.identity_online = identity.online;
                 _ = self.logins.fetchAdd(1, .release);
+                if (self.mode == .silent_login) return;
+                if (self.mode == .kick_login) return carrier.close();
                 if (self.refuse) {
                     try sendFrame(session, carrier, &.{try typedPacket(&buffer, .{ .play_status = .{ .status = .loginfailed_serverold } })});
                     return;
@@ -347,15 +401,27 @@ pub const Backend = struct {
             },
             .client_to_server_handshake => {
                 try session.advance(.resource_packs);
+                _ = self.handshakes.fetchAdd(1, .release);
+                const status = try typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } });
+                if (self.mode == .silent_stack) return sendFrame(session, carrier, &.{status});
                 var stack: [16]u8 = undefined;
-                try sendFrame(session, carrier, &.{
-                    try typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } }),
-                    try rawPacket(&stack, Current.packetId(.resource_pack_stack).?, &@as([9]u8, @splat(0))),
-                });
+                try sendFrame(session, carrier, &.{ status, try rawPacket(&stack, Current.packetId(.resource_pack_stack).?, &@as([9]u8, @splat(0))) });
             },
             .resource_pack_client_response => {
                 try session.advance(.waiting_for_start_game);
-                try sendFrame(session, carrier, &.{try rawPacket(&buffer, Current.packetId(.start_game).?, "not a real StartGame")});
+                const start_game = try rawPacket(&buffer, Current.packetId(.start_game).?, "not a real StartGame");
+                var extra: [16]u8 = undefined;
+                switch (self.mode) {
+                    .welcome => try sendFrame(session, carrier, &.{ start_game, try rawPacket(&extra, game_packet_id, "welcome") }),
+                    .flood => {
+                        var batch: [301][]const u8 = undefined;
+                        batch[0] = start_game;
+                        const filler = try rawPacket(&extra, game_packet_id, "flood");
+                        @memset(batch[1..], filler);
+                        try sendFrame(session, carrier, &batch);
+                    },
+                    else => try sendFrame(session, carrier, &.{start_game}),
+                }
                 try session.advance(.spawn_ready);
             },
             .set_local_player_as_initialised => try session.advance(.in_game),

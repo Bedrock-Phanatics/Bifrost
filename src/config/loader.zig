@@ -382,6 +382,17 @@ test "session section selects managed mode" {
     try expectInvalid(verify ++ "[session]\nmode = \"managed\"\n" ++ backend, "session.proxy_key_file: is required when mode = \"managed\"");
 }
 
+test "transfer section sets the timeouts" {
+    var diag: Diagnostic = .{};
+    const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
+    const config = try parse(std.testing.allocator, "[transfer]\nphase_timeout_ms = 2000\ntimeout_ms = 9000\n" ++ backend, &diag);
+    try std.testing.expectEqual(@as(u32, 2000), config.transfer_phase_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 9000), config.transfer_timeout_ms);
+    try expectInvalid("[transfer]\nphase_timeout_ms = 50\n" ++ backend, "transfer.phase_timeout_ms: must be between 100 and 60000");
+    try expectInvalid("[transfer]\nphase_timeout_ms = 6000\ntimeout_ms = 5000\n" ++ backend, "transfer.timeout_ms: can't be shorter than phase_timeout_ms");
+    try expectInvalid("[transfer]\nretries = 1\n" ++ backend, "transfer.retries: unknown key");
+}
+
 test "loadFile reports missing and oversized files" {
     const io = std.testing.io;
     var diag: Diagnostic = .{};

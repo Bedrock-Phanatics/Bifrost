@@ -131,7 +131,9 @@ pub fn service(self: *Transfer, host: Host) error{Canceled}!Result {
         }
     };
     if (self.result != .running) return self.result;
-    if (self.timer_fired.swap(false, .acquire) and self.state.expired(now(host.io))) self.on(host, .expired);
+    if (self.timer_fired.swap(false, .acquire)) {
+        if (self.state.expired(now(host.io))) self.on(host, .expired) else self.armTimer(host) catch self.on(host, .target_failed);
+    }
     if (self.result != .running) return self.result;
 
     _ = self.watch.take(host.io);

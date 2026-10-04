@@ -6,6 +6,7 @@ const FailOnce = @This();
 child: std.mem.Allocator,
 fail_at: usize,
 count: std.atomic.Value(usize) = .init(0),
+armed: std.atomic.Value(bool) = .init(true),
 
 pub fn allocator(self: *FailOnce) std.mem.Allocator {
     return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -17,7 +18,7 @@ pub fn allocations(self: *const FailOnce) usize {
 
 fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
     const self: *FailOnce = @ptrCast(@alignCast(context));
-    if (self.count.fetchAdd(1, .acq_rel) == self.fail_at) return null;
+    if (self.armed.load(.acquire) and self.count.fetchAdd(1, .acq_rel) == self.fail_at) return null;
     return self.child.rawAlloc(len, alignment, ret_addr);
 }
 
