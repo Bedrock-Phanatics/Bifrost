@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const bifrost = @import("bifrost");
+const managed = @import("managed.zig");
 
 const IpAddress = std.Io.net.IpAddress;
 const Current = bedwire.protocol.Current;
@@ -175,6 +176,7 @@ pub const Proxy = struct {
         workers: u8 = 1,
         connect_timeout_ms: u32 = 1_000,
         health_interval_ms: u32 = 1_000,
+        managed: bool = false,
         backends: []const u16,
     };
 
@@ -188,6 +190,7 @@ pub const Proxy = struct {
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.workers}));
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.connect_timeout_ms}));
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.health_interval_ms}));
+        try argv.append(gpa, try gpa.dupe(u8, if (options.managed) "managed" else "passthrough"));
         for (options.backends) |port| try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{port}));
 
         self.io = io;
@@ -409,6 +412,7 @@ pub const Player = struct {
     expect: ?[]const u8 = null,
     recorder: ?*Recorder = null,
     count_until_ns: u64 = 0,
+    bedrock: ?*managed.Bedrock = null,
 
     pub fn connect(self: *Player, gpa: std.mem.Allocator, io: std.Io, address: IpAddress) !void {
         self.* = .{ .io = io, .client = try raknet.Client.connect(gpa, io, address, .{}) };
@@ -416,10 +420,14 @@ pub const Player = struct {
 
     pub fn deinit(self: *Player) void {
         self.client.destroy();
+        if (self.bedrock) |bedrock| bedrock.destroy();
     }
 
     pub fn send(self: *Player, payload: []const u8) !void {
-        try self.client.send(payload, .reliable_ordered, 0);
+        const bedrock = self.bedrock orelse return self.client.send(payload, .reliable_ordered, 0);
+        const frame = try bedrock.wrap(payload);
+        defer frame.release();
+        try self.client.send(frame.bytes, .reliable_ordered, 0);
     }
 
     /// Sends and waits for exactly this reply
@@ -460,15 +468,22 @@ pub const Player = struct {
 
     fn onMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
         const self: *Player = @ptrCast(@alignCast(context));
+        const bedrock = self.bedrock orelse return self.record(payload.bytes);
+        var packets = bedrock.session.ingest(payload.bytes) catch return error.ApplicationFailure;
+        defer packets.deinit();
+        while (packets.next()) |packet| try self.record(packet.bytes[managed.header_len..]);
+    }
+
+    fn record(self: *Player, bytes: []const u8) error{ApplicationFailure}!void {
         self.received += 1;
-        if (self.expect) |expected| self.matched = std.mem.eql(u8, expected, payload.bytes);
+        if (self.expect) |expected| self.matched = std.mem.eql(u8, expected, bytes);
         const recorder = self.recorder orelse return;
-        if (payload.bytes.len < 9) return error.ApplicationFailure;
+        if (bytes.len < 9) return error.ApplicationFailure;
         const now = nowNs(self.io);
-        recorder.latencies_ns.appendBounded(now -| std.mem.readInt(u64, payload.bytes[1..9], .little)) catch {};
+        recorder.latencies_ns.appendBounded(now -| std.mem.readInt(u64, bytes[1..9], .little)) catch {};
         if (now <= self.count_until_ns) {
             recorder.messages += 1;
-            recorder.bytes += payload.bytes.len;
+            recorder.bytes += bytes.len;
         }
     }
 };

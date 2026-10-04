@@ -44,6 +44,24 @@ worker placement before it is worth considering as a default. At 4 and 8 workers
 Both versions occasionally lose a whole churn round or connection wave (thousands of failed cycles, or 0 joined) when
 the kernel drops UDP bursts; see `net.core.rmem_max` in the README. Treat a single such row as noise, not a regression.
 
+## Passthrough vs managed
+
+`zig build bench -Doptimize=ReleaseFast -- managed`, same host, 1 worker, random payloads, no packet subscribers.
+Managed sessions compress batches over 256 B with deflate on both legs.
+
+| payload | load | passthrough round trips/s | managed round trips/s | managed p50 / p99 us | proxy CPU (pass / managed) |
+|---|---|---|---|---|---|
+| 64 B | 1x1 | 7921 | 7497 | 102 / 377 | 90% / 88% |
+| 64 B | 8x32 | 31690 | 30022 | 8471 / 11096 | 98% / 98% |
+| 512 B | 1x1 | 8272 | 2448 | 383 / 584 | 92% / 72% |
+| 512 B | 8x32 | 34150 | 8535 | 27020 / 61497 | 94% / 93% |
+| 8 KiB | 1x1 | 4645 | 1200 | 801 / 1180 | 95% / 64% |
+| 8 KiB | 8x32 | 5025 | 1652 | 140321 / 249920 | 97% / 98% |
+
+Joins: 1.9 ms per player passthrough, 15.1 ms managed (token check, proxy login, two key exchanges).
+Below the compression threshold managed costs about 5%. Above it, re-compressing every batch makes the proxy
+CPU-bound at roughly a quarter to a third of passthrough; that is the first thing to optimise in managed mode.
+
 ## ReleaseSafe
 
 `-- --quick`, Zig 0.17, work_stealing: relay 512 B 1x1 8554 round trips/s (p50 91 us, p99 221 us), 8 KiB 8x32 23.8 MiB/s,

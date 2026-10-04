@@ -25,15 +25,17 @@ Settings live in [`config/bifrost.toml`](config/bifrost.toml).
 ## Benchmarks
 
 ```sh
-zig build bench -Doptimize=ReleaseFast                          # full suite, about 4 minutes
+zig build bench -Doptimize=ReleaseFast                          # full suite, about 5 minutes
 zig build bench -Doptimize=ReleaseFast -- relay workers --quick # pick scenarios, shorter runs
 zig build bench -Doptimize=ReleaseFast -Dscheduling=pinned      # proxy without ZIO work stealing
+zig build bench -Doptimize=ReleaseFast -- managed               # passthrough vs managed sessions
 ```
 
 [`bench/baseline.md`](bench/baseline.md) records the numbers later changes are compared against.
 
 The suite starts the real proxy (`Workers` on the same runtime as `bifrost`) as a child process, and drives it with
-RakNet clients and echo backends from the parent. Scenarios: `relay`, `handshake`, `connections`, `workers`, `backends`.
+RakNet clients and echo backends from the parent. Scenarios: `relay`, `managed`, `handshake`, `connections`, `workers`,
+`backends`.
 RSS, CPU and kernel drop counts need Linux; elsewhere only the single-worker numbers are meaningful.
 
 Representative results from one run: WSL2 Ubuntu on 12 logical CPUs, ReleaseFast, loopback, with the clients and

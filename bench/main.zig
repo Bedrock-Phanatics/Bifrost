@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const zio = @import("zio");
 const bifrost = @import("bifrost");
 const bench_options = @import("bench_options");
+const credentials = @import("credentials");
 const harness = @import("harness.zig");
+const managed = @import("managed.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -19,11 +21,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|managed|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "managed", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -97,6 +99,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (selected.items) |name| {
         if (std.mem.eql(u8, name, "relay")) try relayScenario(&env);
+        if (std.mem.eql(u8, name, "managed")) try managedScenario(&env);
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
         if (std.mem.eql(u8, name, "connections")) try connectionsScenario(&env);
         if (std.mem.eql(u8, name, "workers")) try workersScenario(&env);
@@ -146,22 +149,29 @@ const Memory = struct {
     churn_heap: [3]u64 = @splat(0),
 };
 
-/// args: workers connect_timeout_ms health_interval_ms backend_port...
+/// args: workers connect_timeout_ms health_interval_ms passthrough|managed backend_port...
 fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (args.len < 4) return error.InvalidArguments;
+    if (args.len < 5) return error.InvalidArguments;
     var config: bifrost.Config = .{ .bind = harness.loopback(0), .max_players = 16_384 };
     config.workers = try std.fmt.parseInt(u8, args[0], 10);
     config.connect_timeout_ms = try std.fmt.parseInt(u32, args[1], 10);
     config.health_interval_ms = try std.fmt.parseInt(u32, args[2], 10);
     config.health_timeout_ms = @min(1_000, config.health_interval_ms / 2);
-    for (args[3..]) |port| try config.addBackend(null, harness.loopback(try std.fmt.parseInt(u16, port, 10)));
+    for (args[4..]) |port| try config.addBackend(null, harness.loopback(try std.fmt.parseInt(u16, port, 10)));
+    var keys = try credentials.keySet(init.gpa);
+    defer keys.deinit();
+    var options: bifrost.Workers.Options = .{};
+    if (std.mem.eql(u8, args[3], "managed")) {
+        config.session_mode = .managed;
+        options = .{ .auth = .{ .verify = &keys }, .proxy_key = managed.proxyKey() };
+    }
 
     // Same runtime setup as the real binary
     const rt = try zio.Runtime.init(init.gpa, .{ .executors = .exact(config.workers) });
     defer rt.deinit();
     const io = rt.io();
     var heap: harness.CountingAllocator = .{ .backing = init.gpa };
-    const workers = try bifrost.Workers.create(heap.allocator(), io, config, .{});
+    const workers = try bifrost.Workers.create(heap.allocator(), io, config, options);
     defer workers.destroy();
     var task = try io.concurrent(bifrost.Workers.run, .{workers});
 
@@ -366,9 +376,11 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
     const io = env.io;
     const jobs = try gpa.alloc(RelayJob, players.len);
     defer gpa.free(jobs);
+    // Random, so compression can't flatter managed mode
+    var prng: std.Random.DefaultPrng = .init(size);
     for (jobs, players) |*job, *player| {
         const payload = try gpa.alloc(u8, size);
-        for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 7);
+        prng.random().bytes(payload);
         payload[0] = 0xfe;
         job.* = .{ .io = io, .player = player, .payload = payload, .window = window, .until_ns = 0 };
         job.recorder.latencies_ns = try .initCapacity(gpa, 1 << 18);
@@ -478,6 +490,76 @@ fn relayScenario(env: *Env) !void {
     try env.out.print("\nTap: {d} handshakes observed, {d} gave up. Proxy RSS {d} KiB fresh, {d} KiB with 8 players, peak {d} KiB. Proxy CPU with 8 silent players: {d:.1}%.\n", .{
         after.handshakes, after.gave_up, base.rss_kb, joined.rss_kb, after.hwm_kb, idle_cpu,
     });
+}
+
+const Mode = enum { passthrough, managed };
+const managed_sizes = [_]usize{ 64, 512, 8 * 1024 };
+
+fn managedScenario(env: *Env) !void {
+    var results: [2][managed_sizes.len][2]RelayResult = undefined;
+    var join_ms: [2]f64 = undefined;
+    for (std.enums.values(Mode), 0..) |mode, m| {
+        var echo: managed.Backend = undefined;
+        var backends: ?Backends = null;
+        const port = switch (mode) {
+            .passthrough => port: {
+                backends = try .start(env, 1);
+                break :port backends.?.ports[0];
+            },
+            .managed => port: {
+                try echo.start(env.gpa, env.io);
+                break :port echo.port();
+            },
+        };
+        defer if (backends) |b| b.deinit(env) else echo.deinit();
+        var proxy: Proxy = undefined;
+        try env.startProxy(&proxy, .{ .backends = &.{port}, .managed = mode == .managed });
+        defer proxy.stop();
+
+        const players = try env.gpa.alloc(Player, 8);
+        var joined: usize = 0;
+        defer {
+            for (players[0..joined]) |*player| player.deinit();
+            env.gpa.free(players);
+        }
+        const started = nowNs(env.io);
+        for (players, 0..) |*player, i| {
+            try player.connect(env.gpa, env.io, proxy.address());
+            joined += 1;
+            switch (mode) {
+                .passthrough => try player.handshake(env.frames),
+                .managed => try managed.join(env.gpa, env.io, player, @intCast(i + 2)),
+            }
+        }
+        join_ms[m] = elapsedS(env.io, started) * 1000 / @as(f64, @floatFromInt(players.len));
+        for (managed_sizes, 0..) |size, s| {
+            results[m][s][0] = try relay(env, &proxy, players[0..1], size, 1);
+            results[m][s][1] = try relay(env, &proxy, players, size, windowFor(size));
+        }
+    }
+
+    try env.out.print(
+        \\
+        \\## Passthrough vs managed
+        \\
+        \\Same echo workload as the raw relay, 1 worker, nothing subscribed to packets. Managed decrypts, decompresses and
+        \\re-batches every batch, then compresses and encrypts it again, in both directions. Joins are sequential and
+        \\include the full managed login (Microsoft token check, proxy login to the backend, two key exchanges).
+        \\
+        \\| payload | load | mode | round trips/s | MiB/s | p50 us | p99 us | proxy CPU |
+        \\|---|---|---|---|---|---|---|---|
+        \\
+    , .{});
+    for (managed_sizes, 0..) |size, s| for (0..2) |loaded| for (std.enums.values(Mode), 0..) |mode, m| {
+        const result = results[m][s][loaded];
+        try env.out.print("| {Bi} | {s}{d} | {t} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} | {d:.0} | {d:.0} | {d:.0}% |\n", .{
+            size,                   if (loaded == 1) "8x" else "1x", if (loaded == 1) windowFor(size) else 1,
+            mode,                   result.round_trips.median,       result.round_trips.min,
+            result.round_trips.max, result.mib_s.median,             result.latency.p50,
+            result.latency.p99,     result.cpu_pct,
+        });
+    };
+    try env.out.print("\nJoin time per player: {d:.1} ms passthrough, {d:.1} ms managed.\n", .{ join_ms[0], join_ms[1] });
 }
 
 /// Proxy CPU while connected players send nothing; should be close to zero
