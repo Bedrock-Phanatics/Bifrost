@@ -10,6 +10,7 @@ pub const Proxy = @import("proxy/Proxy.zig");
 pub const Workers = @import("proxy/Workers.zig");
 pub const Admission = @import("proxy/Admission.zig");
 pub const Stats = @import("proxy/Stats.zig");
+pub const Backend = @import("backend/Backend.zig");
 pub const Health = @import("backend/Health.zig");
 
 pub const Auth = Observer.Auth;
@@ -21,6 +22,7 @@ test {
     _ = Config;
     _ = loader;
     _ = Admission;
+    _ = Backend;
     _ = Health;
     _ = @import("backend/Router.zig");
     _ = @import("protocol/advertisement.zig");

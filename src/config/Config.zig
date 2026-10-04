@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Backend = @import("../backend/Backend.zig");
 const IpAddress = std.Io.net.IpAddress;
 
 const Config = @This();
@@ -27,7 +28,7 @@ keys_file_storage: [max_path_len]u8 = undefined,
 keys_file_len: usize = 0,
 motd_storage: [max_motd_len]u8 = undefined,
 motd_len: usize = 0,
-backend_storage: [max_backends]IpAddress = undefined,
+backend_storage: [max_backends]Backend = undefined,
 backend_count: usize = 0,
 
 pub const Auth = enum {
@@ -55,17 +56,28 @@ pub fn setMotd(self: *Config, value: []const u8) error{InvalidMotd}!void {
     self.motd_len = value.len;
 }
 
-pub fn backends(self: *const Config) []const IpAddress {
+pub fn backends(self: *const Config) []const Backend {
     return self.backend_storage[0..self.backend_count];
 }
 
-pub fn addBackend(self: *Config, address: IpAddress) error{ InvalidPort, TooManyBackends, DuplicateBackend }!void {
-    if (address.getPort() == 0) return error.InvalidPort;
-    for (self.backends()) |existing| {
-        if (existing.eql(&address)) return error.DuplicateBackend;
+pub fn findBackend(self: *const Config, name: []const u8) ?Backend.Id {
+    for (self.backends(), 0..) |*backend, i| {
+        if (std.mem.eql(u8, backend.name(), name)) return .of(i);
     }
+    return null;
+}
+
+pub const AddBackendError = Backend.InitError || error{ TooManyBackends, DuplicateBackend, DuplicateName };
+
+/// A null name uses the address text.
+pub fn addBackend(self: *Config, name: ?[]const u8, address: IpAddress) AddBackendError!void {
+    const backend: Backend = try .init(name, address);
+    for (self.backends()) |*existing| {
+        if (existing.address.eql(&address)) return error.DuplicateBackend;
+    }
+    if (self.findBackend(backend.name()) != null) return error.DuplicateName;
     if (self.backend_count == max_backends) return error.TooManyBackends;
-    self.backend_storage[self.backend_count] = address;
+    self.backend_storage[self.backend_count] = backend;
     self.backend_count += 1;
 }
 
@@ -93,9 +105,19 @@ test "setMotd copies and bounds the value" {
 
 test "addBackend rejects port 0, duplicates and overflow" {
     var config: Config = .{};
-    try std.testing.expectError(error.InvalidPort, config.addBackend(.{ .ip4 = .loopback(0) }));
-    try config.addBackend(.{ .ip4 = .loopback(1) });
-    try std.testing.expectError(error.DuplicateBackend, config.addBackend(.{ .ip4 = .loopback(1) }));
-    for (2..max_backends + 1) |port| try config.addBackend(.{ .ip4 = .loopback(@intCast(port)) });
-    try std.testing.expectError(error.TooManyBackends, config.addBackend(.{ .ip4 = .loopback(9999) }));
+    try std.testing.expectError(error.InvalidPort, config.addBackend(null, .{ .ip4 = .loopback(0) }));
+    try config.addBackend(null, .{ .ip4 = .loopback(1) });
+    try std.testing.expectError(error.DuplicateBackend, config.addBackend("other", .{ .ip4 = .loopback(1) }));
+    for (2..max_backends + 1) |port| try config.addBackend(null, .{ .ip4 = .loopback(@intCast(port)) });
+    try std.testing.expectError(error.TooManyBackends, config.addBackend(null, .{ .ip4 = .loopback(9999) }));
+}
+
+test "backends are found by name" {
+    var config: Config = .{};
+    try config.addBackend("lobby", .{ .ip4 = .loopback(1) });
+    try config.addBackend(null, .{ .ip4 = .loopback(2) });
+    try std.testing.expectError(error.DuplicateName, config.addBackend("lobby", .{ .ip4 = .loopback(3) }));
+    try std.testing.expectEqual(Backend.Id.of(0), config.findBackend("lobby").?);
+    try std.testing.expectEqual(Backend.Id.of(1), config.findBackend("127.0.0.1:2").?);
+    try std.testing.expectEqual(@as(?Backend.Id, null), config.findBackend("missing"));
 }

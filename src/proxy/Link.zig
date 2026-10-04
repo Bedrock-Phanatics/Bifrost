@@ -1,6 +1,7 @@
 const std = @import("std");
 const raknet = @import("raknet");
 const bedwire = @import("bedwire");
+const Backend = @import("../backend/Backend.zig");
 const Dial = @import("../backend/Dial.zig");
 const Health = @import("../backend/Health.zig");
 const Router = @import("../backend/Router.zig");
@@ -38,9 +39,9 @@ session: ?*raknet.Session,
 backend: ?*raknet.Client = null,
 backend_closing: bool = false,
 dial: Dial = .{},
-backend_index: usize = 0,
+backend_id: Backend.Id = .of(0),
 dial_task: ?std.Io.Future(void) = null,
-tried: Router.Set = .empty,
+tried: Router.Set = .{},
 pending: PacketQueue,
 observer: Observer,
 watch: Watch(raknet.Client) = .{},
@@ -72,12 +73,13 @@ pub fn destroy(self: *Link) void {
 pub fn connect(self: *Link) (error{NoBackendAvailable} || std.Io.ConcurrentError)!void {
     std.debug.assert(self.dial_task == null and self.backend == null);
     if (self.tried.count() == max_dial_attempts) return error.NoBackendAvailable;
-    const backend = self.env.router.pick(self.tried) orelse return error.NoBackendAvailable;
-    self.tried.set(backend.index);
-    self.backend_index = backend.index;
+    const id = self.env.router.pick(self.tried) orelse return error.NoBackendAvailable;
+    self.tried.add(id);
+    self.backend_id = id;
     self.dial = .{};
     const options: raknet.ClientOptions = .{ .handshake_timeout_ms = self.env.connect_timeout_ms };
-    self.dial_task = try self.env.io.concurrent(Dial.run, .{ &self.dial, self.env.gpa, self.env.io, backend.address, options, Scheduler.linkNotify(self) });
+    const address = self.env.router.get(id).address;
+    self.dial_task = try self.env.io.concurrent(Dial.run, .{ &self.dial, self.env.gpa, self.env.io, address, options, Scheduler.linkNotify(self) });
 }
 
 pub fn isFinished(self: *const Link) bool {
@@ -143,10 +145,10 @@ fn observe(self: *Link, direction: bedwire.TapDirection, payload: []const u8) Ob
 
 fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
     const client = result catch |err| {
-        log.warn("backend {f} connect failed: {t}", .{ self.env.router.backends[self.backend_index], err });
+        log.warn("backend {f} connect failed: {t}", .{ self.env.router.get(self.backend_id).*, err });
         self.env.stats.bump(.backend_failures, 1);
         if (err == error.Canceled) return self.closeSession();
-        if (self.env.health) |health| health.markFailed(self.backend_index);
+        if (self.env.health) |health| health.markFailed(self.backend_id);
         if (self.session == null) return;
         self.connect() catch |retry_err| {
             log.warn("giving up on player: {t}", .{retry_err});

@@ -41,7 +41,7 @@ fn statusIs(running: *RunningWorkers, index: usize, status: bifrost.Health.Statu
     const Check = struct { running: *RunningWorkers, index: usize, status: bifrost.Health.Status };
     try fixtures.eventually(io, Check{ .running = running, .index = index, .status = status }, struct {
         fn check(c: Check) bool {
-            return c.running.workers.health.status(c.index) == c.status;
+            return c.running.workers.health.status(.of(c.index)) == c.status;
         }
     }.check);
 }
@@ -150,7 +150,7 @@ test "a failed dial marks the backend down before the next ping" {
     var player: Player = try .connect(io, running.address());
     defer player.deinit();
     try player.awaitClosed();
-    try std.testing.expectEqual(bifrost.Health.Status.unhealthy, health.status(0));
+    try std.testing.expectEqual(bifrost.Health.Status.unhealthy, health.status(.of(0)));
 }
 
 const Silent = struct {
@@ -196,8 +196,8 @@ test "a backend that dies after its health check fails over to the next one" {
     try player.expect("\xfequeued");
     try player.roundTrip("\xfehello");
 
-    try std.testing.expectEqual(bifrost.Health.Status.unhealthy, health.status(0));
-    try std.testing.expectEqual(bifrost.Health.Status.healthy, health.status(1));
+    try std.testing.expectEqual(bifrost.Health.Status.unhealthy, health.status(.of(0)));
+    try std.testing.expectEqual(bifrost.Health.Status.healthy, health.status(.of(1)));
     try std.testing.expectEqual(@as(u32, 1), second.connects.load(.acquire));
     running.stop();
     try std.testing.expectEqual(@as(u64, 1), running.stats().backend_failures);

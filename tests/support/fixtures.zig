@@ -15,7 +15,7 @@ pub fn millis(ms: i64) std.Io.Timeout {
 
 pub fn config(backends: []const IpAddress) !bifrost.Config {
     var result: bifrost.Config = .{ .bind = loopback, .max_players = 8, .connect_timeout_ms = 500 };
-    for (backends) |backend| try result.addBackend(backend);
+    for (backends) |backend| try result.addBackend(null, backend);
     return result;
 }
 

@@ -23,7 +23,10 @@ mode = "off"
 # keys_file = "minecraft-keys.json"
 
 [[backend]]
+# Defaults to the address
+name = "lobby"
 address = "127.0.0.1:19133"
 
 [[backend]]
+name = "survival"
 address = "127.0.0.1:19134"

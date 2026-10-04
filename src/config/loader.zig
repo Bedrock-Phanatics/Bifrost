@@ -1,5 +1,6 @@
 const std = @import("std");
 const toml = @import("toml");
+const Backend = @import("../backend/Backend.zig");
 const Config = @import("Config.zig");
 const IpAddress = std.Io.net.IpAddress;
 
@@ -176,18 +177,24 @@ fn readAuth(config: *Config, section: *const toml.Table, diag: *Diagnostic) Erro
 
 fn readBackend(config: *Config, section: *const toml.Table, index: usize, diag: *Diagnostic) Error!void {
     var backend: ?IpAddress = null;
+    var name: ?[]const u8 = null;
     var it = section.iterator();
     while (it.next()) |entry| {
         const key: Key = .{ .section = "backend", .index = index, .name = entry.key_ptr.* };
         if (eql(key.name.?, "address")) {
             backend = try address(diag, key, entry.value_ptr.*, false);
+        } else if (eql(key.name.?, "name")) {
+            name = try string(diag, key, entry.value_ptr.*);
         } else return fail(diag, key, "unknown key", .{});
     }
     const key: Key = .{ .section = "backend", .index = index, .name = "address" };
-    config.addBackend(backend orelse return fail(diag, key, "is required", .{})) catch |err| return switch (err) {
+    const name_key: Key = .{ .section = "backend", .index = index, .name = "name" };
+    config.addBackend(name, backend orelse return fail(diag, key, "is required", .{})) catch |err| return switch (err) {
         error.InvalidPort => fail(diag, key, "needs a non-zero port", .{}),
         error.DuplicateBackend => fail(diag, key, "duplicates an earlier backend", .{}),
         error.TooManyBackends => fail(diag, key, "more than {d} backends", .{Config.max_backends}),
+        error.InvalidName => fail(diag, name_key, "must be 1 to {d} of a-z A-Z 0-9 - _ . : [ ]", .{Backend.max_name_len}),
+        error.DuplicateName => fail(diag, name_key, "duplicates an earlier backend", .{}),
     };
 }
 
@@ -256,6 +263,7 @@ test "full config reads every key" {
         \\pending_bytes = 4096
         \\
         \\[[backend]]
+        \\name = "lobby"
         \\address = "127.0.0.1:2000"
         \\
         \\[[backend]]
@@ -268,8 +276,10 @@ test "full config reads every key" {
     try std.testing.expectEqual(@as(u32, 2000), config.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 8), config.pending_packets);
     try std.testing.expectEqual(@as(u32, 4096), config.pending_bytes);
-    try std.testing.expectEqual(@as(u16, 2000), config.backends()[0].getPort());
-    try std.testing.expectEqual(@as(u16, 3000), config.backends()[1].getPort());
+    try std.testing.expectEqual(@as(u16, 2000), config.backends()[0].address.getPort());
+    try std.testing.expectEqualStrings("lobby", config.backends()[0].name());
+    try std.testing.expectEqual(@as(u16, 3000), config.backends()[1].address.getPort());
+    try std.testing.expectEqualStrings("[::1]:3000", config.backends()[1].name());
 }
 
 test "syntax errors report a position" {
@@ -298,6 +308,9 @@ test "invalid values name the offending key" {
     try expectInvalid("[[backend]]\naddress = \"127.0.0.1:0\"\n", "backend[0].address: needs a non-zero port, got \"127.0.0.1:0\"");
     try expectInvalid("[[backend]]\naddress = \"127.0.0.1:1\"\nweight = 1\n", "backend[0].weight: unknown key");
     try expectInvalid(backend ++ backend, "backend[1].address: duplicates an earlier backend");
+    try expectInvalid("[[backend]]\nname = \"a b\"\naddress = \"127.0.0.1:1\"\n", "backend[0].name: must be 1 to 48 of a-z A-Z 0-9 - _ . : [ ]");
+    try expectInvalid("[[backend]]\nname = 1\naddress = \"127.0.0.1:1\"\n", "backend[0].name: expected a string");
+    try expectInvalid("[[backend]]\nname = \"x\"\naddress = \"127.0.0.1:1\"\n[[backend]]\nname = \"x\"\naddress = \"127.0.0.1:2\"\n", "backend[1].name: duplicates an earlier backend");
     try expectInvalid("backend = \"127.0.0.1:1\"\n", "backend: expected [[backend]] tables");
     try expectInvalid("[auth]\nmode = \"strict\"\n" ++ backend, "auth.mode: expected \"off\" or \"verify\", got \"strict\"");
     try expectInvalid("[health]\ntimeout_ms = 50\n" ++ backend, "health.timeout_ms: must be between 100 and 10000");

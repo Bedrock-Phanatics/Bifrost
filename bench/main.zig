@@ -154,7 +154,7 @@ fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
     config.connect_timeout_ms = try std.fmt.parseInt(u32, args[1], 10);
     config.health_interval_ms = try std.fmt.parseInt(u32, args[2], 10);
     config.health_timeout_ms = @min(1_000, config.health_interval_ms / 2);
-    for (args[3..]) |port| try config.addBackend(harness.loopback(try std.fmt.parseInt(u16, port, 10)));
+    for (args[3..]) |port| try config.addBackend(null, harness.loopback(try std.fmt.parseInt(u16, port, 10)));
 
     // Same runtime setup as the real binary
     const rt = try zio.Runtime.init(init.gpa, .{ .executors = .exact(config.workers) });
