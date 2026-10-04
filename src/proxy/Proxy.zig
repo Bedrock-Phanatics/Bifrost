@@ -8,6 +8,8 @@ const Notify = @import("../net/Notify.zig");
 const Watch = @import("../net/watch.zig").Watch;
 const no_wait = @import("../net/watch.zig").no_wait;
 const Observer = @import("../protocol/Observer.zig");
+const Managed = @import("../session/Managed.zig");
+const proxy_key = @import("../session/proxy_key.zig");
 const advertisement = @import("../protocol/advertisement.zig");
 const Admission = @import("Admission.zig");
 const Link = @import("Link.zig");
@@ -28,6 +30,7 @@ scheduler: Scheduler,
 admission: *Admission,
 own_admission: Admission,
 observer_pool: bedwire.BufferPool,
+managed: ?Managed.Shared,
 env: Link.Env,
 links: std.DoublyLinkedList = .{},
 listener_watch: Watch(raknet.Server) = .{},
@@ -41,6 +44,7 @@ pub const Options = struct {
     auth: Observer.Auth = .off,
     admission: ?*Admission = null,
     health: ?*Health = null,
+    proxy_key: ?proxy_key.Ecdsa.KeyPair = null,
 };
 
 pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Proxy {
@@ -62,6 +66,18 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
     const own_per_ip = if (options.admission == null) config.max_players_per_ip else 0;
     var own_admission: Admission = try .init(gpa, config.max_players, own_per_ip);
     errdefer own_admission.deinit();
+    var managed: ?Managed.Shared = switch (config.session_mode) {
+        .passthrough => null,
+        .managed => try .init(
+            gpa,
+            options.proxy_key orelse return error.MissingProxyKey,
+            switch (options.auth) {
+                .verify => |keys| keys,
+                .off => return error.ManagedNeedsVerifiedLogins,
+            },
+        ),
+    };
+    errdefer if (managed) |*shared| shared.deinit(gpa);
 
     self.* = .{
         .gpa = gpa,
@@ -73,6 +89,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .admission = undefined,
         .own_admission = own_admission,
         .observer_pool = observer_pool,
+        .managed = managed,
         .env = undefined,
     };
     self.admission = options.admission orelse &self.own_admission;
@@ -89,12 +106,14 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .connect_timeout_ms = config.connect_timeout_ms,
         .pending_packets = config.pending_packets,
         .pending_bytes = config.pending_bytes,
+        .managed = if (self.managed) |*shared| shared else null,
     };
     return self;
 }
 
 pub fn destroy(self: *Proxy) void {
     self.closeAll();
+    if (self.managed) |*shared| shared.deinit(self.gpa);
     self.own_admission.deinit();
     self.observer_pool.deinit();
     self.listener.destroy();

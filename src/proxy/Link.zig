@@ -8,6 +8,7 @@ const Router = @import("../backend/Router.zig");
 const Watch = @import("../net/watch.zig").Watch;
 const no_wait = @import("../net/watch.zig").no_wait;
 const Observer = @import("../protocol/Observer.zig");
+const Managed = @import("../session/Managed.zig");
 const PacketQueue = @import("PacketQueue.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -31,6 +32,7 @@ pub const Env = struct {
     connect_timeout_ms: u32,
     pending_packets: u32,
     pending_bytes: u32,
+    managed: ?*Managed.Shared = null,
 };
 
 env: *const Env,
@@ -44,6 +46,7 @@ dial_task: ?std.Io.Future(void) = null,
 tried: Router.Set = .{},
 pending: PacketQueue,
 observer: Observer,
+managed: ?*Managed = null,
 watch: Watch(raknet.Client) = .{},
 node: std.DoublyLinkedList.Node = .{},
 // Can't free the link while it's still on the ready stack
@@ -53,18 +56,24 @@ next_ready: ?*Link = null,
 pub fn create(env: *const Env, session: *raknet.Session) !*Link {
     const self = try env.gpa.create(Link);
     errdefer env.gpa.destroy(self);
+    const managed = if (env.managed) |shared| try Managed.create(env.gpa, shared, env.pending_packets, env.pending_bytes) else null;
+    errdefer if (managed) |m| m.destroy();
     self.* = .{
         .env = env,
         .session = session,
         .pending = .init(env.pending_packets, env.pending_bytes),
         .observer = try .init(env.observer_pool),
+        .managed = managed,
     };
+    // Managed mode verifies the login itself
+    if (managed != null) self.observer.watching = false;
     return self;
 }
 
 pub fn destroy(self: *Link) void {
     self.cancelDial();
     self.dropBackend();
+    if (self.managed) |managed| managed.destroy();
     self.pending.deinit(self.env.gpa);
     self.observer.deinit();
     self.env.gpa.destroy(self);
@@ -87,6 +96,12 @@ pub fn isFinished(self: *const Link) bool {
 }
 
 pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
+    if (self.managed) |managed| {
+        if (self.backend == null and self.dial_task == null) return error.BackendClosed;
+        try managed.fromPlayer(self.ends(self.session.?), payload);
+        if (self.backend != null) self.env.scheduler.schedule(self);
+        return;
+    }
     if (self.observer.watching and self.observe(.client_to_server, payload).rejects()) return error.LoginRejected;
     if (self.backend) |client| {
         try client.send(payload, .reliable_ordered, 0);
@@ -158,13 +173,22 @@ fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
     };
     self.backend = client;
     self.env.stats.bump(.backends_connected, 1);
-    if (self.session == null) return self.dropBackend();
+    const session = self.session orelse return self.dropBackend();
+    if (self.managed) |managed| return managed.backendConnected(self.ends(session)) catch |err| self.fail(err);
     self.flushPending(client) catch |err| self.fail(err);
+}
+
+fn ends(self: *Link, session: *raknet.Session) Managed.Ends {
+    return .{ .io = self.env.io, .stats = self.env.stats, .player = session, .backend = if (self.backend_closing) null else self.backend };
 }
 
 fn onBackendMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
     const self: *Link = @ptrCast(@alignCast(context));
     const session = self.session orelse return error.ApplicationFailure;
+    if (self.managed) |managed| return managed.fromBackend(self.ends(session), payload.bytes) catch |err| {
+        log.debug("managed session failed: {t}", .{err});
+        return error.ApplicationFailure;
+    };
     if (self.observer.watching and self.observe(.server_to_client, payload.bytes).rejects()) return error.ApplicationFailure;
     session.send(payload.bytes, .reliable_ordered, 0) catch return error.ApplicationFailure;
     self.env.stats.bump(.bytes_to_player, payload.bytes.len);

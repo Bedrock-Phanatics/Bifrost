@@ -3,6 +3,7 @@ const Config = @import("../config/Config.zig");
 const Health = @import("../backend/Health.zig");
 const Notify = @import("../net/Notify.zig");
 const Observer = @import("../protocol/Observer.zig");
+const proxy_key = @import("../session/proxy_key.zig");
 const Admission = @import("Admission.zig");
 const Proxy = @import("Proxy.zig");
 const Stats = @import("Stats.zig");
@@ -20,7 +21,12 @@ health: Health,
 watchers: []Notify,
 proxies: []*Proxy,
 
-pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer.Auth) !*Workers {
+pub const Options = struct {
+    auth: Observer.Auth = .off,
+    proxy_key: ?proxy_key.Ecdsa.KeyPair = null,
+};
+
+pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Workers {
     try config.validate();
     const self = try gpa.create(Workers);
     errdefer gpa.destroy(self);
@@ -44,7 +50,12 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, auth: Observer
     errdefer for (self.proxies[0..created]) |proxy| proxy.destroy();
     var worker_config = config;
     for (self.proxies, self.watchers) |*proxy, *watcher| {
-        proxy.* = try Proxy.create(gpa, io, worker_config, .{ .auth = auth, .admission = &self.admission, .health = &self.health });
+        proxy.* = try Proxy.create(gpa, io, worker_config, .{
+            .auth = options.auth,
+            .admission = &self.admission,
+            .health = &self.health,
+            .proxy_key = options.proxy_key,
+        });
         watcher.* = proxy.*.healthNotify();
         created += 1;
         // Needed when bind uses port 0

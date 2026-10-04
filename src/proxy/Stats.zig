@@ -15,6 +15,7 @@ observer_gave_up: u64 = 0,
 logins_verified: u64 = 0,
 logins_rejected: u64 = 0,
 auth_unavailable: u64 = 0,
+proxy_logins: u64 = 0,
 
 // Only the worker writes these, so a plain atomic store is enough
 pub fn bump(self: *Stats, comptime field: std.meta.FieldEnum(Stats), amount: u64) void {

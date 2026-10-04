@@ -22,6 +22,11 @@ timeout_ms = 1000
 mode = "off"
 # keys_file = "minecraft-keys.json"
 
+[session]
+# "managed" needs auth mode = "verify", and backends must trust the proxy key it logs
+mode = "passthrough"
+# proxy_key_file = "bifrost-proxy.key"
+
 [[backend]]
 # Defaults to the address
 name = "lobby"

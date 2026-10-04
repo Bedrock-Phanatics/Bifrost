@@ -17,6 +17,9 @@ pub const Auth = Observer.Auth;
 pub const KeySet = @import("bedwire").auth.KeySet;
 pub const loadKeys = Observer.loadKeys;
 pub const advertisedPlayers = @import("protocol/advertisement.zig").players;
+pub const Managed = @import("session/Managed.zig");
+pub const loadProxyKey = @import("session/proxy_key.zig").load;
+pub const proxyKeyText = @import("session/proxy_key.zig").publicText;
 
 test {
     _ = Config;
@@ -27,4 +30,5 @@ test {
     _ = @import("backend/Router.zig");
     _ = @import("protocol/advertisement.zig");
     _ = @import("proxy/PacketQueue.zig");
+    _ = @import("session/proxy_key.zig");
 }

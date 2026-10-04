@@ -22,10 +22,17 @@ pub fn main(init: std.process.Init) !void {
         .verify => .{ .verify = &keys.? },
     };
 
+    const proxy_key = switch (config.session_mode) {
+        .passthrough => null,
+        .managed => bifrost.loadProxyKey(init.io, config.proxyKeyFile().?) catch |err|
+            fatal("{s}: {t}", .{ config.proxyKeyFile().?, err }),
+    };
+    if (proxy_key) |key| log.info("managed sessions; backends must trust proxy key {s}", .{&bifrost.proxyKeyText(key)});
+
     const rt = try zio.Runtime.init(init.gpa, .{ .executors = .exact(config.workers) });
     defer rt.deinit();
 
-    const workers = try bifrost.Workers.create(init.gpa, rt.io(), config, auth);
+    const workers = try bifrost.Workers.create(init.gpa, rt.io(), config, .{ .auth = auth, .proxy_key = proxy_key });
     defer workers.destroy();
 
     var signals = try rt.spawn(stopOnSignal, .{workers});

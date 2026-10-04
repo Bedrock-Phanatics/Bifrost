@@ -176,7 +176,7 @@ pub const RunningWorkers = struct {
     stopped: bool = false,
 
     pub fn start(self: *RunningWorkers, io: std.Io, workers_config: bifrost.Config) !void {
-        const workers = try bifrost.Workers.create(gpa, io, workers_config, .off);
+        const workers = try bifrost.Workers.create(gpa, io, workers_config, .{});
         errdefer workers.destroy();
         self.* = .{ .io = io, .workers = workers, .task = try io.concurrent(bifrost.Workers.run, .{workers}) };
     }

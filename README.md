@@ -9,6 +9,19 @@ zig build -Doptimize=ReleaseSafe
 
 Settings live in [`config/bifrost.toml`](config/bifrost.toml).
 
+## Session modes
+
+`passthrough` (the default) relays each player's own encrypted session byte for byte.
+
+`managed` ends the player's session at Bifrost and opens a separate one to the backend:
+
+- Players must pass Microsoft authentication (`[auth] mode = "verify"`) before Bifrost speaks for them.
+- Bifrost logs in to backends with a certificate chain signed by its proxy key (`proxy_key_file`, created on first
+  start and logged). The identity carries the player's name and UUID, `online = false` and no XUID: it never claims
+  to be Microsoft-authenticated, and the player's Microsoft token never reaches a backend.
+- A backend must trust exactly that key as its issuer and keep offline logins disabled. A backend that does not
+  will refuse managed players.
+
 ## Benchmarks
 
 ```sh

@@ -7,6 +7,7 @@ test {
     _ = @import("handshake.zig");
     _ = @import("backends.zig");
     _ = @import("workers.zig");
+    _ = @import("managed.zig");
 }
 
 test "the shipped config parses" {

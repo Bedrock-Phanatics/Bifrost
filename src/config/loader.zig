@@ -83,6 +83,12 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
         return fail(diag, .{ .section = "health", .name = "timeout_ms" }, "must be shorter than interval_ms", .{});
     if (config.auth == .verify and config.keysFile() == null)
         return fail(diag, .{ .section = "auth", .name = "keys_file" }, "is required when mode = \"verify\"", .{});
+    if (config.session_mode == .managed) {
+        if (config.auth != .verify)
+            return fail(diag, .{ .section = "session", .name = "mode" }, "\"managed\" needs [auth] mode = \"verify\"", .{});
+        if (config.proxyKeyFile() == null)
+            return fail(diag, .{ .section = "session", .name = "proxy_key_file" }, "is required when mode = \"managed\"", .{});
+    }
     return config;
 }
 
@@ -100,6 +106,8 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
             try readHealth(config, try table(diag, key, value), diag);
         } else if (eql(name, "auth")) {
             try readAuth(config, try table(diag, key, value), diag);
+        } else if (eql(name, "session")) {
+            try readSession(config, try table(diag, key, value), diag);
         } else if (eql(name, "backend")) {
             if (value != .array) return fail(diag, key, "expected [[backend]] tables", .{});
             for (value.array.items, 0..) |item, i| {
@@ -170,6 +178,22 @@ fn readAuth(config: *Config, section: *const toml.Table, diag: *Diagnostic) Erro
                 return fail(diag, key, "expected \"off\" or \"verify\", got \"{s}\"", .{text});
         } else if (eql(key.name.?, "keys_file")) {
             config.setKeysFile(try string(diag, key, value)) catch
+                return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len});
+        } else return fail(diag, key, "unknown key", .{});
+    }
+}
+
+fn readSession(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "session", .name = entry.key_ptr.* };
+        const value = entry.value_ptr.*;
+        if (eql(key.name.?, "mode")) {
+            const text = try string(diag, key, value);
+            config.session_mode = std.meta.stringToEnum(Config.SessionMode, text) orelse
+                return fail(diag, key, "expected \"passthrough\" or \"managed\", got \"{s}\"", .{text});
+        } else if (eql(key.name.?, "proxy_key_file")) {
+            config.setProxyKeyFile(try string(diag, key, value)) catch
                 return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len});
         } else return fail(diag, key, "unknown key", .{});
     }
@@ -325,6 +349,20 @@ test "auth section reads mode and keys file" {
     try std.testing.expectEqualStrings("keys.json", config.keysFile().?);
     const defaults = try parse(std.testing.allocator, "[[backend]]\naddress = \"127.0.0.1:1\"\n", &diag);
     try std.testing.expectEqual(Config.Auth.off, defaults.auth);
+}
+
+test "session section selects managed mode" {
+    var diag: Diagnostic = .{};
+    const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
+    const verify = "[auth]\nmode = \"verify\"\nkeys_file = \"keys.json\"\n";
+    const config = try parse(std.testing.allocator, verify ++ "[session]\nmode = \"managed\"\nproxy_key_file = \"proxy.key\"\n" ++ backend, &diag);
+    try std.testing.expectEqual(Config.SessionMode.managed, config.session_mode);
+    try std.testing.expectEqualStrings("proxy.key", config.proxyKeyFile().?);
+    try std.testing.expectEqual(Config.SessionMode.passthrough, (try parse(std.testing.allocator, backend, &diag)).session_mode);
+
+    try expectInvalid("[session]\nmode = \"mixed\"\n" ++ backend, "session.mode: expected \"passthrough\" or \"managed\", got \"mixed\"");
+    try expectInvalid("[session]\nmode = \"managed\"\nproxy_key_file = \"k\"\n" ++ backend, "session.mode: \"managed\" needs [auth] mode = \"verify\"");
+    try expectInvalid(verify ++ "[session]\nmode = \"managed\"\n" ++ backend, "session.proxy_key_file: is required when mode = \"managed\"");
 }
 
 test "loadFile reports missing and oversized files" {

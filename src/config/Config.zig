@@ -26,6 +26,9 @@ health_timeout_ms: u32 = 1_000,
 auth: Auth = .off,
 keys_file_storage: [max_path_len]u8 = undefined,
 keys_file_len: usize = 0,
+session_mode: SessionMode = .passthrough,
+proxy_key_file_storage: [max_path_len]u8 = undefined,
+proxy_key_file_len: usize = 0,
 motd_storage: [max_motd_len]u8 = undefined,
 motd_len: usize = 0,
 backend_storage: [max_backends]Backend = undefined,
@@ -36,6 +39,11 @@ pub const Auth = enum {
     verify,
 };
 
+pub const SessionMode = enum {
+    passthrough,
+    managed,
+};
+
 pub fn keysFile(self: *const Config) ?[]const u8 {
     return if (self.keys_file_len == 0) null else self.keys_file_storage[0..self.keys_file_len];
 }
@@ -44,6 +52,16 @@ pub fn setKeysFile(self: *Config, path: []const u8) error{InvalidPath}!void {
     if (path.len == 0 or path.len > max_path_len) return error.InvalidPath;
     @memcpy(self.keys_file_storage[0..path.len], path);
     self.keys_file_len = path.len;
+}
+
+pub fn proxyKeyFile(self: *const Config) ?[]const u8 {
+    return if (self.proxy_key_file_len == 0) null else self.proxy_key_file_storage[0..self.proxy_key_file_len];
+}
+
+pub fn setProxyKeyFile(self: *Config, path: []const u8) error{InvalidPath}!void {
+    if (path.len == 0 or path.len > max_path_len) return error.InvalidPath;
+    @memcpy(self.proxy_key_file_storage[0..path.len], path);
+    self.proxy_key_file_len = path.len;
 }
 
 pub fn motd(self: *const Config) []const u8 {
