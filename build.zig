@@ -56,6 +56,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
+
+    const bench = b.addExecutable(.{ .name = "bifrost-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bifrost", .module = bifrost },
+            .{ .name = "raknet", .module = raknet },
+            .{ .name = "bedwire", .module = bedwire_module },
+            .{ .name = "zio", .module = zio },
+        },
+    }) });
+    const bench_cmd = b.addRunArtifact(bench);
+    if (b.args) |args| bench_cmd.addArgs(args);
+    b.step("bench", "Run the proxy benchmarks (use -Doptimize=ReleaseFast)").dependOn(&bench_cmd.step);
 }
 
 fn dependencyModule(
