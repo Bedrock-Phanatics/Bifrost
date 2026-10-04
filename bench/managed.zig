@@ -2,7 +2,7 @@ const std = @import("std");
 const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const bifrost = @import("bifrost");
-const credentials = @import("credentials");
+const sample = @import("sample");
 const harness = @import("harness.zig");
 
 const Current = bedwire.protocol.Current;
@@ -49,7 +49,7 @@ pub const Bedrock = struct {
     }
 
     pub fn wrap(self: *Bedrock, payload: []const u8) !bedwire.Session.Frame {
-        return self.session.encodeOne(try credentials.rawPacket(self.scratch, game_packet_id, payload));
+        return self.session.encodeOne(try sample.rawPacket(self.scratch, game_packet_id, payload));
     }
 
     fn send(self: *Bedrock, client: *raknet.Client, packet: []const u8) !void {
@@ -68,13 +68,13 @@ pub fn join(gpa: std.mem.Allocator, io: std.Io, player: *harness.Player, seed: u
     var buffer: [64]u8 = undefined;
     const session = &bedrock.session;
 
-    try bedrock.send(client, try credentials.typedPacket(&buffer, .{ .request_network_settings = .{ .client_network_version = @intCast(Current.protocol_number) } }));
+    try bedrock.send(client, try sample.typedPacket(&buffer, .{ .request_network_settings = .{ .client_network_version = @intCast(Current.protocol_number) } }));
     {
         var packets = try session.ingest(try inbox.next(io, client));
         defer packets.deinit();
         try session.negotiateFromSettings(packets.next() orelse return error.NoPacket);
     }
-    const request = try credentials.request(gpa, bedrock.key, bedrock.key, "Bench", "2535400000000001", std.Io.Clock.real.now(io).toSeconds());
+    const request = try sample.request(gpa, bedrock.key, bedrock.key, "Bench", "2535400000000001", std.Io.Clock.real.now(io).toSeconds());
     defer gpa.free(request);
     try bedrock.send(client, try bedwire.auth.login.encodeLoginPacket(Current, bedrock.scratch, request, limits));
     {
@@ -82,14 +82,14 @@ pub fn join(gpa: std.mem.Allocator, io: std.Io, player: *harness.Player, seed: u
         defer packets.deinit();
         try session.acceptServerHandshakePacket(gpa, packets.next() orelse return error.NoPacket, bedrock.key.secret_key);
     }
-    try bedrock.send(client, try credentials.typedPacket(&buffer, .{ .client_to_server_handshake = .{} }));
+    try bedrock.send(client, try sample.typedPacket(&buffer, .{ .client_to_server_handshake = .{} }));
     try session.advance(.resource_packs);
     try expectKind(session, try inbox.next(io, client), .play_status);
-    try bedrock.send(client, try credentials.typedPacket(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .resource_pack_stack_finished = "" } } }));
+    try bedrock.send(client, try sample.typedPacket(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .resource_pack_stack_finished = "" } } }));
     try session.advance(.waiting_for_start_game);
     try expectKind(session, try inbox.next(io, client), .start_game);
     try session.advance(.spawn_ready);
-    try bedrock.send(client, try credentials.rawPacket(&buffer, Current.packetId(.set_local_player_as_initialised).?, &.{1}));
+    try bedrock.send(client, try sample.rawPacket(&buffer, Current.packetId(.set_local_player_as_initialised).?, &.{1}));
     try session.advance(.in_game);
     player.bedrock = bedrock;
 }
@@ -245,7 +245,7 @@ pub const Backend = struct {
             continue;
         }) {
             .request_network_settings => {
-                try send(session, carrier, &.{try credentials.typedPacket(&buffer, .{ .network_settings = .{
+                try send(session, carrier, &.{try sample.typedPacket(&buffer, .{ .network_settings = .{
                     .compression_threshold = 256,
                     .compression_algorithm = .zlib,
                     .client_throttle_enabled = false,
@@ -265,16 +265,22 @@ pub const Backend = struct {
                 defer self.gpa.free(token);
                 const storage = try self.gpa.alloc(u8, token.len + 16);
                 defer self.gpa.free(storage);
-                try send(session, carrier, &.{try credentials.typedPacket(storage, .{ .server_to_client_handshake = .{ .handshake_web_token = token } })});
+                try send(session, carrier, &.{try sample.typedPacket(storage, .{ .server_to_client_handshake = .{ .handshake_web_token = token } })});
                 try session.installServerCrypto(connection.key.secret_key, salt);
             },
             .client_to_server_handshake => {
                 try session.advance(.resource_packs);
-                try send(session, carrier, &.{try credentials.typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } })});
+                try send(session, carrier, &.{try sample.typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } })});
             },
             .resource_pack_client_response => {
                 try session.advance(.waiting_for_start_game);
-                try send(session, carrier, &.{try credentials.rawPacket(&buffer, Current.packetId(.start_game).?, "bench")});
+                var start_buffer: [1024]u8 = undefined;
+                var items_buffer: [256]u8 = undefined;
+                try send(session, carrier, &.{
+                    try sample.startGame(&start_buffer, .{}),
+                    try sample.itemRegistry(&items_buffer, .{}),
+                    &sample.biome_definitions,
+                });
                 try session.advance(.spawn_ready);
             },
             .set_local_player_as_initialised => try session.advance(.in_game),

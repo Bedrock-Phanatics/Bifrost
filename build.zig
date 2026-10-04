@@ -65,8 +65,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "raknet", .module = raknet },
         .{ .name = "bedwire", .module = bedwire_module },
         .{ .name = "bench_options", .module = bench_options.createModule() },
-        .{ .name = "credentials", .module = b.createModule(.{
-            .root_source_file = b.path("tests/support/credentials.zig"),
+        .{ .name = "sample", .module = b.createModule(.{
+            .root_source_file = b.path("tests/support/sample.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "bedwire", .module = bedwire_module }},

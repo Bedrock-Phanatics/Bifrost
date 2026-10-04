@@ -70,3 +70,57 @@ pub fn request(allocator: std.mem.Allocator, key: Ecdsa.KeyPair, client_data_sig
     defer allocator.free(envelope);
     return bedwire.auth.encodeConnectionRequest(allocator, .{ .chain_data = envelope, .client_data = client_data }, .{});
 }
+
+// Real packets from protocol-zig's corpus, so the proxy can decode them
+const start_game_hex = "0bffffffffffffffffff01ffffffffffffffffff010a09fe2f49712131c9f7d74f49eb3107c8fcb2e0c7ffffffffffffffff010000d392fba6010c02010afeffffff0fc4db9aaa09feffffff0f00020000feffffff0f020103343732a1df5cc969754fc801000102080101000200000000010668c3a96c6c6f0001000003ae80974c010000010101010000000130000000809abf562600126d696e6563726166743a73746f6e6531313705537465766501010000060008537465766533393909e697a5e69cace8aa9e0339373800bc90f98201010000000000000000ffffffff0f0301300a000105782079207a200005782079207a0a000107f09f9982206f6bac0001300a00000968c3a96c6c6f3338380109e697a5e69cace8aa9e0a0000b1514ca91695eb8a6f96a16dfc9c80dd5b802003d0fe7379010100000668c3a96c6c6f05782079207a0ce697a5e69cace8aa9e32343100";
+const item_registry_hex = "a201010668c3a96c6c6ff61801040a00080f6d696e6563726166743a73746f6e650000";
+const biome_definitions_hex = "7a00030668c3a96c6c6f000161";
+
+pub const biome_definitions = fromHex(biome_definitions_hex);
+const empty_compound = [_]u8{ 10, 0, 0 };
+
+pub const Content = struct {
+    custom_block: ?[]const u8 = null,
+    custom_item: ?[]const u8 = null,
+    authoritative_block_breaking: ?bool = null,
+};
+
+pub fn startGame(buffer: []u8, content: Content) ![]const u8 {
+    const source = comptime fromHex(start_game_hex);
+    var envelope = try Current.decodeBorrowed(&source, .{});
+    var value = envelope.value.typed.start_game;
+    const blocks = [_]protocol.packets.start_game.ServerBlockProperty{.{ .block_name = content.custom_block orelse "", .block_definition = &empty_compound }};
+    if (content.custom_block != null) value.block_properties = .init(&blocks);
+    if (content.authoritative_block_breaking) |enabled| value.movement_settings.server_authoritative_block_breaking = enabled;
+    envelope.value = .{ .typed = .{ .start_game = value } };
+    return encodeEnvelope(buffer, envelope);
+}
+
+pub fn itemRegistry(buffer: []u8, content: Content) ![]const u8 {
+    const source = comptime fromHex(item_registry_hex);
+    var envelope = try Current.decodeBorrowed(&source, .{});
+    var value = envelope.value.typed.item_registry;
+    const items = [_]protocol.packets.item_registry.ItemData{.{
+        .item_name = content.custom_item orelse "",
+        .item_id = 1000,
+        .is_component_based = true,
+        .item_version = .datadriven,
+        .item_component_data = &empty_compound,
+    }};
+    if (content.custom_item != null) value.item_data = .init(&items);
+    envelope.value = .{ .typed = .{ .item_registry = value } };
+    return encodeEnvelope(buffer, envelope);
+}
+
+fn encodeEnvelope(buffer: []u8, envelope: protocol.BorrowedEnvelope) ![]const u8 {
+    var writer = protocol.Writer.init(buffer);
+    try Current.encode(&writer, envelope);
+    return writer.written();
+}
+
+fn fromHex(comptime hex: []const u8) [hex.len / 2]u8 {
+    @setEvalBranchQuota(10_000);
+    var bytes: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+    return bytes;
+}

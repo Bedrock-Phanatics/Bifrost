@@ -11,6 +11,7 @@ const Upstream = Managed.Upstream;
 const Stats = @import("../proxy/Stats.zig");
 const content = @import("../content/policy.zig");
 const packs = @import("../content/packs.zig");
+const registries = @import("../content/registries.zig");
 pub const State = @import("State.zig");
 
 const Transfer = @This();
@@ -73,7 +74,8 @@ const Queue = struct {
 
 const Seen = packed struct {
     logged_in: bool = false,
-    joined: bool = false,
+    started: bool = false,
+    world: bool = false,
     failed: bool = false,
 };
 
@@ -92,6 +94,7 @@ seen: Seen = .{},
 result: Result = .running,
 content_policy: content.Policy,
 target_packs: packs.Fingerprint = .{},
+target_registries: registries.Fingerprint = .{},
 mismatch: ?content.Mismatch = null,
 host: ?Host = null,
 
@@ -176,8 +179,10 @@ pub fn service(self: *Transfer, host: Host) error{Canceled}!Result {
 fn settle(self: *Transfer, host: Host) void {
     if (self.seen.failed) return self.on(host, .target_failed);
     if (self.seen.logged_in and self.state.phase == .logging_in) self.on(host, .logged_in);
-    if (self.seen.joined and self.state.phase == .joining) {
-        if (self.incompatibility(host.managed)) |mismatch| {
+    const managed = host.managed;
+    const complete = self.seen.world or self.target_registries.covers(&managed.initial_registries);
+    if (self.seen.started and complete and self.state.phase == .joining) {
+        if (self.incompatibility(managed)) |mismatch| {
             self.mismatch = mismatch;
             log.info("transfer {d}: target content is incompatible: {t}", .{ self.state.epoch, mismatch });
             return self.on(host, .target_failed);
@@ -187,6 +192,7 @@ fn settle(self: *Transfer, host: Host) void {
 }
 
 fn incompatibility(self: *const Transfer, managed: *const Managed) ?content.Mismatch {
+    if (self.target_registries.difference(&managed.initial_registries)) |kind| return .of(kind);
     return switch (self.content_policy) {
         .initial => null,
         .match => if (self.target_packs.eql(managed.initial_packs)) null else .packs,
@@ -216,7 +222,13 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
     }
     var buffer: [64]u8 = undefined;
     while (packets.next()) |packet| {
-        if (self.seen.joined) {
+        if (registries.isRegistry(packet.kind)) {
+            try self.target_registries.record(try self.upstream.session.decodePacket(packet));
+            if (packet.kind == .start_game) self.seen.started = true;
+            continue;
+        }
+        if (self.seen.started) {
+            if (endsRegistries(packet.kind)) self.seen.world = true;
             try self.queue.push(host.gpa, packet.bytes);
             continue;
         }
@@ -230,15 +242,18 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
                 try self.upstream.send(ctx, &.{try Managed.encodeTyped(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .resource_pack_stack_finished = "" } } })});
                 try self.upstream.session.advance(.waiting_for_start_game);
             },
-            .start_game => {
-                self.seen.joined = true;
-                try self.queue.push(host.gpa, packet.bytes);
-            },
             .disconnect => return error.BackendRefused,
             else => {},
         }
     }
-    if (self.seen.joined and self.upstream.session.state == .waiting_for_start_game) try self.upstream.session.advance(.spawn_ready);
+    if (self.seen.started and self.upstream.session.state == .waiting_for_start_game) try self.upstream.session.advance(.spawn_ready);
+}
+
+fn endsRegistries(kind: ?bedwire.PacketKind) bool {
+    return switch (kind orelse return false) {
+        .network_chunk_publisher_update, .level_chunk, .sub_chunk, .play_status => true,
+        else => false,
+    };
 }
 
 fn on(self: *Transfer, host: Host, event: State.Event) void {

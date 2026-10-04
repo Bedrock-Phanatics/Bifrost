@@ -32,4 +32,5 @@ test {
     _ = @import("proxy/PacketQueue.zig");
     _ = @import("session/proxy_key.zig");
     _ = @import("transfer/State.zig");
+    _ = @import("content/nbt.zig");
 }

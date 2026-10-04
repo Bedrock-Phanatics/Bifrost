@@ -4,6 +4,7 @@ const bedwire = @import("bedwire");
 const PacketQueue = @import("../proxy/PacketQueue.zig");
 const Stats = @import("../proxy/Stats.zig");
 const packs = @import("../content/packs.zig");
+pub const registries = @import("../content/registries.zig");
 pub const Upstream = @import("Upstream.zig");
 
 const protocol = bedwire.protocol;
@@ -78,6 +79,8 @@ player_phase: PlayerPhase = .settings,
 identity: ?bedwire.Identity = null,
 client_data: ?[]u8 = null,
 initial_packs: packs.Fingerprint = .{},
+initial_registries: registries.Fingerprint = .{},
+transferred: bool = false,
 // Player packets sent before the backend is ready
 early: PacketQueue,
 
@@ -120,6 +123,7 @@ pub fn loginUpstream(self: *Managed, upstream: *Upstream, ctx: Upstream.Context)
 pub fn swapUpstream(self: *Managed, next: Upstream) Upstream {
     const previous = self.upstream;
     self.upstream = next;
+    self.transferred = true;
     return previous;
 }
 
@@ -241,6 +245,13 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
     var start_game = false;
     var count: usize = 0;
     while (packets.next()) |packet| {
+        if (registries.isRegistry(packet.kind)) {
+            if (self.transferred) {
+                try self.checkRegistry(packet);
+                continue;
+            }
+            if (self.player.state != .in_game) try self.initial_registries.record(try self.upstream.session.decodePacket(packet));
+        }
         if (packet.kind == .start_game) start_game = true;
         if (self.player.state == .resource_packs) try self.capturePacks(packet);
         self.shared.batch[count] = packet.bytes;
@@ -248,6 +259,15 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
     }
     try self.sendToPlayer(ends, self.shared.batch[0..count]);
     if (start_game) try self.advance(.spawn_ready);
+}
+
+fn checkRegistry(self: *Managed, packet: BackendSession.Packet) !void {
+    var late: registries.Fingerprint = .{};
+    try late.record(try self.upstream.session.decodePacket(packet));
+    for (std.enums.values(registries.Kind)) |kind| {
+        const value = late.get(kind) orelse continue;
+        if (value != self.initial_registries.get(kind)) return error.IncompatibleRegistry;
+    }
 }
 
 fn capturePacks(self: *Managed, packet: BackendSession.Packet) !void {

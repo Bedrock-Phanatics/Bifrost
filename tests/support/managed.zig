@@ -3,7 +3,7 @@ const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const bifrost = @import("bifrost");
 const fixtures = @import("fixtures.zig");
-const credentials = @import("credentials.zig");
+const sample = @import("sample.zig");
 
 const protocol = bedwire.protocol;
 const Current = protocol.Current;
@@ -24,11 +24,11 @@ pub fn proxyKey(seed: u8) !Ecdsa.KeyPair {
 }
 
 pub fn keySet() !bedwire.auth.KeySet {
-    return credentials.keySet(gpa);
+    return sample.keySet(gpa);
 }
 
-pub const rawPacket = credentials.rawPacket;
-pub const typedPacket = credentials.typedPacket;
+pub const rawPacket = sample.rawPacket;
+pub const typedPacket = sample.typedPacket;
 
 pub fn config(backends: []const IpAddress) !bifrost.Config {
     var result = try fixtures.config(backends);
@@ -97,7 +97,7 @@ pub const Player = struct {
 
     // Signing ClientData with another key forges it
     pub fn sendLogin(self: *Player, name: []const u8, xuid: []const u8, client_data_signer: Ecdsa.KeyPair) !void {
-        const request = try credentials.request(gpa, self.key, client_data_signer, name, xuid, std.Io.Clock.real.now(self.io).toSeconds());
+        const request = try sample.request(gpa, self.key, client_data_signer, name, xuid, std.Io.Clock.real.now(self.io).toSeconds());
         defer gpa.free(request);
         const storage = try gpa.alloc(u8, request.len + 32);
         defer gpa.free(storage);
@@ -249,6 +249,7 @@ pub const Backend = struct {
     disconnects: std.atomic.Value(u32) = .init(0),
     refuse: bool = false,
     mode: Mode = .normal,
+    content: sample.Content = .{},
     chattered_ns: u64 = 0,
     identity_name: [64]u8 = undefined,
     identity_name_len: usize = 0,
@@ -409,19 +410,25 @@ pub const Backend = struct {
             },
             .resource_pack_client_response => {
                 try session.advance(.waiting_for_start_game);
-                const start_game = try rawPacket(&buffer, Current.packetId(.start_game).?, "not a real StartGame");
+                var start_buffer: [1024]u8 = undefined;
+                var items_buffer: [256]u8 = undefined;
+                var batch: [303][]const u8 = undefined;
+                batch[0] = try sample.startGame(&start_buffer, self.content);
+                batch[1] = try sample.itemRegistry(&items_buffer, self.content);
+                batch[2] = &sample.biome_definitions;
                 var extra: [16]u8 = undefined;
-                switch (self.mode) {
-                    .welcome => try sendFrame(session, carrier, &.{ start_game, try rawPacket(&extra, game_packet_id, "welcome") }),
-                    .flood => {
-                        var batch: [301][]const u8 = undefined;
-                        batch[0] = start_game;
-                        const filler = try rawPacket(&extra, game_packet_id, "flood");
-                        @memset(batch[1..], filler);
-                        try sendFrame(session, carrier, &batch);
+                const count: usize = switch (self.mode) {
+                    .welcome => count: {
+                        batch[3] = try rawPacket(&extra, game_packet_id, "welcome");
+                        break :count 4;
                     },
-                    else => try sendFrame(session, carrier, &.{start_game}),
-                }
+                    .flood => count: {
+                        @memset(batch[3..], try rawPacket(&extra, game_packet_id, "flood"));
+                        break :count batch.len;
+                    },
+                    else => 3,
+                };
+                try sendFrame(session, carrier, batch[0..count]);
                 try session.advance(.spawn_ready);
             },
             .set_local_player_as_initialised => try session.advance(.in_game),
