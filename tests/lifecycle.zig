@@ -25,19 +25,21 @@ test "an unreachable backend closes the player" {
     try std.testing.expectEqual(@as(u64, 1), running.stats().links_closed);
 }
 
-test "a player leaving mid-connect frees its link once the dial ends" {
+test "a player leaving mid-connect cancels the dial" {
     const silent = try fixtures.silent(io);
     defer silent.close(io);
+    var proxy_config = try fixtures.config(&.{silent.address});
+    proxy_config.connect_timeout_ms = 60_000;
     var running: Running = undefined;
-    try running.start(io, try fixtures.config(&.{silent.address}), .{});
+    try running.start(io, proxy_config, .{});
     defer running.deinit();
 
     var player: Player = try .connect(io, running.address());
     player.deinit();
-    try io.sleep(.fromMilliseconds(1_000), .awake);
+    try running.waitForStat(.links_closed, 1);
 
     running.stop();
-    try std.testing.expectEqual(@as(u64, 1), running.stats().backend_failures);
+    try std.testing.expectEqual(@as(u64, 0), running.stats().backend_failures);
     try std.testing.expectEqual(@as(u64, 1), running.stats().links_closed);
 }
 

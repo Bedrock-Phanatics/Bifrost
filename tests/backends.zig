@@ -152,3 +152,138 @@ test "a failed dial marks the backend down before the next ping" {
     try player.awaitClosed();
     try std.testing.expectEqual(bifrost.Health.Status.unhealthy, health.status(0));
 }
+
+const Silent = struct {
+    sockets: [4]std.Io.net.Socket = undefined,
+    len: usize = 0,
+
+    fn open(self: *Silent, count: usize) !void {
+        while (self.len < count) : (self.len += 1) self.sockets[self.len] = try fixtures.silent(io);
+    }
+
+    fn close(self: *Silent) void {
+        for (self.sockets[0..self.len]) |socket| socket.close(io);
+    }
+
+    fn config(self: *const Silent, live: []const std.Io.net.IpAddress) !bifrost.Config {
+        var addresses: [8]std.Io.net.IpAddress = undefined;
+        for (self.sockets[0..self.len], 0..) |socket, i| addresses[i] = socket.address;
+        @memcpy(addresses[self.len..][0..live.len], live);
+        return fixtures.config(addresses[0 .. self.len + live.len]);
+    }
+};
+
+test "a backend that dies after its health check fails over to the next one" {
+    var first: Backend = undefined;
+    try first.start(io, .{});
+    defer first.deinit();
+    var second: Backend = undefined;
+    try second.start(io, .{});
+    defer second.deinit();
+    const proxy_config = try fixtures.config(&.{ first.address(), second.address() });
+    var health: bifrost.Health = .init(proxy_config.backends(), 60_000, 100);
+    try health.checkAll(io);
+    try std.testing.expectEqual(@as(usize, 2), health.healthyCount());
+    first.pause();
+
+    var running: Running = undefined;
+    try running.start(io, proxy_config, .{ .health = &health });
+    defer running.deinit();
+    var player: Player = try .connect(io, running.address());
+    defer player.deinit();
+    // Sent mid-dial, so it has to survive the retry
+    try player.send("\xfequeued");
+    try player.expect("\xfequeued");
+    try player.roundTrip("\xfehello");
+
+    try std.testing.expectEqual(bifrost.Health.Status.unhealthy, health.status(0));
+    try std.testing.expectEqual(bifrost.Health.Status.healthy, health.status(1));
+    try std.testing.expectEqual(@as(u32, 1), second.connects.load(.acquire));
+    running.stop();
+    try std.testing.expectEqual(@as(u64, 1), running.stats().backend_failures);
+    try std.testing.expectEqual(@as(u64, 1), running.stats().backends_connected);
+}
+
+test "a player skips several dead backends before reaching a live one" {
+    var silent: Silent = .{};
+    defer silent.close();
+    try silent.open(2);
+    var live: Backend = undefined;
+    try live.start(io, .{});
+    defer live.deinit();
+    var running: Running = undefined;
+    try running.start(io, try silent.config(&.{live.address()}), .{});
+    defer running.deinit();
+
+    var player: Player = try .connect(io, running.address());
+    defer player.deinit();
+    try player.send("\xfequeued");
+    try player.expect("\xfequeued");
+    try player.roundTrip("\xfehello");
+
+    running.stop();
+    try std.testing.expectEqual(@as(u32, 1), live.connects.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), running.stats().backend_failures);
+    try std.testing.expectEqual(@as(u64, 1), running.stats().backends_connected);
+}
+
+test "each backend is dialed once and attempts are capped when all fail" {
+    // No health checks, so only the tried set stops repeat dials
+    for ([_][2]usize{ .{ 2, 2 }, .{ 4, 3 } }) |case| {
+        var silent: Silent = .{};
+        defer silent.close();
+        try silent.open(case[0]);
+        var running: Running = undefined;
+        try running.start(io, try silent.config(&.{}), .{});
+        defer running.deinit();
+
+        var player: Player = try .connect(io, running.address());
+        defer player.deinit();
+        try player.send("\xfequeued");
+        try player.awaitClosed();
+        try running.waitForStat(.links_closed, 1);
+
+        running.stop();
+        try std.testing.expectEqual(@as(u64, case[1]), running.stats().backend_failures);
+        try std.testing.expectEqual(@as(u64, 0), running.stats().backends_connected);
+    }
+}
+
+test "a player leaving mid-retry cancels the retry dial" {
+    var silent: Silent = .{};
+    defer silent.close();
+    try silent.open(2);
+    var running: Running = undefined;
+    try running.start(io, try silent.config(&.{}), .{});
+    defer running.deinit();
+
+    var player: Player = try .connect(io, running.address());
+    try running.waitForStat(.backend_failures, 1);
+    player.deinit();
+    try running.waitForStat(.links_closed, 1);
+
+    running.stop();
+    try std.testing.expectEqual(@as(u64, 1), running.stats().backend_failures);
+}
+
+test "stopping mid-retry cancels the retry dial" {
+    var silent: Silent = .{};
+    defer silent.close();
+    try silent.open(2);
+    var proxy_config = try silent.config(&.{});
+    proxy_config.connect_timeout_ms = 1_000;
+    var running: Running = undefined;
+    try running.start(io, proxy_config, .{});
+    defer running.deinit();
+
+    var player: Player = try .connect(io, running.address());
+    defer player.deinit();
+    try running.waitForStat(.backend_failures, 1);
+
+    const started = std.Io.Clock.awake.now(io);
+    running.stop();
+    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 500);
+    try std.testing.expectEqual(@as(u64, 1), running.stats().backend_failures);
+    try std.testing.expectEqual(@as(u64, 1), running.stats().links_closed);
+    try player.awaitClosed();
+}

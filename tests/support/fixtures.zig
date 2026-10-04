@@ -157,6 +157,14 @@ pub const Running = struct {
         std.debug.assert(self.stopped);
         return self.proxy.stats;
     }
+
+    pub fn waitForStat(self: *const Running, comptime field: std.meta.FieldEnum(bifrost.Stats), value: u64) !void {
+        for (0..500) |_| {
+            if (@field(self.proxy.stats.snapshot(), @tagName(field)) == value) return;
+            try self.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.WaitTimedOut;
+    }
 };
 
 pub const RunningWorkers = struct {

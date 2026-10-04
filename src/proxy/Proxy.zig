@@ -85,6 +85,8 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .observer_pool = &self.observer_pool,
         .auth = options.auth,
         .health = options.health,
+        .router = &self.router,
+        .connect_timeout_ms = config.connect_timeout_ms,
         .pending_packets = config.pending_packets,
         .pending_bytes = config.pending_bytes,
     };
@@ -203,8 +205,7 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     const link = try Link.create(&self.env, session);
     errdefer link.destroy();
 
-    const backend = self.router.pick() orelse return error.NoBackendAvailable;
-    try link.startDial(backend.index, backend.address, .{ .handshake_timeout_ms = self.config.connect_timeout_ms });
+    try link.connect();
     self.links.append(&link.node);
     session.setUserData(link);
     self.stats.bump(.sessions_accepted, 1);

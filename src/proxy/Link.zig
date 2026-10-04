@@ -3,6 +3,7 @@ const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const Dial = @import("../backend/Dial.zig");
 const Health = @import("../backend/Health.zig");
+const Router = @import("../backend/Router.zig");
 const Watch = @import("../net/watch.zig").Watch;
 const no_wait = @import("../net/watch.zig").no_wait;
 const Observer = @import("../protocol/Observer.zig");
@@ -14,6 +15,8 @@ const Link = @This();
 const log = std.log.scoped(.link);
 
 const max_polls_per_turn = 4;
+// Each attempt can take a full connect timeout
+const max_dial_attempts = 3;
 
 pub const Env = struct {
     gpa: std.mem.Allocator,
@@ -23,6 +26,8 @@ pub const Env = struct {
     observer_pool: *bedwire.BufferPool,
     auth: Observer.Auth,
     health: ?*Health,
+    router: *Router,
+    connect_timeout_ms: u32,
     pending_packets: u32,
     pending_bytes: u32,
 };
@@ -35,6 +40,7 @@ backend_closing: bool = false,
 dial: Dial = .{},
 backend_index: usize = 0,
 dial_task: ?std.Io.Future(void) = null,
+tried: Router.Set = .initEmpty(),
 pending: PacketQueue,
 observer: Observer,
 watch: Watch(raknet.Client) = .{},
@@ -56,22 +62,22 @@ pub fn create(env: *const Env, session: *raknet.Session) !*Link {
 }
 
 pub fn destroy(self: *Link) void {
-    if (self.dial_task) |*task| {
-        task.cancel(self.env.io);
-        self.dial_task = null;
-        if (self.dial.finished()) |result| {
-            if (result) |client| client.destroy() else |_| {}
-        }
-    }
+    self.cancelDial();
     self.dropBackend();
     self.pending.deinit(self.env.gpa);
     self.observer.deinit();
     self.env.gpa.destroy(self);
 }
 
-pub fn startDial(self: *Link, backend_index: usize, address: std.Io.net.IpAddress, options: raknet.ClientOptions) std.Io.ConcurrentError!void {
-    self.backend_index = backend_index;
-    self.dial_task = try self.env.io.concurrent(Dial.run, .{ &self.dial, self.env.gpa, self.env.io, address, options, Scheduler.linkNotify(self) });
+pub fn connect(self: *Link) (error{NoBackendAvailable} || std.Io.ConcurrentError)!void {
+    std.debug.assert(self.dial_task == null and self.backend == null);
+    if (self.tried.count() == max_dial_attempts) return error.NoBackendAvailable;
+    const backend = self.env.router.pick(self.tried) orelse return error.NoBackendAvailable;
+    self.tried.set(backend.index);
+    self.backend_index = backend.index;
+    self.dial = .{};
+    const options: raknet.ClientOptions = .{ .handshake_timeout_ms = self.env.connect_timeout_ms };
+    self.dial_task = try self.env.io.concurrent(Dial.run, .{ &self.dial, self.env.gpa, self.env.io, backend.address, options, Scheduler.linkNotify(self) });
 }
 
 pub fn isFinished(self: *const Link) bool {
@@ -91,6 +97,7 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
 
 pub fn detachSession(self: *Link) void {
     self.session = null;
+    self.cancelDial();
     self.closeBackend();
     self.env.scheduler.schedule(self);
 }
@@ -136,10 +143,16 @@ fn observe(self: *Link, direction: bedwire.TapDirection, payload: []const u8) Ob
 
 fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
     const client = result catch |err| {
-        log.warn("backend connect failed: {t}", .{err});
+        log.warn("backend {f} connect failed: {t}", .{ self.env.router.backends[self.backend_index], err });
         self.env.stats.bump(.backend_failures, 1);
-        if (err != error.Canceled) if (self.env.health) |health| health.markFailed(self.backend_index);
-        return self.closeSession();
+        if (err == error.Canceled) return self.closeSession();
+        if (self.env.health) |health| health.markFailed(self.backend_index);
+        if (self.session == null) return;
+        self.connect() catch |retry_err| {
+            log.warn("giving up on player: {t}", .{retry_err});
+            self.closeSession();
+        };
+        return;
     };
     self.backend = client;
     self.env.stats.bump(.backends_connected, 1);
@@ -160,6 +173,15 @@ fn flushPending(self: *Link, client: *raknet.Client) !void {
     for (self.pending.items()) |packet| {
         try client.send(packet, .reliable_ordered, 0);
         self.env.stats.bump(.bytes_to_backend, packet.len);
+    }
+}
+
+fn cancelDial(self: *Link) void {
+    var task = self.dial_task orelse return;
+    self.dial_task = null;
+    task.cancel(self.env.io);
+    if (self.dial.finished()) |result| {
+        if (result) |client| client.destroy() else |_| {}
     }
 }
 
