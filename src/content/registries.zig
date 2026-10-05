@@ -148,3 +148,66 @@ fn hashString(hasher: *Hasher, text: []const u8) void {
     hasher.update(std.mem.asBytes(&@as(u32, @intCast(@min(text.len, std.math.maxInt(u32))))));
     hasher.update(text);
 }
+
+fn fingerprintOf(value: protocol.typed.Packet) !Fingerprint {
+    var fingerprint: Fingerprint = .{};
+    try fingerprint.record(.{ .header = .{ .packet_id = 0 }, .kind = null, .payload = &.{}, .value = .{ .typed = value } });
+    return fingerprint;
+}
+
+fn testItem(name: []const u8, id: i16, components: []const u8) packets.item_registry.ItemData {
+    return .{ .item_name = name, .item_id = id, .is_component_based = true, .item_version = .datadriven, .item_component_data = components };
+}
+
+fn testBiome(key: u16, id: u16) packets.biome_definition_list.PacketMapOfBiomeNamesToDataEntry {
+    return .{ .key = key, .value = .{
+        .id = id,
+        .temperature = 0.5,
+        .downfall = 0.5,
+        .foliage_snow = 0,
+        .depth = 0,
+        .scale = 0,
+        .map_water_color_argb = 0,
+        .rain = true,
+        .tags = null,
+        .chunk_gen_data = null,
+    } };
+}
+
+test "item registries compare by meaning, not order" {
+    const ab = [_]u8{ 10, 0, 1, 1, 'a', 5, 1, 1, 'b', 6, 0 };
+    const ba = [_]u8{ 10, 0, 1, 1, 'b', 6, 1, 1, 'a', 5, 0 };
+    const first = [_]packets.item_registry.ItemData{ testItem("custom:wand", 1000, &ab), testItem("custom:staff", 1001, &ab) };
+    const reordered = [_]packets.item_registry.ItemData{ testItem("custom:staff", 1001, &ba), testItem("custom:wand", 1000, &ba) };
+    const renumbered = [_]packets.item_registry.ItemData{ testItem("custom:wand", 1001, &ab), testItem("custom:staff", 1000, &ab) };
+    const a = try fingerprintOf(.{ .item_registry = .{ .item_data = .init(&first) } });
+    const b = try fingerprintOf(.{ .item_registry = .{ .item_data = .init(&reordered) } });
+    const c = try fingerprintOf(.{ .item_registry = .{ .item_data = .init(&renumbered) } });
+    try std.testing.expectEqual(@as(?Kind, null), a.difference(&b));
+    try std.testing.expectEqual(@as(?Kind, .items), a.difference(&c));
+}
+
+test "biomes compare by name and id, wherever the names sit" {
+    const names = [_][]const u8{ "plains", "desert" };
+    const swapped = [_][]const u8{ "desert", "plains" };
+    const entries = [_]packets.biome_definition_list.PacketMapOfBiomeNamesToDataEntry{ testBiome(0, 1), testBiome(1, 2) };
+    const moved = [_]packets.biome_definition_list.PacketMapOfBiomeNamesToDataEntry{ testBiome(1, 1), testBiome(0, 2) };
+    const renumbered = [_]packets.biome_definition_list.PacketMapOfBiomeNamesToDataEntry{ testBiome(0, 2), testBiome(1, 1) };
+    const a = try fingerprintOf(.{ .biome_definition_list = .{ .map_of_biome_names_to_data = .init(&entries), .string_list = .init(&names) } });
+    const b = try fingerprintOf(.{ .biome_definition_list = .{ .map_of_biome_names_to_data = .init(&moved), .string_list = .init(&swapped) } });
+    const c = try fingerprintOf(.{ .biome_definition_list = .{ .map_of_biome_names_to_data = .init(&renumbered), .string_list = .init(&names) } });
+    try std.testing.expectEqual(@as(?Kind, null), a.difference(&b));
+    try std.testing.expectEqual(@as(?Kind, .biomes), a.difference(&c));
+
+    const dangling = [_]packets.biome_definition_list.PacketMapOfBiomeNamesToDataEntry{testBiome(5, 1)};
+    try std.testing.expectError(error.InvalidBiome, fingerprintOf(.{ .biome_definition_list = .{ .map_of_biome_names_to_data = .init(&dangling), .string_list = .init(&names) } }));
+}
+
+test "a registry only one side sent counts as a difference" {
+    const list = [_]packets.item_registry.ItemData{testItem("custom:wand", 1000, &.{ 10, 0, 0 })};
+    const with_items = try fingerprintOf(.{ .item_registry = .{ .item_data = .init(&list) } });
+    const empty: Fingerprint = .{};
+    try std.testing.expectEqual(@as(?Kind, .items), empty.difference(&with_items));
+    try std.testing.expect(!empty.covers(&with_items));
+    try std.testing.expect(with_items.covers(&empty));
+}

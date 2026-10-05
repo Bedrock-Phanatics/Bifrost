@@ -184,6 +184,9 @@ fn settle(self: *Transfer, host: Host) void {
     if (self.seen.started and complete and self.state.phase == .joining) {
         if (self.incompatibility(managed)) |mismatch| {
             self.mismatch = mismatch;
+            switch (mismatch) {
+                inline else => |reason| host.stats.bump(@field(std.meta.FieldEnum(Stats), "incompatible_" ++ @tagName(reason)), 1),
+            }
             log.info("transfer {d}: target content is incompatible: {t}", .{ self.state.epoch, mismatch });
             return self.on(host, .target_failed);
         }

@@ -5,73 +5,11 @@ const managed = @import("support/managed.zig");
 const FailOnce = @import("support/FailOnce.zig");
 
 const Running = fixtures.Running;
+const Rig = @import("support/rig.zig").Rig;
 const Player = managed.Player;
 const gpa = std.testing.allocator;
 const io = std.testing.io;
 const IpAddress = std.Io.net.IpAddress;
-
-const Rig = struct {
-    keys: bifrost.KeySet,
-    a: managed.Backend,
-    b: managed.Backend,
-    running: Running,
-    player: *Player,
-
-    const Options = struct {
-        b: managed.Backend.Mode = .normal,
-        a: managed.Backend.Mode = .normal,
-        target: ?IpAddress = null,
-        connect_timeout_ms: u32 = 500,
-        phase_timeout_ms: u32 = 5_000,
-        timeout_ms: u32 = 15_000,
-    };
-
-    fn start(self: *Rig, options: Options) !void {
-        const proxy_key = try managed.proxyKey(1);
-        self.keys = try managed.keySet();
-        errdefer self.keys.deinit();
-        try self.a.start(io, proxy_key.public_key);
-        errdefer self.a.deinit();
-        try self.b.start(io, proxy_key.public_key);
-        errdefer self.b.deinit();
-        self.a.mode = options.a;
-        self.b.mode = options.b;
-        var proxy_config = try managed.config(&.{ self.a.address(), options.target orelse self.b.address() });
-        proxy_config.connect_timeout_ms = options.connect_timeout_ms;
-        proxy_config.transfer_phase_timeout_ms = options.phase_timeout_ms;
-        proxy_config.transfer_timeout_ms = options.timeout_ms;
-        try self.running.start(io, proxy_config, .{ .auth = .{ .verify = &self.keys }, .proxy_key = proxy_key });
-        errdefer self.running.deinit();
-        self.player = try Player.connect(io, self.running.address(), 2);
-        errdefer self.player.destroy();
-        try self.player.login("Steve", "2535400000000001");
-        try self.player.spawn();
-        // Waits until the proxy has the player in game
-        if (options.a != .chatter) try self.expectOn(&self.a);
-    }
-
-    fn deinit(self: *Rig) void {
-        self.player.destroy();
-        self.running.deinit();
-        self.b.deinit();
-        self.a.deinit();
-        self.keys.deinit();
-    }
-
-    fn transfer(self: *Rig, target: usize) !void {
-        try self.running.proxy.requestTransfer(1, .of(target));
-    }
-
-    fn stats(self: *Rig) bifrost.Stats {
-        return self.running.proxy.stats.snapshot();
-    }
-
-    fn expectOn(self: *Rig, backend: *managed.Backend) !void {
-        const before = backend.echoes.load(.acquire);
-        try self.player.echo("still here");
-        try std.testing.expectEqual(before + 1, backend.echoes.load(.acquire));
-    }
-};
 
 test "a player moves from one backend to another" {
     var rig: Rig = undefined;

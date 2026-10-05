@@ -33,4 +33,6 @@ test {
     _ = @import("session/proxy_key.zig");
     _ = @import("transfer/State.zig");
     _ = @import("content/nbt.zig");
+    _ = @import("content/registries.zig");
+    _ = @import("content/packs.zig");
 }

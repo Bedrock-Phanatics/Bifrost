@@ -80,6 +80,7 @@ pub const biome_definitions = fromHex(biome_definitions_hex);
 const empty_compound = [_]u8{ 10, 0, 0 };
 
 pub const Content = struct {
+    pack: ?[]const u8 = null,
     custom_block: ?[]const u8 = null,
     custom_item: ?[]const u8 = null,
     authoritative_block_breaking: ?bool = null,
@@ -110,6 +111,17 @@ pub fn itemRegistry(buffer: []u8, content: Content) ![]const u8 {
     if (content.custom_item != null) value.item_data = .init(&items);
     envelope.value = .{ .typed = .{ .item_registry = value } };
     return encodeEnvelope(buffer, envelope);
+}
+
+pub fn packStack(buffer: []u8, content: Content) ![]const u8 {
+    const packs = [_]protocol.packets.resource_pack_stack.StackResourcePack{.{ .pack_id = content.pack orelse "", .version = "1.0.0", .sub_pack_name = "" }};
+    return typedPacket(buffer, .{ .resource_pack_stack = .{
+        .texture_pack_required = false,
+        .texture_pack_list = if (content.pack != null) .init(&packs) else .empty,
+        .base_game_version = "",
+        .experiments = .{ .toggles = .empty, .experiments_ever_toggled = false },
+        .include_editor_packs = false,
+    } });
 }
 
 fn encodeEnvelope(buffer: []u8, envelope: protocol.BorrowedEnvelope) ![]const u8 {

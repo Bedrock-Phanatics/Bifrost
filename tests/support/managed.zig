@@ -234,7 +234,7 @@ pub const Backend = struct {
         carrier: *raknet.Session,
     };
 
-    pub const Mode = enum { normal, silent_login, kick_login, silent_stack, welcome, flood, chatter };
+    pub const Mode = enum { normal, silent_login, kick_login, silent_stack, kick_packs, welcome, flood, chatter };
 
     io: std.Io,
     listener: *raknet.Server,
@@ -376,10 +376,10 @@ pub const Backend = struct {
                 try session.negotiateCompression(.snappy, 0);
             },
             .login => {
-                var identity = try session.authenticateLoginPacket(gpa, packet, .{ .certificate_chain = .{
+                var identity = session.authenticateLoginPacket(gpa, packet, .{ .certificate_chain = .{
                     .now = std.Io.Clock.real.now(self.io).toSeconds(),
                     .trusted_issuer_key = self.trusted,
-                } });
+                } }) catch return carrier.close();
                 defer identity.deinit();
                 @memcpy(self.identity_name[0..identity.display_name.len], identity.display_name);
                 self.identity_name_len = identity.display_name.len;
@@ -405,10 +405,11 @@ pub const Backend = struct {
                 _ = self.handshakes.fetchAdd(1, .release);
                 const status = try typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } });
                 if (self.mode == .silent_stack) return sendFrame(session, carrier, &.{status});
-                var stack: [16]u8 = undefined;
-                try sendFrame(session, carrier, &.{ status, try rawPacket(&stack, Current.packetId(.resource_pack_stack).?, &@as([9]u8, @splat(0))) });
+                var stack: [128]u8 = undefined;
+                try sendFrame(session, carrier, &.{ status, try sample.packStack(&stack, self.content) });
             },
             .resource_pack_client_response => {
+                if (self.mode == .kick_packs) return carrier.close();
                 try session.advance(.waiting_for_start_game);
                 var start_buffer: [1024]u8 = undefined;
                 var items_buffer: [256]u8 = undefined;

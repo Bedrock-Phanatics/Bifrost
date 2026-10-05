@@ -22,6 +22,13 @@ transfers_failed_before_commit: u64 = 0,
 transfers_failed_after_commit: u64 = 0,
 transfers_timed_out: u64 = 0,
 transfers_rejected: u64 = 0,
+incompatible_packs: u64 = 0,
+incompatible_start_game: u64 = 0,
+incompatible_blocks: u64 = 0,
+incompatible_items: u64 = 0,
+incompatible_biomes: u64 = 0,
+incompatible_dimensions: u64 = 0,
+incompatible_actors: u64 = 0,
 
 // Only the worker writes these, so a plain atomic store is enough
 pub fn bump(self: *Stats, comptime field: std.meta.FieldEnum(Stats), amount: u64) void {
