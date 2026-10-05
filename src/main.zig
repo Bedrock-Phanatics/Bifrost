@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
         return error.PluginLoadFailed;
     };
 
-    const workers = try bifrost.Workers.create(init.gpa, rt.io(), config, .{ .auth = auth, .proxy_key = proxy_key });
+    const workers = try bifrost.Workers.create(init.gpa, rt.io(), config, .{ .auth = auth, .proxy_key = proxy_key, .plugins = &plugins });
     defer workers.destroy();
     defer plugins.unload();
 

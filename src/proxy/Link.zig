@@ -10,6 +10,8 @@ const no_wait = @import("../net/watch.zig").no_wait;
 const Observer = @import("../protocol/Observer.zig");
 const Managed = @import("../session/Managed.zig");
 const Transfer = @import("../transfer/Transfer.zig");
+const Events = @import("../plugin/Events.zig");
+const abi = @import("../plugin/abi.zig");
 const PacketQueue = @import("PacketQueue.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -36,6 +38,7 @@ pub const Env = struct {
     managed: ?*Managed.Shared = null,
     transfer: Transfer.Settings = .{ .limits = .{ .dial_ms = 5_000, .phase_ms = 5_000, .total_ms = 15_000 }, .queue_packets = 64, .queue_bytes = 1024 * 1024 },
     next_epoch: ?*Transfer.State.Epoch = null,
+    events: Events = .{},
 };
 
 env: *const Env,
@@ -52,6 +55,8 @@ observer: Observer,
 managed: ?*Managed = null,
 transfer: ?*Transfer = null,
 id: u64 = 0,
+player: abi.Player = .{},
+announced: bool = false,
 watch: Watch(raknet.Client) = .{},
 node: std.DoublyLinkedList.Node = .{},
 // Can't free the link while it's still on the ready stack
@@ -76,6 +81,7 @@ pub fn create(env: *const Env, session: *raknet.Session) !*Link {
 
 pub fn destroy(self: *Link) void {
     self.endTransfer(.player_left);
+    self.env.events.disconnected(&self.player);
     self.cancelDial();
     self.dropBackend();
     if (self.managed) |managed| managed.destroy();
@@ -90,6 +96,7 @@ pub fn connect(self: *Link) (error{NoBackendAvailable} || std.Io.ConcurrentError
     const id = self.env.router.pick(self.tried) orelse return error.NoBackendAvailable;
     self.tried.add(id);
     self.backend_id = id;
+    self.env.events.backendSelected(self.player, id.index());
     self.dial = .{};
     const options: raknet.ClientOptions = .{ .handshake_timeout_ms = self.env.connect_timeout_ms };
     const address = self.env.router.get(id).address;
@@ -104,10 +111,15 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
     if (self.managed) |managed| {
         if (self.backend == null and self.dial_task == null) return error.BackendClosed;
         try managed.fromPlayer(self.ends(self.session.?), payload);
+        if (!self.announced) if (managed.identity) |identity| self.announce(identity);
         if (self.backend != null) self.env.scheduler.schedule(self);
         return;
     }
     if (self.observer.watching and self.observe(.client_to_server, payload).rejects()) return error.LoginRejected;
+    if (self.observer.identity) |identity| {
+        self.announce(identity);
+        self.observer.dropIdentity();
+    }
     if (self.backend) |client| {
         try client.send(payload, .reliable_ordered, 0);
         self.env.stats.bump(.bytes_to_backend, payload.len);
@@ -117,8 +129,14 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
     } else return error.BackendClosed;
 }
 
+fn announce(self: *Link, identity: bedwire.Identity) void {
+    self.announced = true;
+    self.env.events.authenticated(self.player, identity.display_name, identity.xuid);
+}
+
 pub fn detachSession(self: *Link) void {
     self.endTransfer(.player_left);
+    self.env.events.disconnected(&self.player);
     self.session = null;
     self.cancelDial();
     self.closeBackend();
@@ -134,8 +152,9 @@ pub fn service(self: *Link) error{Canceled}!void {
     if (self.transfer) |transfer| if (self.session) |session| switch (try transfer.service(self.transferHost(session))) {
         .running => {},
         .finished => {
-            self.backend_id = transfer.target;
+            const target = transfer.target;
             self.endTransfer(null);
+            self.backend_id = target;
         },
         .rolled_back, .abandoned => self.endTransfer(null),
         .disconnect => {
@@ -197,11 +216,24 @@ fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
     self.flushPending(client) catch |err| self.fail(err);
 }
 
-pub fn startTransfer(self: *Link, target: Backend.Id) !void {
+pub fn requestTransfer(self: *Link, requested: Backend.Id) !void {
+    self.startTransfer(requested) catch |err| {
+        self.env.events.transferEnded(self.player, self.backend_id.index(), requested.index(), .rejected);
+        return err;
+    };
+}
+
+fn startTransfer(self: *Link, requested: Backend.Id) !void {
     const managed = self.managed orelse return error.NotManaged;
     if (self.transfer != null) return error.TransferInProgress;
     const session = self.session orelse return error.NotInGame;
     if (self.backend == null or self.backend_closing or !managed.inGame()) return error.NotInGame;
+    const decision = self.env.events.transferRequested(self.player, self.backend_id.index(), requested.index());
+    const target: Backend.Id = switch (decision.action) {
+        .cancel => return error.CanceledByPlugin,
+        .redirect => .of(decision.backend),
+        else => requested,
+    };
     if (target.index() >= self.env.router.backends.len) return error.UnknownBackend;
     if (target == self.backend_id) return error.AlreadyThere;
     if (self.env.health) |health| if (health.status(target) == .unhealthy) return error.BackendDown;
@@ -228,7 +260,17 @@ fn endTransfer(self: *Link, event: ?Transfer.State.Event) void {
     const transfer = self.transfer orelse return;
     self.transfer = null;
     if (event) |cause| transfer.end(self.env.io, self.env.stats, cause);
+    self.env.events.transferEnded(self.player, self.backend_id.index(), transfer.target.index(), failure(transfer));
     transfer.destroy(self.env.gpa, self.env.io);
+}
+
+fn failure(transfer: *const Transfer) abi.TransferFailure {
+    return switch (transfer.outcome orelse return .failed_before_commit) {
+        .committed => .none,
+        .failed_before_commit => if (transfer.mismatch != null) .incompatible_content else .failed_before_commit,
+        .failed_after_commit => .failed_after_commit,
+        .timed_out => .timed_out,
+    };
 }
 
 fn ends(self: *Link, session: *raknet.Session) Managed.Ends {

@@ -38,6 +38,7 @@ pub const Event = enum {
 tap: bedwire.Tap,
 watching: bool = true,
 verified: bool = false,
+identity: ?bedwire.Identity = null,
 
 pub fn loadKeys(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bedwire.auth.KeySet {
     const json = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(limits.max_jwks_bytes));
@@ -54,6 +55,7 @@ pub fn init(pool: *bedwire.BufferPool) !Observer {
 }
 
 pub fn deinit(self: *Observer) void {
+    self.dropIdentity();
     self.tap.deinit();
 }
 
@@ -82,7 +84,7 @@ fn verify(self: *Observer, ctx: Context, packet: bedwire.Tap.Packet) Event {
         .now = std.Io.Clock.real.now(ctx.io).toSeconds(),
         .keys = ctx.auth.verify,
     } };
-    var identity = self.tap.authenticateLoginPacket(ctx.gpa, packet, policy) catch |err| {
+    const identity = self.tap.authenticateLoginPacket(ctx.gpa, packet, policy) catch |err| {
         if (err == error.OutOfMemory) {
             log.warn("login verification unavailable: {t}", .{err});
             return .auth_unavailable;
@@ -90,10 +92,16 @@ fn verify(self: *Observer, ctx: Context, packet: bedwire.Tap.Packet) Event {
         log.info("login rejected: {t}", .{err});
         return .login_rejected;
     };
-    defer identity.deinit();
     self.verified = true;
     log.info("verified {s} (xuid {s})", .{ identity.display_name, identity.xuid });
+    self.dropIdentity();
+    self.identity = identity;
     return .login_verified;
+}
+
+pub fn dropIdentity(self: *Observer) void {
+    if (self.identity) |*identity| identity.deinit();
+    self.identity = null;
 }
 
 fn giveUp(self: *Observer, ctx: Context, err: anyerror) Event {

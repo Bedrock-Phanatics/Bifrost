@@ -15,6 +15,8 @@ const Admission = @import("Admission.zig");
 const Backend = @import("../backend/Backend.zig");
 const Transfer = @import("../transfer/Transfer.zig");
 const Link = @import("Link.zig");
+const Plugins = @import("../plugin/Plugins.zig");
+const abi = @import("../plugin/abi.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
 
@@ -55,6 +57,7 @@ pub const Options = struct {
     admission: ?*Admission = null,
     health: ?*Health = null,
     proxy_key: ?proxy_key.Ecdsa.KeyPair = null,
+    plugins: ?*Plugins = null,
 };
 
 pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Proxy {
@@ -128,6 +131,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
             .content_policy = config.content_policy,
         },
         .next_epoch = &self.next_epoch,
+        .events = .{ .plugins = options.plugins },
     };
     return self;
 }
@@ -187,7 +191,13 @@ fn startTransfer(self: *Proxy, request: TransferRequest) void {
         if (link.id == request.player) break link;
     } else null;
     const found = link orelse return self.rejectTransfer(request, error.UnknownPlayer);
-    found.startTransfer(request.target) catch |err| self.rejectTransfer(request, err);
+    found.requestTransfer(request.target) catch |err| self.rejectTransfer(request, err);
+}
+
+fn routeTransfer(context: *anyopaque, link: u64, backend: u32) abi.Status {
+    const self: *Proxy = @ptrCast(@alignCast(context));
+    self.requestTransfer(link, .of(backend)) catch return .busy;
+    return .ok;
 }
 
 fn rejectTransfer(self: *Proxy, request: TransferRequest, err: anyerror) void {
@@ -196,11 +206,13 @@ fn rejectTransfer(self: *Proxy, request: TransferRequest, err: anyerror) void {
 }
 
 pub fn stop(self: *Proxy) void {
+    self.env.events.proxyStopping();
     self.stop_requested.store(true, .release);
     self.scheduler.wake.set(self.io);
 }
 
 pub fn run(self: *Proxy) void {
+    self.env.events.proxyStarted();
     while (!self.stop_requested.load(.acquire)) self.turn();
     self.closeAll();
 }
@@ -285,10 +297,11 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     errdefer self.admission.leave(self.io, session.address);
     const link = try Link.create(&self.env, session);
     errdefer link.destroy();
+    link.id = self.next_player + 1;
+    link.player = self.env.events.connected(.{ .context = self, .link = link.id, .transfer = routeTransfer }, session.address);
 
     try link.connect();
     self.next_player += 1;
-    link.id = self.next_player;
     self.links.append(&link.node);
     session.setUserData(link);
     self.stats.bump(.sessions_accepted, 1);

@@ -67,6 +67,7 @@ queue: Queue,
 source: ?*raknet.Client = null,
 seen: Seen = .{},
 result: Result = .running,
+outcome: ?State.Outcome = null,
 content_policy: content.Policy,
 target_packs: packs.Fingerprint = .{},
 target_registries: registries.Fingerprint = .{},
@@ -111,7 +112,7 @@ pub fn destroy(self: *Transfer, gpa: std.mem.Allocator, io: std.Io) void {
 
 pub fn end(self: *Transfer, io: std.Io, stats: *Stats, event: State.Event) void {
     if (self.result != .running) return;
-    record(stats, self.state.apply(event, now(io)));
+    self.record(stats, self.state.apply(event, now(io)));
     self.result = .abandoned;
 }
 
@@ -270,7 +271,7 @@ fn endsRegistries(kind: ?bedwire.PacketKind) bool {
 fn on(self: *Transfer, host: Host, event: State.Event) void {
     const phase = self.state.phase;
     const step = self.state.apply(event, now(host.io));
-    record(host.stats, step);
+    self.record(host.stats, step);
     switch (step.action) {
         .none, .stale => {},
         .prepare_client => return self.on(host, .client_prepared),
@@ -353,8 +354,9 @@ fn finite(position: bedwire.protocol.Vec3f) bedwire.protocol.Vec3f {
     return .{ .x = 0, .y = 0, .z = 0 };
 }
 
-fn record(stats: *Stats, step: State.Step) void {
+fn record(self: *Transfer, stats: *Stats, step: State.Step) void {
     const outcome = step.outcome orelse return;
+    self.outcome = outcome;
     switch (outcome) {
         .committed => stats.bump(.transfers_committed, 1),
         .failed_before_commit => stats.bump(.transfers_failed_before_commit, 1),

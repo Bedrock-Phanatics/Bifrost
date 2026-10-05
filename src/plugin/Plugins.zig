@@ -39,6 +39,8 @@ subscribers: [abi.EventKind.count]std.ArrayList(Subscriber) = @splat(.empty),
 pending: std.ArrayList(Pending) = .empty,
 initializing: std.atomic.Value(?*Loaded) = .init(null),
 handles: Handles = .{},
+started: std.atomic.Value(bool) = .init(false),
+stopping: std.atomic.Value(bool) = .init(false),
 
 pub fn init(gpa: std.mem.Allocator, backends: []const Backend) Plugins {
     return .{ .gpa = gpa, .backends = backends };

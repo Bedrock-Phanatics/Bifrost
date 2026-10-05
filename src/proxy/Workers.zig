@@ -7,6 +7,7 @@ const proxy_key = @import("../session/proxy_key.zig");
 const Admission = @import("Admission.zig");
 const Proxy = @import("Proxy.zig");
 const Stats = @import("Stats.zig");
+const Plugins = @import("../plugin/Plugins.zig");
 
 const Workers = @This();
 const log = std.log.scoped(.stats);
@@ -24,6 +25,7 @@ proxies: []*Proxy,
 pub const Options = struct {
     auth: Observer.Auth = .off,
     proxy_key: ?proxy_key.Ecdsa.KeyPair = null,
+    plugins: ?*Plugins = null,
 };
 
 pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Workers {
@@ -55,6 +57,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
             .admission = &self.admission,
             .health = &self.health,
             .proxy_key = options.proxy_key,
+            .plugins = options.plugins,
         });
         watcher.* = proxy.*.healthNotify();
         created += 1;
