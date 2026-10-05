@@ -117,8 +117,29 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
             for (value.array.items, 0..) |item, i| {
                 try readBackend(config, try table(diag, .{ .section = name, .index = i }, item), i, diag);
             }
+        } else if (eql(name, "plugin")) {
+            if (value != .array) return fail(diag, key, "expected [[plugin]] tables", .{});
+            for (value.array.items, 0..) |item, i| {
+                try readPlugin(config, try table(diag, .{ .section = name, .index = i }, item), i, diag);
+            }
         } else return fail(diag, key, "unknown section", .{});
     }
+}
+
+fn readPlugin(config: *Config, section: *const toml.Table, index: usize, diag: *Diagnostic) Error!void {
+    var path: ?[]const u8 = null;
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "plugin", .index = index, .name = entry.key_ptr.* };
+        if (eql(key.name.?, "path")) {
+            path = try string(diag, key, entry.value_ptr.*);
+        } else return fail(diag, key, "unknown key", .{});
+    }
+    const key: Key = .{ .section = "plugin", .index = index, .name = "path" };
+    config.addPlugin(path orelse return fail(diag, key, "is required", .{})) catch |err| return switch (err) {
+        error.InvalidPath => fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len}),
+        error.TooManyPlugins => fail(diag, key, "at most {d} plugins", .{Config.max_plugins}),
+    };
 }
 
 fn readServer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
@@ -398,6 +419,16 @@ test "transfer section sets the timeouts" {
     try expectInvalid("[transfer]\ncontent = \"latest\"\n" ++ backend, "transfer.content: expected \"initial\" or \"match\", got \"latest\"");
     const matching = try parse(std.testing.allocator, "[transfer]\ncontent = \"match\"\n" ++ backend, &diag);
     try std.testing.expectEqual(.match, matching.content_policy);
+}
+
+test "plugin tables list libraries to load" {
+    var diag: Diagnostic = .{};
+    const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
+    const config = try parse(std.testing.allocator, "[[plugin]]\npath = \"plugins/a.so\"\n[[plugin]]\npath = \"b.dll\"\n" ++ backend, &diag);
+    try std.testing.expectEqual(@as(usize, 2), config.plugin_count);
+    try std.testing.expectEqualStrings("b.dll", config.pluginPath(1));
+    try expectInvalid("[[plugin]]\nname = \"a\"\n" ++ backend, "plugin[0].name: unknown key");
+    try expectInvalid("[[plugin]]\n" ++ backend, "plugin[0].path: is required");
 }
 
 test "loadFile reports missing and oversized files" {

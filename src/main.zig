@@ -32,8 +32,16 @@ pub fn main(init: std.process.Init) !void {
     const rt = try zio.Runtime.init(init.gpa, .{ .executors = .exact(config.workers) });
     defer rt.deinit();
 
+    var plugins: bifrost.Plugins = .init(init.gpa, config.backends());
+    defer plugins.deinit();
+    for (0..config.plugin_count) |i| plugins.open(config.pluginPath(i)) catch |err| {
+        log.err("plugin {s}: {t}", .{ config.pluginPath(i), err });
+        return error.PluginLoadFailed;
+    };
+
     const workers = try bifrost.Workers.create(init.gpa, rt.io(), config, .{ .auth = auth, .proxy_key = proxy_key });
     defer workers.destroy();
+    defer plugins.unload();
 
     var signals = try rt.spawn(stopOnSignal, .{workers});
     defer signals.cancel();

@@ -11,6 +11,7 @@ pub const max_workers = 64;
 pub const multi_worker_supported = builtin.os.tag == .linux;
 pub const max_motd_len = 256;
 pub const max_path_len = 1024;
+pub const max_plugins = 16;
 // raknet retries every 500 ms and rejects anything shorter
 pub const min_connect_timeout_ms = 500;
 pub const default_motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;";
@@ -37,6 +38,9 @@ motd_storage: [max_motd_len]u8 = undefined,
 motd_len: usize = 0,
 backend_storage: [max_backends]Backend = undefined,
 backend_count: usize = 0,
+plugin_storage: [max_plugins][max_path_len]u8 = undefined,
+plugin_lens: [max_plugins]u16 = undefined,
+plugin_count: usize = 0,
 
 pub const Auth = enum {
     off,
@@ -76,6 +80,18 @@ pub fn setMotd(self: *Config, value: []const u8) error{InvalidMotd}!void {
     if (value.len == 0 or value.len > max_motd_len) return error.InvalidMotd;
     @memcpy(self.motd_storage[0..value.len], value);
     self.motd_len = value.len;
+}
+
+pub fn pluginPath(self: *const Config, index: usize) []const u8 {
+    return self.plugin_storage[index][0..self.plugin_lens[index]];
+}
+
+pub fn addPlugin(self: *Config, path: []const u8) error{ InvalidPath, TooManyPlugins }!void {
+    if (path.len == 0 or path.len > max_path_len) return error.InvalidPath;
+    if (self.plugin_count == max_plugins) return error.TooManyPlugins;
+    @memcpy(self.plugin_storage[self.plugin_count][0..path.len], path);
+    self.plugin_lens[self.plugin_count] = @intCast(path.len);
+    self.plugin_count += 1;
 }
 
 pub fn backends(self: *const Config) []const Backend {

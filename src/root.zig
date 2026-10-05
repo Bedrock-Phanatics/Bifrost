@@ -18,6 +18,8 @@ pub const KeySet = @import("bedwire").auth.KeySet;
 pub const loadKeys = Observer.loadKeys;
 pub const advertisedPlayers = @import("protocol/advertisement.zig").players;
 pub const Managed = @import("session/Managed.zig");
+pub const Plugins = @import("plugin/Plugins.zig");
+pub const plugin_abi = @import("plugin/abi.zig");
 pub const loadProxyKey = @import("session/proxy_key.zig").load;
 pub const proxyKeyText = @import("session/proxy_key.zig").publicText;
 
@@ -38,4 +40,6 @@ test {
     _ = @import("session/ClientState.zig");
     _ = @import("transfer/Handoff.zig");
     _ = @import("session/self_id.zig");
+    _ = @import("plugin/Plugins.zig");
+    _ = @import("plugin/Handles.zig");
 }

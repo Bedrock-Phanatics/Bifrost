@@ -41,3 +41,7 @@ address = "127.0.0.1:19133"
 [[backend]]
 name = "survival"
 address = "127.0.0.1:19134"
+
+# Native plugins load in order at startup and unload in reverse at shutdown
+# [[plugin]]
+# path = "plugins/libexample.so"
