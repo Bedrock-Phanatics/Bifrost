@@ -7,6 +7,9 @@ const packs = @import("../content/packs.zig");
 pub const registries = @import("../content/registries.zig");
 pub const Upstream = @import("Upstream.zig");
 const ClientState = @import("ClientState.zig");
+pub const Outbox = @import("Outbox.zig");
+const Queue = @import("../transfer/Queue.zig");
+const Handoff = @import("../transfer/Handoff.zig");
 
 const protocol = bedwire.protocol;
 const Current = protocol.Current;
@@ -83,6 +86,11 @@ initial_packs: packs.Fingerprint = .{},
 initial_registries: registries.Fingerprint = .{},
 transferred: bool = false,
 client_state: ClientState = .{},
+client_dimension: i32 = Handoff.overworld,
+// New backend packets wait here until the client is in their dimension
+hold: ?*Queue = null,
+syncing: bool = false,
+dimension_acks: u32 = 0,
 // Player packets sent before the backend is ready
 early: PacketQueue,
 
@@ -144,22 +152,12 @@ pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
     return packets.len - count;
 }
 
-pub fn resetClient(self: *Managed, ends: Ends) !void {
-    var bytes: std.ArrayList(u8) = .empty;
-    defer bytes.deinit(self.gpa);
-    var lengths: std.ArrayList(u32) = .empty;
-    defer lengths.deinit(self.gpa);
-    try self.client_state.reset(self.gpa, &bytes, &lengths);
-    var offset: usize = 0;
+pub fn sendOutbox(self: *Managed, ends: Ends, outbox: *const Outbox) !void {
     var start: usize = 0;
-    while (start < lengths.items.len) {
-        const count = @min(lengths.items.len - start, self.shared.batch.len);
-        for (lengths.items[start..][0..count], self.shared.batch[0..count]) |len, *slice| {
-            slice.* = bytes.items[offset..][0..len];
-            offset += len;
-        }
-        try self.sendToPlayer(ends, self.shared.batch[0..count]);
-        start += count;
+    while (start < outbox.count()) {
+        const packets = outbox.slices(start, self.shared.batch);
+        try self.sendToPlayer(ends, packets);
+        start += packets.len;
     }
 }
 
@@ -266,6 +264,14 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
     var next_state: ?bedwire.State = null;
     var count: usize = 0;
     while (packets.next()) |packet| {
+        if (self.syncing) if (packet.kind) |kind| switch (kind) {
+            .player_action => if (Handoff.isAck(try self.player.decodePacket(packet))) {
+                self.dimension_acks += 1;
+                continue;
+            },
+            .player_auth_input, .move_player => continue,
+            else => {},
+        };
         if (packet.kind == .container_close) self.client_state.containerClosed();
         if (try self.playerMilestone(packet)) |state| next_state = state;
         if (self.upstream.phase != .ready) {
@@ -291,10 +297,21 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
             if (self.player.state != .in_game) {
                 const decoded = try self.upstream.session.decodePacket(packet);
                 try self.initial_registries.record(decoded);
-                if (decoded.value == .typed and decoded.value.typed == .start_game) self.client_state.own_runtime_id = decoded.value.typed.start_game.runtime_id;
+                if (decoded.value == .typed and decoded.value.typed == .start_game) {
+                    self.client_state.own_runtime_id = decoded.value.typed.start_game.runtime_id;
+                    self.client_dimension = decoded.value.typed.start_game.settings.spawn_settings.dimension;
+                }
             }
         }
         if (ClientState.tracks(packet.kind)) self.observeClient(packet.bytes);
+        if (packet.kind == .change_dimension) {
+            const decoded = try typed(try self.upstream.session.decodePacket(packet), .change_dimension);
+            self.client_dimension = decoded.dimension_id;
+        }
+        if (self.hold) |hold| {
+            try hold.push(self.gpa, packet.bytes);
+            continue;
+        }
         if (packet.kind == .start_game) start_game = true;
         if (self.player.state == .resource_packs) try self.capturePacks(packet);
         self.shared.batch[count] = packet.bytes;

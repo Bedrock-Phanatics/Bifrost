@@ -36,4 +36,5 @@ test {
     _ = @import("content/registries.zig");
     _ = @import("content/packs.zig");
     _ = @import("session/ClientState.zig");
+    _ = @import("transfer/Handoff.zig");
 }

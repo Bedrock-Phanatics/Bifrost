@@ -51,6 +51,9 @@ pub const Player = struct {
     frames: std.ArrayList([]u8) = .empty,
     current: ?[]u8 = null,
     timeout_ms: i64 = 5_000,
+    game_packets: std.ArrayList([]u8) = .empty,
+    dimension_changes: usize = 0,
+    dimensions: [8]i32 = undefined,
 
     pub fn connect(io: std.Io, address: IpAddress, seed: u8) !*Player {
         const self = try gpa.create(Player);
@@ -77,6 +80,8 @@ pub const Player = struct {
         if (self.current) |frame| gpa.free(frame);
         for (self.frames.items) |frame| gpa.free(frame);
         self.frames.deinit(gpa);
+        for (self.game_packets.items) |packet| gpa.free(packet);
+        self.game_packets.deinit(gpa);
         gpa.destroy(self);
     }
 
@@ -159,16 +164,41 @@ pub const Player = struct {
     }
 
     pub fn nextGamePacket(self: *Player, out: []u8) ![]const u8 {
-        while (true) {
+        while (self.game_packets.items.len == 0) try self.pump();
+        const payload = self.game_packets.orderedRemove(0);
+        defer gpa.free(payload);
+        @memcpy(out[0..payload.len], payload);
+        return out[0..payload.len];
+    }
+
+    // Acks dimension changes like a client
+    pub fn pump(self: *Player) !void {
+        var acks: usize = 0;
+        {
             var packets = try self.receive();
             defer packets.deinit();
-            while (packets.next()) |packet| {
-                if (packet.kind != null) continue;
-                const payload = packet.bytes[2..];
-                @memcpy(out[0..payload.len], payload);
-                return out[0..payload.len];
-            }
+            while (packets.next()) |packet| switch (packet.kind orelse {
+                try self.game_packets.ensureUnusedCapacity(gpa, 1);
+                self.game_packets.appendAssumeCapacity(try gpa.dupe(u8, packet.bytes[2..]));
+                continue;
+            }) {
+                .change_dimension => {
+                    const change = (try self.session.decodePacket(packet)).value.typed.change_dimension;
+                    if (self.dimension_changes < self.dimensions.len) self.dimensions[self.dimension_changes] = change.dimension_id;
+                    self.dimension_changes += 1;
+                    acks += 1;
+                },
+                else => {},
+            };
         }
+        var buffer: [64]u8 = undefined;
+        for (0..acks) |_| try self.send(&.{try typedPacket(&buffer, .{ .player_action = .{
+            .player_runtime_id = 0,
+            .action = .changedimensionack,
+            .block_position = .{ .x = 0, .y = 0, .z = 0 },
+            .result_pos = .{ .x = 0, .y = 0, .z = 0 },
+            .face = 0,
+        } })});
     }
 
     pub fn countGamePackets(self: *Player, suffix: []const u8, ms: i64) !usize {

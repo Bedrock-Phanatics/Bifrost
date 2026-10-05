@@ -18,7 +18,7 @@ test "a player moves from one backend to another" {
     try rig.expectOn(&rig.a);
 
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_committed, 1);
+    try rig.waitFor(.transfers_committed, 1);
     try rig.expectOn(&rig.b);
     try fixtures.waitFor(io, &rig.a.disconnects, 1);
     try std.testing.expectEqual(@as(u64, 1), rig.stats().transfers_started);
@@ -31,7 +31,7 @@ test "a player can bounce between backends" {
 
     for (1..5) |round| {
         try rig.transfer(round % 2);
-        try rig.running.waitForStat(.transfers_committed, round);
+        try rig.waitFor(.transfers_committed, round);
         try rig.expectOn(if (round % 2 == 1) &rig.b else &rig.a);
     }
     try std.testing.expectEqual(@as(u32, 3), rig.a.logins.load(.acquire));
@@ -46,7 +46,7 @@ test "an unreachable target leaves the player where it was" {
     defer rig.deinit();
 
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_failed_before_commit, 1);
+    try rig.waitFor(.transfers_failed_before_commit, 1);
     try rig.expectOn(&rig.a);
     try std.testing.expectEqual(@as(u64, 0), rig.stats().transfers_committed);
 }
@@ -57,7 +57,7 @@ test "a target that drops the login is rolled back" {
     defer rig.deinit();
 
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_failed_before_commit, 1);
+    try rig.waitFor(.transfers_failed_before_commit, 1);
     try rig.expectOn(&rig.a);
 }
 
@@ -67,7 +67,7 @@ test "a stalled transfer times out and rolls back" {
     defer rig.deinit();
 
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_timed_out, 1);
+    try rig.waitFor(.transfers_timed_out, 1);
     try rig.expectOn(&rig.a);
     try fixtures.waitFor(io, &rig.b.disconnects, 1);
 }
@@ -79,9 +79,9 @@ test "a second request while one is in flight is rejected" {
 
     try rig.transfer(1);
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_committed, 1);
+    try rig.waitFor(.transfers_committed, 1);
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_rejected, 2);
+    try rig.waitFor(.transfers_rejected, 2);
     try std.testing.expectEqual(@as(u64, 1), rig.stats().transfers_started);
     try rig.expectOn(&rig.b);
 }
@@ -94,7 +94,7 @@ test "a dial left over from a timed out transfer is cancelled" {
     defer rig.deinit();
 
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_timed_out, 1);
+    try rig.waitFor(.transfers_timed_out, 1);
     try rig.expectOn(&rig.a);
     try std.testing.expectEqual(@as(u64, 0), rig.stats().backends_connected - 1);
 }
@@ -114,7 +114,7 @@ test "leaving or stopping the proxy mid-transfer frees the target in every phase
 
         try rig.transfer(1);
         switch (phase) {
-            .dialing => try rig.running.waitForStat(.transfers_started, 1),
+            .dialing => try rig.waitFor(.transfers_started, 1),
             .logging_in => try fixtures.waitFor(io, &rig.b.logins, 1),
             .joining => try fixtures.waitFor(io, &rig.b.handshakes, 1),
         }
@@ -123,7 +123,7 @@ test "leaving or stopping the proxy mid-transfer frees the target in every phase
         } else {
             rig.player.destroy();
             rig.player = try Player.connect(io, rig.running.address(), 3);
-            try rig.running.waitForStat(.links_closed, 1);
+            try rig.waitFor(.links_closed, 1);
         }
         try std.testing.expectEqual(@as(u64, 1), rig.stats().transfers_failed_before_commit);
         if (phase != .dialing) try fixtures.waitFor(io, &rig.b.disconnects, 1);
@@ -137,7 +137,7 @@ test "the old backend is silent once the player has moved" {
     try std.testing.expect(try rig.player.countGamePackets("chatter", 200) > 0);
 
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_committed, 1);
+    try rig.waitFor(.transfers_committed, 1);
     _ = try rig.player.countGamePackets("chatter", 100);
     try std.testing.expectEqual(@as(usize, 0), try rig.player.countGamePackets("chatter", 500));
     try rig.expectOn(&rig.b);
@@ -149,7 +149,7 @@ test "target packets sent before the switch reach the player after it" {
     defer rig.deinit();
 
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_committed, 1);
+    try rig.waitFor(.transfers_committed, 1);
     var buffer: [64]u8 = undefined;
     try std.testing.expectStringEndsWith(try rig.player.nextGamePacket(&buffer), "welcome");
     try rig.expectOn(&rig.b);
@@ -161,7 +161,7 @@ test "a target that overflows the queue is rolled back and its packets dropped" 
     defer rig.deinit();
 
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_failed_before_commit, 1);
+    try rig.waitFor(.transfers_failed_before_commit, 1);
     try std.testing.expectEqual(@as(usize, 0), try rig.player.countGamePackets("flood", 200));
     try rig.expectOn(&rig.a);
 }
@@ -205,8 +205,13 @@ fn transferWith(allocator: *FailOnce, proxy_config: bifrost.Config, options: bif
         const ended = stats.transfers_committed + stats.transfers_failed_before_commit +
             stats.transfers_failed_after_commit + stats.transfers_timed_out + stats.transfers_rejected;
         if (ended != 0) break;
-        try io.sleep(.fromMilliseconds(10), .awake);
+        player.timeout_ms = 10;
+        player.pump() catch |err| switch (err) {
+            error.NoMessage => {},
+            else => break,
+        };
     }
+    player.timeout_ms = 1_000;
     const committed = running.proxy.stats.snapshot().transfers_committed == 1;
     player.echo("after") catch {};
     return committed;

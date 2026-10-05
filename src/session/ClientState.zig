@@ -5,6 +5,8 @@ const protocol = bedwire.protocol;
 const packets = protocol.packets;
 const Current = protocol.Current;
 
+const Outbox = @import("Outbox.zig");
+
 const ClientState = @This();
 
 const max_entities = 4096;
@@ -96,8 +98,8 @@ pub fn containerClosed(self: *ClientState) void {
     self.container = null;
 }
 
-pub fn reset(self: *ClientState, gpa: std.mem.Allocator, out: *std.ArrayList(u8), lengths: *std.ArrayList(u32)) !void {
-    var emitter: Emitter = .{ .gpa = gpa, .out = out, .lengths = lengths };
+pub fn reset(self: *ClientState, emitter: *Outbox) !void {
+    const gpa = emitter.gpa;
     if (self.container) |container| try emitter.emit(.{ .container_close = .{ .container_id = container.id, .container_type = container.kind, .server_initiated_close = true } });
     for (self.entities.items) |id| try emitter.emit(.{ .remove_actor = .{ .target_actor_id = id } });
     if (self.players.items.len != 0) {
@@ -223,40 +225,17 @@ fn remove(comptime T: type, list: *std.ArrayList(T), value: T) void {
     };
 }
 
-const Emitter = struct {
-    gpa: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    lengths: *std.ArrayList(u32),
-
-    fn emit(self: *Emitter, packet: protocol.typed.Packet) !void {
-        const envelope: protocol.typed.Envelope = .{ .header = .{ .packet_id = Current.packetId(protocol.typed.packetKind(packet)).? }, .packet = packet };
-        const size = try protocol.typed.encodedSize(envelope);
-        try self.lengths.ensureUnusedCapacity(self.gpa, 1);
-        try self.out.ensureUnusedCapacity(self.gpa, size);
-        var writer = protocol.Writer.init(self.out.unusedCapacitySlice()[0..size]);
-        try protocol.typed.encode(&writer, envelope);
-        self.out.items.len += size;
-        self.lengths.appendAssumeCapacity(@intCast(size));
-    }
-};
-
 fn observed(state: *ClientState, value: protocol.typed.Packet) !void {
     try state.observe(std.testing.allocator, .{ .header = .{ .packet_id = 0 }, .kind = null, .payload = &.{}, .value = .{ .typed = value } });
 }
 
 fn resetKinds(state: *ClientState, kinds: []bedwire.PacketKind) ![]bedwire.PacketKind {
-    const gpa = std.testing.allocator;
-    var bytes: std.ArrayList(u8) = .empty;
-    defer bytes.deinit(gpa);
-    var lengths: std.ArrayList(u32) = .empty;
-    defer lengths.deinit(gpa);
-    try state.reset(gpa, &bytes, &lengths);
-    var offset: usize = 0;
-    for (lengths.items, 0..) |len, i| {
-        kinds[i] = (try Current.decodeBorrowed(bytes.items[offset..][0..len], .{})).kind.?;
-        offset += len;
-    }
-    return kinds[0..lengths.items.len];
+    var outbox: Outbox = .init(std.testing.allocator);
+    defer outbox.deinit();
+    try state.reset(&outbox);
+    var packets_out: [16][]const u8 = undefined;
+    for (outbox.slices(0, &packets_out), 0..) |packet, i| kinds[i] = (try Current.decodeBorrowed(packet, .{})).kind.?;
+    return kinds[0..outbox.count()];
 }
 
 test "everything a backend left behind is undone once" {

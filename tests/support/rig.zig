@@ -63,6 +63,17 @@ pub const Rig = struct {
         self.keys.deinit();
     }
 
+    pub fn waitFor(self: *Rig, comptime field: std.meta.FieldEnum(bifrost.Stats), value: u64) !void {
+        const saved = self.player.timeout_ms;
+        defer self.player.timeout_ms = saved;
+        self.player.timeout_ms = 20;
+        for (0..500) |_| {
+            if (@field(self.stats(), @tagName(field)) >= value) return;
+            self.player.pump() catch |err| if (err != error.NoMessage) return err;
+        }
+        return error.WaitTimedOut;
+    }
+
     pub fn transfer(self: *Rig, target: usize) !void {
         try self.running.proxy.requestTransfer(1, .of(target));
     }

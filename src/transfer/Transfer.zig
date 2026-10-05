@@ -13,6 +13,8 @@ const content = @import("../content/policy.zig");
 const packs = @import("../content/packs.zig");
 const registries = @import("../content/registries.zig");
 pub const State = @import("State.zig");
+const Queue = @import("Queue.zig");
+const Handoff = @import("Handoff.zig");
 
 const Transfer = @This();
 const log = std.log.scoped(.transfer);
@@ -44,34 +46,6 @@ pub const Settings = struct {
     content_policy: content.Policy = .initial,
 };
 
-const Queue = struct {
-    bytes: std.ArrayList(u8) = .empty,
-    lengths: std.ArrayList(u32) = .empty,
-    max_packets: usize,
-    max_bytes: usize,
-
-    fn push(self: *Queue, gpa: std.mem.Allocator, packet: []const u8) !void {
-        if (self.lengths.items.len == self.max_packets or packet.len > self.max_bytes - self.bytes.items.len) return error.QueueFull;
-        try self.lengths.ensureUnusedCapacity(gpa, 1);
-        try self.bytes.appendSlice(gpa, packet);
-        self.lengths.appendAssumeCapacity(@intCast(packet.len));
-    }
-
-    fn slices(self: *const Queue, out: [][]const u8) []const []const u8 {
-        var offset: usize = 0;
-        for (self.lengths.items, out[0..self.lengths.items.len]) |len, *slice| {
-            slice.* = self.bytes.items[offset..][0..len];
-            offset += len;
-        }
-        return out[0..self.lengths.items.len];
-    }
-
-    fn deinit(self: *Queue, gpa: std.mem.Allocator) void {
-        self.bytes.deinit(gpa);
-        self.lengths.deinit(gpa);
-    }
-};
-
 const Seen = packed struct {
     logged_in: bool = false,
     started: bool = false,
@@ -95,6 +69,9 @@ result: Result = .running,
 content_policy: content.Policy,
 target_packs: packs.Fingerprint = .{},
 target_registries: registries.Fingerprint = .{},
+target_spawn: ?Handoff.Target = null,
+handoff: ?Handoff = null,
+managed: *Managed,
 mismatch: ?content.Mismatch = null,
 host: ?Host = null,
 
@@ -107,6 +84,7 @@ pub fn create(host: Host, target: Backend.Id, address: std.Io.net.IpAddress, epo
         .upstream = try .init(host.managed.shared),
         .queue = .{ .max_packets = @min(settings.queue_packets, max_queued_packets), .max_bytes = settings.queue_bytes },
         .content_policy = settings.content_policy,
+        .managed = host.managed,
     };
     errdefer self.upstream.deinit();
     const options: raknet.ClientOptions = .{ .handshake_timeout_ms = settings.limits.dial_ms };
@@ -119,6 +97,8 @@ pub fn create(host: Host, target: Backend.Id, address: std.Io.net.IpAddress, epo
 }
 
 pub fn destroy(self: *Transfer, gpa: std.mem.Allocator, io: std.Io) void {
+    if (self.managed.hold == &self.queue) self.managed.hold = null;
+    if (self.handoff != null) self.managed.syncing = false;
     self.cancelTasks(io);
     if (self.client) |client| client.destroy();
     if (self.source) |source| source.destroy();
@@ -151,6 +131,13 @@ pub fn service(self: *Transfer, host: Host) error{Canceled}!Result {
         if (self.state.expired(now(host.io))) self.on(host, .expired) else self.armTimer(host) catch self.on(host, .target_failed);
     }
     if (self.result != .running) return self.result;
+    if (self.state.phase == .syncing_client) {
+        self.syncClient(host) catch |err| {
+            log.info("transfer {d}: client sync failed: {t}", .{ self.state.epoch, err });
+            self.on(host, .target_failed);
+        };
+        return self.result;
+    }
 
     _ = self.watch.take(host.io);
     const client = self.client orelse return self.result;
@@ -226,8 +213,13 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
     var buffer: [64]u8 = undefined;
     while (packets.next()) |packet| {
         if (registries.isRegistry(packet.kind)) {
-            try self.target_registries.record(try self.upstream.session.decodePacket(packet));
-            if (packet.kind == .start_game) self.seen.started = true;
+            const decoded = try self.upstream.session.decodePacket(packet);
+            try self.target_registries.record(decoded);
+            if (packet.kind == .start_game) {
+                const start = try Managed.typed(decoded, .start_game);
+                self.target_spawn = .{ .dimension = start.settings.spawn_settings.dimension, .position = finite(start.position) };
+                self.seen.started = true;
+            }
             continue;
         }
         if (self.seen.started) {
@@ -266,12 +258,9 @@ fn on(self: *Transfer, host: Host, event: State.Event) void {
     switch (step.action) {
         .none, .stale => {},
         .prepare_client => return self.on(host, .client_prepared),
-        .commit => {
-            self.commit(host) catch |err| {
-                log.info("transfer {d}: commit failed: {t}", .{ self.state.epoch, err });
-                return self.on(host, .target_failed);
-            };
-            return self.on(host, .client_synced);
+        .commit => self.commit(host) catch |err| {
+            log.info("transfer {d}: commit failed: {t}", .{ self.state.epoch, err });
+            return self.on(host, .target_failed);
         },
         .close_source => {
             if (self.source) |source| source.destroy();
@@ -300,13 +289,50 @@ fn commit(self: *Transfer, host: Host) !void {
     host.backend.* = self.client;
     self.client = null;
     self.upstream = managed.swapUpstream(self.upstream);
-    try managed.resetClient(host.ends());
+    var outbox: Managed.Outbox = .init(host.gpa);
+    defer outbox.deinit();
+    try managed.client_state.reset(&outbox);
+    self.handoff = try .begin(managed.client_dimension, self.target_spawn.?, &outbox);
+    managed.syncing = true;
+    managed.dimension_acks = 0;
+    try managed.sendOutbox(host.ends(), &outbox);
+    if (self.handoff.?.waitingForTarget()) {
+        managed.hold = &self.queue;
+    } else try self.release(host);
+}
+
+fn release(self: *Transfer, host: Host) !void {
+    const managed = host.managed;
+    managed.hold = null;
     var slices: [max_queued_packets][]const u8 = undefined;
     const skipped = try managed.deliver(host.ends(), self.queue.slices(&slices));
     if (skipped != 0) log.debug("transfer {d}: held back {d} world packets for client sync", .{ self.state.epoch, skipped });
-    self.queue.bytes.clearRetainingCapacity();
-    self.queue.lengths.clearRetainingCapacity();
-    if (managed.upstream.session.state == .spawn_ready) try managed.upstream.session.advance(.in_game);
+    self.queue.clear();
+}
+
+fn syncClient(self: *Transfer, host: Host) !void {
+    const managed = host.managed;
+    while (managed.dimension_acks != 0 and self.state.phase == .syncing_client) {
+        managed.dimension_acks -= 1;
+        var outbox: Managed.Outbox = .init(host.gpa);
+        defer outbox.deinit();
+        const progress = try self.handoff.?.acknowledged(&outbox);
+        try managed.sendOutbox(host.ends(), &outbox);
+        switch (progress) {
+            .sent_target => try self.release(host),
+            .arrived => {
+                managed.syncing = false;
+                managed.client_dimension = self.handoff.?.target.dimension;
+                if (managed.upstream.session.state == .spawn_ready) try managed.upstream.session.advance(.in_game);
+                self.on(host, .client_synced);
+            },
+        }
+    }
+}
+
+fn finite(position: bedwire.protocol.Vec3f) bedwire.protocol.Vec3f {
+    if (std.math.isFinite(position.x) and std.math.isFinite(position.y) and std.math.isFinite(position.z)) return position;
+    return .{ .x = 0, .y = 0, .z = 0 };
 }
 
 fn record(stats: *Stats, step: State.Step) void {

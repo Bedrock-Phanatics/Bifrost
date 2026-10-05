@@ -11,13 +11,13 @@ const custom: sample.Content = .{ .pack = "packs:shared", .custom_block = "custo
 
 fn expectCommitted(rig: *Rig) !void {
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_committed, 1);
+    try rig.waitFor(.transfers_committed, 1);
     try rig.expectOn(&rig.b);
 }
 
 fn expectRefused(rig: *Rig, comptime reason: std.meta.FieldEnum(bifrost.Stats)) !void {
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_failed_before_commit, 1);
+    try rig.waitFor(.transfers_failed_before_commit, 1);
     try std.testing.expectEqual(@as(u64, 1), @field(rig.stats(), @tagName(reason)));
     try std.testing.expectEqual(@as(u64, 0), rig.stats().transfers_committed);
     try rig.expectOn(&rig.a);
@@ -84,7 +84,7 @@ test "a target that drops out during pack negotiation is rolled back" {
     try rig.start(.{ .b = .kick_packs, .a_content = custom, .b_content = custom });
     defer rig.deinit();
     try rig.transfer(1);
-    try rig.running.waitForStat(.transfers_failed_before_commit, 1);
+    try rig.waitFor(.transfers_failed_before_commit, 1);
     try rig.expectOn(&rig.a);
     const stats = rig.stats();
     try std.testing.expectEqual(@as(u64, 0), stats.incompatible_packs + stats.incompatible_blocks + stats.incompatible_items);
@@ -96,7 +96,7 @@ test "repeated compatible transfers keep working" {
     defer rig.deinit();
     for (1..7) |round| {
         try rig.transfer(round % 2);
-        try rig.running.waitForStat(.transfers_committed, round);
+        try rig.waitFor(.transfers_committed, round);
         try rig.expectOn(if (round % 2 == 1) &rig.b else &rig.a);
     }
     try std.testing.expectEqual(@as(u64, 0), rig.stats().transfers_failed_before_commit);
