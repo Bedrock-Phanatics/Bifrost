@@ -12,6 +12,7 @@ extern "C" {
 
 #define BIFROST_ABI_VERSION 1u
 #define BIFROST_NO_BACKEND UINT32_MAX
+#define BIFROST_NO_WORKER UINT32_MAX
 
 #if defined(_WIN32)
 #define BIFROST_EXPORT __declspec(dllexport)
@@ -139,6 +140,27 @@ typedef struct bifrost_packet {
 
 typedef bifrost_packet_action (*bifrost_packet_fn)(void *user, bifrost_packet *packet);
 
+typedef struct bifrost_command {
+    uint32_t struct_size;
+    uint32_t worker;
+    bifrost_player player;
+    bifrost_str name;
+    bifrost_str args;
+} bifrost_command;
+
+typedef void (*bifrost_command_fn)(void *user, const bifrost_command *command);
+
+typedef void (*bifrost_task_fn)(void *user);
+
+typedef struct bifrost_task_result {
+    uint32_t struct_size;
+    bifrost_status status;
+    uint32_t worker;
+    bifrost_player player;
+} bifrost_task_result;
+
+typedef void (*bifrost_task_done_fn)(void *user, const bifrost_task_result *result);
+
 typedef void (*bifrost_event_fn)(void *user, const bifrost_event *event, bifrost_transfer_decision *decision);
 
 typedef struct bifrost_host {
@@ -153,6 +175,10 @@ typedef struct bifrost_host {
     bifrost_status (*transfer)(void *context, bifrost_player player, uint32_t backend);
     uint32_t (*worker_count)(void *context);
     bifrost_status (*subscribe_packet)(void *context, bifrost_direction direction, uint32_t id, bifrost_packet_phase phase, uint32_t flags, bifrost_packet_fn callback, void *user);
+    bifrost_status (*register_command)(void *context, bifrost_str name, bifrost_command_fn callback, void *user);
+    /* run gets its own thread; done runs once, on the player's worker, or with STALE_HANDLE after they leave */
+    bifrost_status (*spawn_task)(void *context, bifrost_player player, bifrost_task_fn run, bifrost_task_done_fn done, void *user);
+    bifrost_status (*send_message)(void *context, bifrost_player player, bifrost_str text);
 } bifrost_host;
 
 typedef struct bifrost_plugin {

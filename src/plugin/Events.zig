@@ -7,6 +7,12 @@ const Events = @This();
 const log = std.log.scoped(.plugin);
 
 plugins: ?*Plugins = null,
+worker: u32 = 0,
+
+pub fn drain(self: Events, io: std.Io, sink: anytype) void {
+    const plugins = self.plugins orelse return;
+    plugins.drain(self.worker, io, sink);
+}
 
 pub fn proxyStarted(self: Events) void {
     const plugins = self.plugins orelse return;

@@ -129,6 +129,13 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
     } else return error.BackendClosed;
 }
 
+pub fn sendMessage(self: *Link, text: []const u8) !void {
+    const managed = self.managed orelse return error.NotManaged;
+    const session = self.session orelse return error.NotInGame;
+    if (!managed.inGame()) return error.NotInGame;
+    try managed.sendText(self.ends(session), text);
+}
+
 fn announce(self: *Link, identity: bedwire.Identity) void {
     self.announced = true;
     self.env.events.authenticated(self.player, identity.display_name, identity.xuid);

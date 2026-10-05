@@ -88,7 +88,7 @@ fn loadRecorder(plugins: *bifrost.Plugins) !void {
 }
 
 test "a passthrough player's life is visible without decrypting anything" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     var backend: fixtures.Backend = undefined;
@@ -113,7 +113,7 @@ test "a passthrough player's life is visible without decrypting anything" {
 }
 
 test "a managed player is named, followed across a transfer and goes stale on leaving" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     var rig: Rig = undefined;
@@ -147,7 +147,7 @@ test "a managed player is named, followed across a transfer and goes stale on le
 }
 
 test "a transfer request can be cancelled" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     Recorder.action = .cancel;
@@ -164,7 +164,7 @@ test "a transfer request can be cancelled" {
 }
 
 test "a transfer request can be redirected" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     Recorder.action = .redirect;
@@ -181,7 +181,7 @@ test "a transfer request can be redirected" {
 }
 
 test "a failed transfer says why" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     var rig: Rig = undefined;
@@ -205,6 +205,8 @@ test "the C header matches the Zig ABI" {
         .{ abi.Host, header.bifrost_host },
         .{ abi.Plugin, header.bifrost_plugin },
         .{ abi.Packet, header.bifrost_packet },
+        .{ abi.Command, header.bifrost_command },
+        .{ abi.TaskResult, header.bifrost_task_result },
     }) |pair| {
         try std.testing.expectEqual(@sizeOf(pair[0]), @sizeOf(pair[1]));
         inline for (comptime std.meta.fieldNames(pair[0])) |field| {
@@ -222,6 +224,7 @@ test "the C header matches the Zig ABI" {
     try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .validated = true })), header.BIFROST_PACKET_VALIDATED);
     try std.testing.expectEqual(abi.version, header.BIFROST_ABI_VERSION);
     try std.testing.expectEqual(abi.no_backend, header.BIFROST_NO_BACKEND);
+    try std.testing.expectEqual(abi.no_worker, header.BIFROST_NO_WORKER);
     try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .packets = true })), header.BIFROST_CAPABILITY_PACKETS);
 }
 
@@ -236,7 +239,7 @@ fn expectConstants(comptime Enum: type, comptime prefix: []const u8) !void {
 }
 
 test "the example plugin loads from disk and keeps players off maintenance" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try plugins.open(test_options.example_plugin);
     var rig: Rig = undefined;
@@ -295,7 +298,7 @@ const Hook = struct {
 };
 
 test "a packet hook can pass, cancel or replace player packets" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
     Hook.mode.store(.pass, .release);
     Hook.calls.store(0, .release);
@@ -318,7 +321,169 @@ test "a packet hook can pass, cancel or replace player packets" {
 }
 
 test "passthrough refuses packet subscriptions" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{ .packets = false });
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{ .packets = false });
     defer plugins.deinit();
     try std.testing.expectError(error.PluginInitFailed, plugins.add(Hook.init, null));
+}
+
+const Commander = struct {
+    var host: ?*const abi.Host = null;
+    var gate: std.atomic.Value(bool) = .init(true);
+    var commands: std.atomic.Value(u32) = .init(0);
+    var spawned: [4]abi.Status = undefined;
+    var spawn_count: std.atomic.Value(u32) = .init(0);
+    var done_count: std.atomic.Value(u32) = .init(0);
+    var done_status: std.atomic.Value(i32) = .init(0);
+    var done_worker: std.atomic.Value(u32) = .init(0);
+    var args: [16]u8 = undefined;
+    var args_len: usize = 0;
+
+    fn reset() void {
+        gate.store(true, .release);
+        commands.store(0, .release);
+        spawn_count.store(0, .release);
+        done_count.store(0, .release);
+        args_len = 0;
+    }
+
+    fn init(host_api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("commander");
+        plugin.plugin_version = .of("1.0.0");
+        plugin.capabilities = .{ .commands = true, .tasks = true };
+        host = host_api;
+        const hub = host_api.register_command(host_api.context, .of("Hub"), onHub, null);
+        if (hub != .ok) return hub;
+        if (host_api.register_command(host_api.context, .of("hub"), onHub, null) != .invalid_argument) return .failed;
+        return host_api.register_command(host_api.context, .of("slow"), onSlow, null);
+    }
+
+    fn onHub(_: ?*anyopaque, command: *const abi.Command) callconv(.c) void {
+        const text = command.args.slice();
+        @memcpy(args[0..text.len], text);
+        args_len = text.len;
+        const api = host.?;
+        _ = api.send_message(api.context, command.player, .of("taking you there"));
+        _ = api.transfer(api.context, command.player, 1);
+        _ = commands.fetchAdd(1, .acq_rel);
+    }
+
+    fn onSlow(_: ?*anyopaque, command: *const abi.Command) callconv(.c) void {
+        const api = host.?;
+        const index = spawn_count.load(.acquire);
+        spawned[index] = api.spawn_task(api.context, command.player, run, done, null);
+        spawn_count.store(index + 1, .release);
+    }
+
+    fn run(_: ?*anyopaque) callconv(.c) void {
+        while (!gate.load(.acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn done(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        done_status.store(@backingInt(result.status), .release);
+        done_worker.store(result.worker, .release);
+        if (result.status == .ok) {
+            const api = host.?;
+            _ = api.send_message(api.context, result.player, .of("done"));
+        }
+        _ = done_count.fetchAdd(1, .acq_rel);
+    }
+
+    fn send(rig: *Rig, line: []const u8) !void {
+        var buffer: [128]u8 = undefined;
+        try rig.player.send(&.{try managed.typedPacket(&buffer, .{ .command_request = .{
+            .command = line,
+            .origin = .{ .type = "player", .uuid = @splat(0), .request_id = "", .player_id = 0 },
+            .is_internal = false,
+            .version = "latest",
+        } })});
+    }
+
+    fn waitFor(counter: *const std.atomic.Value(u32), value: u32) !void {
+        for (0..500) |_| {
+            if (counter.load(.acquire) >= value) return;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.WaitTimedOut;
+    }
+};
+
+const Texts = struct {
+    fn arrived(player: *managed.Player) bool {
+        return player.received(.text) >= 1;
+    }
+};
+
+test "a plugin command runs on the player's worker and never reaches the backend" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    Commander.reset();
+    try plugins.add(Commander.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    plugins.backends = rig.running.proxy.config.backends();
+
+    try Commander.send(&rig, "/HUB  now ");
+    try rig.waitFor(.transfers_committed, 1);
+    try rig.pumpUntil(rig.player, Texts.arrived);
+    try std.testing.expectEqualStrings("now", Commander.args[0..Commander.args_len]);
+    try rig.expectOn(&rig.b);
+
+    try Commander.send(&rig, "/gamemode creative");
+    try fixtures.waitFor(io, &rig.b.commands, 1);
+    try std.testing.expectEqual(@as(u32, 0), rig.a.commands.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), Commander.commands.load(.acquire));
+}
+
+test "slow plugin work finishes on the player's worker, or reports the player gone" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{ .max_tasks_per_plugin = 2 });
+    defer plugins.deinit();
+    Commander.reset();
+    try plugins.add(Commander.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+
+    Commander.gate.store(false, .release);
+    try Commander.send(&rig, "/slow");
+    try Commander.send(&rig, "/slow");
+    try Commander.send(&rig, "/slow");
+    try Commander.waitFor(&Commander.spawn_count, 3);
+    try std.testing.expectEqualSlices(abi.Status, &.{ .ok, .ok, .busy }, Commander.spawned[0..3]);
+    try std.testing.expectEqual(@as(u32, 2), plugins.totals(0).outstanding);
+
+    Commander.gate.store(true, .release);
+    try Commander.waitFor(&Commander.done_count, 2);
+    try std.testing.expectEqual(@as(i32, @backingInt(abi.Status.ok)), Commander.done_status.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), Commander.done_worker.load(.acquire));
+    try rig.pumpUntil(rig.player, Texts.arrived);
+    try std.testing.expectEqual(@as(u32, 0), plugins.totals(0).outstanding);
+
+    Commander.gate.store(false, .release);
+    try Commander.send(&rig, "/slow");
+    try Commander.waitFor(&Commander.spawn_count, 4);
+    rig.player.destroy();
+    rig.player = try managed.Player.connect(io, rig.running.address(), 3);
+    try rig.running.waitForStat(.links_closed, 1);
+    Commander.gate.store(true, .release);
+    try Commander.waitFor(&Commander.done_count, 3);
+    try std.testing.expectEqual(@as(i32, @backingInt(abi.Status.stale_handle)), Commander.done_status.load(.acquire));
+}
+
+test "a task still running at shutdown is finished before the plugin unloads" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    Commander.reset();
+    try plugins.add(Commander.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+
+    Commander.gate.store(false, .release);
+    try Commander.send(&rig, "/slow");
+    try Commander.waitFor(&Commander.spawn_count, 1);
+    rig.deinit();
+    Commander.gate.store(true, .release);
+    plugins.unload();
+    try std.testing.expectEqual(@as(u32, 1), Commander.done_count.load(.acquire));
+    try std.testing.expectEqual(@as(i32, @backingInt(abi.Status.stale_handle)), Commander.done_status.load(.acquire));
 }

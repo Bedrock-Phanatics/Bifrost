@@ -107,9 +107,10 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .env = undefined,
     };
     self.admission = options.admission orelse &self.own_admission;
-    if (self.managed) |*shared| if (options.plugins) |plugins| {
-        shared.hooks = .{ .plugins = plugins, .worker = options.worker };
-    };
+    if (options.plugins) |plugins| {
+        plugins.attachWorker(options.worker, self.scheduler.wakeNotify());
+        if (self.managed) |*shared| shared.hooks = .{ .plugins = plugins, .worker = options.worker };
+    }
     self.router = .init(self.config.backends(), options.health);
     self.env = .{
         .gpa = gpa,
@@ -135,7 +136,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
             .content_policy = config.content_policy,
         },
         .next_epoch = &self.next_epoch,
-        .events = .{ .plugins = options.plugins },
+        .events = .{ .plugins = options.plugins, .worker = options.worker },
     };
     return self;
 }
@@ -189,13 +190,22 @@ fn drainMailbox(self: *Proxy) void {
 }
 
 fn startTransfer(self: *Proxy, request: TransferRequest) void {
-    var it = self.links.first;
-    const link = while (it) |node| : (it = node.next) {
-        const link: *Link = @fieldParentPtr("node", node);
-        if (link.id == request.player) break link;
-    } else null;
-    const found = link orelse return self.rejectTransfer(request, error.UnknownPlayer);
+    const found = self.findLink(request.player) orelse return self.rejectTransfer(request, error.UnknownPlayer);
     found.requestTransfer(request.target) catch |err| self.rejectTransfer(request, err);
+}
+
+pub fn message(self: *Proxy, link_id: u64, text: []const u8) void {
+    const link = self.findLink(link_id) orelse return;
+    link.sendMessage(text) catch |err| log.debug("plugin message dropped: {t}", .{err});
+}
+
+fn findLink(self: *Proxy, id: u64) ?*Link {
+    var it = self.links.first;
+    while (it) |node| : (it = node.next) {
+        const link: *Link = @fieldParentPtr("node", node);
+        if (link.id == id) return link;
+    }
+    return null;
 }
 
 fn routeTransfer(context: *anyopaque, link: u64, backend: u32) abi.Status {
@@ -232,6 +242,7 @@ fn turn(self: *Proxy) void {
 
     if (self.health_changed.swap(false, .acquire)) self.refreshAdvertisement();
     self.drainMailbox();
+    self.env.events.drain(self.io, self);
     const listener_ready = self.listener_watch.take(self.io);
     if (listener_ready or self.listener_busy) self.pollListener();
     self.serviceReady() catch return self.stop();
@@ -302,7 +313,7 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     const link = try Link.create(&self.env, session);
     errdefer link.destroy();
     link.id = self.next_player + 1;
-    link.player = self.env.events.connected(.{ .context = self, .link = link.id, .transfer = routeTransfer }, session.address);
+    link.player = self.env.events.connected(.{ .context = self, .worker = self.env.events.worker, .link = link.id, .transfer = routeTransfer }, session.address);
     if (link.managed) |managed| managed.plugin_player = link.player;
 
     try link.connect();

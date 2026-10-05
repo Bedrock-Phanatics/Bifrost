@@ -8,6 +8,9 @@ pub const TransferDecision = abi.TransferDecision;
 pub const Packet = abi.Packet;
 pub const Handler = fn (event: *const Event, decision: ?*TransferDecision) void;
 pub const PacketHandler = fn (packet: *Packet) abi.PacketAction;
+pub const Command = abi.Command;
+pub const CommandHandler = fn (command: *const Command) void;
+pub const TaskResult = abi.TaskResult;
 
 pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy };
 
@@ -36,6 +39,32 @@ pub const Host = struct {
             }
         };
         try check(self.raw.subscribe_packet(self.raw.context, direction, id, phase, flags, Trampoline.call, null));
+    }
+
+    pub fn command(self: Host, name: []const u8, comptime handler: CommandHandler) Error!void {
+        const Trampoline = struct {
+            fn call(_: ?*anyopaque, request: *const Command) callconv(.c) void {
+                handler(request);
+            }
+        };
+        try check(self.raw.register_command(self.raw.context, .of(name), Trampoline.call, null));
+    }
+
+    pub fn spawn(self: Host, player: Player, comptime run: fn (user: ?*anyopaque) void, comptime done: fn (user: ?*anyopaque, result: *const TaskResult) void, user: ?*anyopaque) Error!void {
+        const Trampoline = struct {
+            fn runTask(state: ?*anyopaque) callconv(.c) void {
+                run(state);
+            }
+
+            fn finish(state: ?*anyopaque, result: *const TaskResult) callconv(.c) void {
+                done(state, result);
+            }
+        };
+        try check(self.raw.spawn_task(self.raw.context, player, Trampoline.runTask, Trampoline.finish, user));
+    }
+
+    pub fn message(self: Host, player: Player, text: []const u8) Error!void {
+        try check(self.raw.send_message(self.raw.context, player, .of(text)));
     }
 
     pub fn workerCount(self: Host) u32 {

@@ -133,7 +133,7 @@ pub fn run(table: *const Table, call: Call, bytes: []const u8, scratch: []u8, ch
         const elapsed = now(call.io) -| started;
         const metrics = &subscriber.metrics[call.worker];
         metrics.timed(elapsed);
-        if (elapsed >= call.slow_ns) warnSlow(metrics, subscriber.name, id, elapsed, call.io);
+        if (elapsed >= call.slow_ns) warnSlow(metrics, subscriber.name, elapsed, call.io, "on packet {d}", .{id});
         switch (action) {
             .pass => {},
             .cancel => return .cancel,
@@ -164,14 +164,14 @@ pub fn packetId(bytes: []const u8) ?u10 {
     return null;
 }
 
-fn warnSlow(metrics: *Metrics, name: []const u8, id: u10, elapsed_ns: u64, io: std.Io) void {
+pub fn warnSlow(metrics: *Metrics, name: []const u8, elapsed_ns: u64, io: std.Io, comptime what: []const u8, args: anytype) void {
     const at = now(io);
     if (metrics.last_warning_ns != 0 and at -| metrics.last_warning_ns < slow_warning_interval_ns) return;
     metrics.last_warning_ns = at;
-    log.warn("plugin {s} took {d} us on packet {d}", .{ name, elapsed_ns / std.time.ns_per_us, id });
+    log.warn("plugin {s} took {d} us " ++ what, .{ name, elapsed_ns / std.time.ns_per_us } ++ args);
 }
 
-fn now(io: std.Io) u64 {
+pub fn now(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
 

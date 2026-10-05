@@ -264,6 +264,17 @@ const Checker = struct {
     }
 };
 
+pub fn sendText(self: *Managed, ends: Ends, text: []const u8) !void {
+    var buffer: [Plugins.max_message_bytes + 64]u8 = undefined;
+    try self.sendToPlayer(ends, &.{try encodeTyped(&buffer, .{ .text = .{
+        .localize = false,
+        .body = .{ .message_only = .{ .message_type = .raw, .message = text } },
+        .senders_xuid = "",
+        .platform_id = "",
+        .filtered_message = null,
+    } })});
+}
+
 pub fn sendOutbox(self: *Managed, ends: Ends, outbox: *const Outbox) !void {
     var start: usize = 0;
     while (start < outbox.count()) {
@@ -382,6 +393,10 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
                 self.chunk_radius = .{ .radius = request.chunk_radius, .max = request.max_chunk_radius };
             },
             .client_cache_status => self.cache_supported = (try typed(try self.player.decodePacket(packet), .client_cache_status)).is_cache_supported,
+            .command_request => if (self.shared.hooks) |hooks| if (hooks.plugins.hasCommands()) {
+                const request = try typed(try self.player.decodePacket(packet), .command_request);
+                if (hooks.plugins.runCommand(hooks.worker, ends.io, self.plugin_player, request.command)) continue;
+            },
             else => {},
         };
         if (self.syncing) if (packet.kind) |kind| switch (kind) {

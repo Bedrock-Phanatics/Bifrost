@@ -5,6 +5,7 @@ const std = @import("std");
 pub const version: u32 = 1;
 pub const entrypoint = "bifrost_plugin_init";
 pub const no_backend: u32 = std.math.maxInt(u32);
+pub const no_worker: u32 = std.math.maxInt(u32);
 
 pub const Status = enum(i32) {
     ok = 0,
@@ -43,7 +44,7 @@ pub const Capabilities = packed struct(u64) {
     tasks: bool = false,
     _: u60 = 0,
 
-    pub const supported: Capabilities = .{ .events = true, .packets = true };
+    pub const supported: Capabilities = .{ .events = true, .commands = true, .packets = true, .tasks = true };
 };
 
 pub const LogLevel = enum(u32) { err, warn, info, debug, _ };
@@ -119,6 +120,27 @@ pub const Packet = extern struct {
 
 pub const PacketFn = *const fn (user: ?*anyopaque, packet: *Packet) callconv(.c) PacketAction;
 
+pub const Command = extern struct {
+    struct_size: u32 = @sizeOf(Command),
+    worker: u32,
+    player: Player,
+    name: Str,
+    args: Str,
+};
+
+pub const CommandFn = *const fn (user: ?*anyopaque, command: *const Command) callconv(.c) void;
+
+pub const TaskFn = *const fn (user: ?*anyopaque) callconv(.c) void;
+
+pub const TaskResult = extern struct {
+    struct_size: u32 = @sizeOf(TaskResult),
+    status: Status,
+    worker: u32 = no_worker,
+    player: Player = .{},
+};
+
+pub const TaskDoneFn = *const fn (user: ?*anyopaque, result: *const TaskResult) callconv(.c) void;
+
 pub const EventFn = *const fn (user: ?*anyopaque, event: *const Event, decision: ?*TransferDecision) callconv(.c) void;
 
 pub const Host = extern struct {
@@ -133,6 +155,10 @@ pub const Host = extern struct {
     transfer: *const fn (context: *anyopaque, player: Player, backend: u32) callconv(.c) Status,
     worker_count: *const fn (context: *anyopaque) callconv(.c) u32,
     subscribe_packet: *const fn (context: *anyopaque, direction: Direction, id: u32, phase: PacketPhase, flags: PacketFlags, callback: ?PacketFn, user: ?*anyopaque) callconv(.c) Status,
+    register_command: *const fn (context: *anyopaque, name: Str, callback: ?CommandFn, user: ?*anyopaque) callconv(.c) Status,
+    // `run` gets its own thread; `done` runs once, on the player's worker, or with stale_handle after they leave
+    spawn_task: *const fn (context: *anyopaque, player: Player, run: ?TaskFn, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
+    send_message: *const fn (context: *anyopaque, player: Player, text: Str) callconv(.c) Status,
 };
 
 pub const Plugin = extern struct {

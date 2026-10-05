@@ -311,6 +311,7 @@ pub const Backend = struct {
     spawns: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
     sub_chunk_requests: std.atomic.Value(u32) = .init(0),
+    commands: std.atomic.Value(u32) = .init(0),
     cache_reports: std.atomic.Value(u32) = .init(0),
     cache_supported: std.atomic.Value(bool) = .init(false),
     hold_spawn: std.atomic.Value(bool) = .init(false),
@@ -582,6 +583,7 @@ pub const Backend = struct {
                 _ = self.cache_reports.fetchAdd(1, .release);
             },
             .sub_chunk_request => _ = self.sub_chunk_requests.fetchAdd(1, .release),
+            .command_request => _ = self.commands.fetchAdd(1, .release),
             .set_local_player_as_initialised => {
                 if (session.state == .spawn_ready) try session.advance(.in_game);
                 _ = self.spawns.fetchAdd(1, .release);

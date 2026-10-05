@@ -7,6 +7,7 @@ pub const max_name_len = 64;
 
 pub const Route = struct {
     context: *anyopaque,
+    worker: u32 = 0,
     link: u64,
     transfer: *const fn (context: *anyopaque, link: u64, backend: u32) abi.Status,
 };

@@ -42,4 +42,6 @@ test {
     _ = @import("session/self_id.zig");
     _ = @import("plugin/Plugins.zig");
     _ = @import("plugin/Handles.zig");
+    _ = @import("plugin/Packets.zig");
+    _ = @import("plugin/Work.zig");
 }

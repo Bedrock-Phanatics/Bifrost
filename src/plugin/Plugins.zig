@@ -4,16 +4,24 @@ const Backend = @import("../backend/Backend.zig");
 const Library = @import("Library.zig").Library;
 pub const Handles = @import("Handles.zig");
 pub const Packets = @import("Packets.zig");
+const Work = @import("Work.zig");
+const Notify = @import("../net/Notify.zig");
 
 const Plugins = @This();
 const log = std.log.scoped(.plugin);
 
 pub const max_name_len = 64;
+pub const max_command_len = 32;
+pub const max_message_bytes = Work.max_message_bytes;
 
 pub const Options = struct {
     workers: u32 = 1,
     packets: bool = true,
     slow_callback_ns: u64 = 5 * std.time.ns_per_ms,
+    // ponytail: one thread per running task; a fixed pool with a backlog if plugins need far more
+    max_tasks: u32 = 128,
+    max_tasks_per_plugin: u32 = 32,
+    max_messages: u32 = 1024,
 };
 
 pub const Totals = struct {
@@ -21,6 +29,19 @@ pub const Totals = struct {
     total_ns: u64 = 0,
     max_ns: u64 = 0,
     errors: u64 = 0,
+    outstanding: u32 = 0,
+};
+
+const Command = struct {
+    callback: abi.CommandFn,
+    user: ?*anyopaque,
+    loaded: *Loaded,
+};
+
+const PendingCommand = struct {
+    name: [max_command_len]u8,
+    len: usize,
+    command: Command,
 };
 
 const Subscriber = struct {
@@ -41,6 +62,7 @@ const Loaded = struct {
     name: [max_name_len]u8 = undefined,
     name_len: usize = 0,
     metrics: []Packets.Metrics = &.{},
+    outstanding: std.atomic.Value(u32) = .init(0),
 
     fn label(self: *const Loaded) []const u8 {
         return self.name[0..self.name_len];
@@ -60,13 +82,35 @@ initializing: std.atomic.Value(?*Loaded) = .init(null),
 handles: Handles = .{},
 started: std.atomic.Value(bool) = .init(false),
 stopping: std.atomic.Value(bool) = .init(false),
+commands: std.StringHashMapUnmanaged(Command) = .empty,
+pending_commands: std.ArrayList(PendingCommand) = .empty,
+queues: []Work.Queue,
+pool: ?*std.Io.Threaded = null,
+group: std.Io.Group = .init,
+group_lock: std.atomic.Value(bool) = .init(false),
+outstanding: std.atomic.Value(u32) = .init(0),
+messages: std.atomic.Value(u32) = .init(0),
 
-pub fn init(gpa: std.mem.Allocator, backends: []const Backend, options: Options) Plugins {
-    return .{ .gpa = gpa, .backends = backends, .options = options };
+pub fn init(gpa: std.mem.Allocator, backends: []const Backend, options: Options) !Plugins {
+    const queues = try gpa.alloc(Work.Queue, options.workers);
+    var ready: usize = 0;
+    errdefer {
+        for (queues[0..ready]) |*queue| queue.deinit(gpa);
+        gpa.free(queues);
+    }
+    for (queues) |*queue| {
+        queue.* = try .init(gpa, options.max_tasks + options.max_messages);
+        ready += 1;
+    }
+    return .{ .gpa = gpa, .backends = backends, .options = options, .queues = queues };
 }
 
 pub fn deinit(self: *Plugins) void {
     self.unload();
+    for (self.queues) |*queue| queue.deinit(self.gpa);
+    self.gpa.free(self.queues);
+    self.commands.deinit(self.gpa);
+    self.pending_commands.deinit(self.gpa);
     for (&self.subscribers) |*list| list.deinit(self.gpa);
     self.loaded.deinit(self.gpa);
     self.pending.deinit(self.gpa);
@@ -94,6 +138,7 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
 
     self.pending.clearRetainingCapacity();
     self.pending_packets.clearRetainingCapacity();
+    self.pending_commands.clearRetainingCapacity();
     self.initializing.store(loaded, .release);
     const status = entry(&loaded.host, &loaded.plugin);
     self.initializing.store(null, .release);
@@ -116,14 +161,30 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
         return error.UnsupportedCapability;
     }
 
+    if (plugin.capabilities.tasks and self.pool == null) try self.startPool();
     for (self.pending.items) |item| try self.subscribers[@backingInt(item.kind)].ensureUnusedCapacity(self.gpa, countKind(self.pending.items, item.kind));
+    try self.commands.ensureUnusedCapacity(self.gpa, @intCast(self.pending_commands.items.len));
+    const names = try self.gpa.alloc([]u8, self.pending_commands.items.len);
+    defer self.gpa.free(names);
+    var named: usize = 0;
+    errdefer for (names[0..named]) |name| self.gpa.free(name);
+    for (self.pending_commands.items, names) |*item, *name| {
+        name.* = try self.gpa.dupe(u8, item.name[0..item.len]);
+        named += 1;
+    }
     if (self.pending_packets.items.len != 0) try self.addPacketHooks(loaded);
+    for (self.pending_commands.items, names) |item, name| self.commands.putAssumeCapacityNoClobber(name, item.command);
     for (self.pending.items) |item| self.subscribers[@backingInt(item.kind)].appendAssumeCapacity(item.subscriber);
     self.loaded.appendAssumeCapacity(loaded);
     log.info("loaded plugin {s} {s}", .{ loaded.label(), plugin.plugin_version.slice() });
 }
 
 pub fn unload(self: *Plugins) void {
+    if (self.pool) |pool| self.group.await(pool.io()) catch {};
+    for (self.queues) |*queue| for (queue.take()) |item| self.settle(item, null, null);
+    var names = self.commands.keyIterator();
+    while (names.next()) |name| self.gpa.free(name.*);
+    self.commands.clearRetainingCapacity();
     for (&self.subscribers) |*list| list.clearRetainingCapacity();
     for (&self.tables) |*table| table.deinit(self.gpa);
     self.registrations.clearRetainingCapacity();
@@ -133,6 +194,104 @@ pub fn unload(self: *Plugins) void {
         self.gpa.free(loaded.metrics);
         self.gpa.destroy(loaded);
     }
+    if (self.pool) |pool| {
+        pool.deinit();
+        self.gpa.destroy(pool);
+        self.pool = null;
+    }
+}
+
+pub fn attachWorker(self: *Plugins, worker: u32, notify: Notify) void {
+    self.queues[worker].notify = notify;
+}
+
+pub fn drain(self: *Plugins, worker: u32, io: std.Io, sink: anytype) void {
+    for (self.queues[worker].take()) |item| self.settle(item, .{ .worker = worker, .io = io }, sink);
+}
+
+pub fn hasCommands(self: *const Plugins) bool {
+    return self.commands.count() != 0;
+}
+
+pub fn runCommand(self: *const Plugins, worker: u32, io: std.Io, player: abi.Player, line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " ");
+    const text = if (std.mem.startsWith(u8, trimmed, "/")) trimmed[1..] else trimmed;
+    const end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
+    if (end == 0 or end > max_command_len) return false;
+    var name: [max_command_len]u8 = undefined;
+    const lower = std.ascii.lowerString(&name, text[0..end]);
+    const command = self.commands.get(lower) orelse return false;
+    const request: abi.Command = .{
+        .worker = worker,
+        .player = player,
+        .name = .of(lower),
+        .args = .of(std.mem.trim(u8, text[end..], " ")),
+    };
+    const started = Packets.now(io);
+    command.callback(command.user, &request);
+    self.timed(command.loaded, worker, io, started, "on command {s}", .{lower});
+    return true;
+}
+
+const Owner = struct {
+    worker: u32,
+    io: std.Io,
+};
+
+fn settle(self: *Plugins, item: Work.Item, owner: ?Owner, sink: anytype) void {
+    switch (item) {
+        .message => |message| {
+            defer {
+                self.gpa.destroy(message);
+                Work.release(&self.messages);
+            }
+            if (@TypeOf(sink) == @TypeOf(null)) return;
+            const route = self.handles.route(message.player) orelse return;
+            sink.message(route.link, message.text[0..message.len]);
+        },
+        .task => |task| {
+            const live = owner != null and self.handles.route(task.player) != null;
+            self.finish(task, &.{
+                .status = if (live) .ok else .stale_handle,
+                .worker = if (owner) |at| at.worker else abi.no_worker,
+                .player = task.player,
+            }, owner);
+        },
+    }
+}
+
+fn finish(self: *Plugins, task: *Work.Task, result: *const abi.TaskResult, owner: ?Owner) void {
+    const started = if (owner) |at| Packets.now(at.io) else 0;
+    task.done(task.user, result);
+    if (owner) |at| {
+        const elapsed = Packets.now(at.io) -| started;
+        task.metrics[at.worker].timed(elapsed);
+        if (elapsed >= self.options.slow_callback_ns) Packets.warnSlow(&task.metrics[at.worker], task.name, elapsed, at.io, "finishing a task", .{});
+    }
+    Work.release(task.outstanding);
+    Work.release(&self.outstanding);
+    self.gpa.destroy(task);
+}
+
+fn timed(self: *const Plugins, loaded: *Loaded, worker: u32, io: std.Io, started: u64, comptime what: []const u8, args: anytype) void {
+    const elapsed = Packets.now(io) -| started;
+    const metrics = &loaded.metrics[worker];
+    metrics.timed(elapsed);
+    if (elapsed >= self.options.slow_callback_ns) Packets.warnSlow(metrics, loaded.label(), elapsed, io, what, args);
+}
+
+fn startPool(self: *Plugins) !void {
+    const pool = try self.gpa.create(std.Io.Threaded);
+    pool.* = .init(self.gpa, .{ .async_limit = .nothing, .concurrent_limit = .limited(self.options.max_tasks) });
+    self.pool = pool;
+}
+
+fn runTask(self: *Plugins, task: *Work.Task) void {
+    task.run(task.user);
+    if (self.handles.route(task.player)) |route| {
+        if (route.worker < self.queues.len) return self.queues[route.worker].post(.{ .task = task });
+    }
+    self.finish(task, &.{ .status = if (task.player.id == 0) .ok else .stale_handle, .player = task.player }, null);
 }
 
 pub fn packetTable(self: *const Plugins, direction: abi.Direction) ?*const Packets.Table {
@@ -148,6 +307,7 @@ pub fn totals(self: *const Plugins, index: usize) Totals {
         sum.max_ns = @max(sum.max_ns, metrics.max_ns.load(.monotonic));
         sum.errors += metrics.errors.load(.monotonic);
     }
+    sum.outstanding = self.loaded.items[index].outstanding.load(.acquire);
     return sum;
 }
 
@@ -197,6 +357,9 @@ fn hostFor(loaded: *Loaded) abi.Host {
         .transfer = hostTransfer,
         .worker_count = hostWorkerCount,
         .subscribe_packet = hostSubscribePacket,
+        .register_command = hostRegisterCommand,
+        .spawn_task = hostSpawnTask,
+        .send_message = hostSendMessage,
     };
 }
 
@@ -238,6 +401,81 @@ fn hostSubscribePacket(context: *anyopaque, direction: abi.Direction, id: u32, p
         .name = "",
         .metrics = &.{},
     } }) catch return .failed;
+    return .ok;
+}
+
+fn hostRegisterCommand(context: *anyopaque, name: abi.Str, callback: ?abi.CommandFn, user: ?*anyopaque) callconv(.c) abi.Status {
+    const loaded = from(context);
+    const owner = loaded.owner;
+    if (owner.initializing.load(.acquire) != loaded) return .too_late;
+    if (!owner.options.packets) return .unsupported;
+    const text = name.slice();
+    if (text.len == 0 or text.len > max_command_len) return .invalid_argument;
+    var item: PendingCommand = .{ .name = undefined, .len = text.len, .command = .{ .callback = callback orelse return .invalid_argument, .user = user, .loaded = loaded } };
+    for (text, item.name[0..text.len]) |char, *out| {
+        if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return .invalid_argument;
+        out.* = std.ascii.toLower(char);
+    }
+    const lower = item.name[0..text.len];
+    if (owner.commands.contains(lower)) return .invalid_argument;
+    for (owner.pending_commands.items) |*other| if (std.mem.eql(u8, other.name[0..other.len], lower)) return .invalid_argument;
+    owner.pending_commands.append(owner.gpa, item) catch return .failed;
+    return .ok;
+}
+
+fn hostSpawnTask(context: *anyopaque, player: abi.Player, run: ?abi.TaskFn, done: ?abi.TaskDoneFn, user: ?*anyopaque) callconv(.c) abi.Status {
+    const loaded = from(context);
+    const owner = loaded.owner;
+    if (!loaded.plugin.capabilities.tasks) return .unsupported;
+    const pool = owner.pool orelse return .unsupported;
+    const run_fn = run orelse return .invalid_argument;
+    const done_fn = done orelse return .invalid_argument;
+    if (!Work.reserve(&owner.outstanding, owner.options.max_tasks)) return .busy;
+    if (!Work.reserve(&loaded.outstanding, owner.options.max_tasks_per_plugin)) {
+        Work.release(&owner.outstanding);
+        return .busy;
+    }
+    const task = owner.gpa.create(Work.Task) catch {
+        Work.release(&loaded.outstanding);
+        Work.release(&owner.outstanding);
+        return .failed;
+    };
+    task.* = .{
+        .run = run_fn,
+        .done = done_fn,
+        .user = user,
+        .player = player,
+        .name = loaded.label(),
+        .metrics = loaded.metrics,
+        .outstanding = &loaded.outstanding,
+    };
+    while (owner.group_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    const started = owner.group.concurrent(pool.io(), runTask, .{ owner, task });
+    owner.group_lock.store(false, .release);
+    started catch {
+        Work.release(&loaded.outstanding);
+        Work.release(&owner.outstanding);
+        owner.gpa.destroy(task);
+        return .busy;
+    };
+    return .ok;
+}
+
+fn hostSendMessage(context: *anyopaque, player: abi.Player, text: abi.Str) callconv(.c) abi.Status {
+    const owner = from(context).owner;
+    if (!owner.options.packets) return .unsupported;
+    const bytes = text.slice();
+    if (bytes.len == 0 or bytes.len > Work.max_message_bytes or !std.unicode.utf8ValidateSlice(bytes)) return .invalid_argument;
+    const route = owner.handles.route(player) orelse return .stale_handle;
+    if (route.worker >= owner.queues.len) return .invalid_argument;
+    if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
+    const message = owner.gpa.create(Work.Message) catch {
+        Work.release(&owner.messages);
+        return .failed;
+    };
+    message.* = .{ .player = player, .len = bytes.len, .text = undefined };
+    @memcpy(message.text[0..bytes.len], bytes);
+    owner.queues[route.worker].post(.{ .message = message });
     return .ok;
 }
 
@@ -339,7 +577,7 @@ fn routedTransfer(context: *anyopaque, link: u64, backend: u32) abi.Status {
 
 test "plugins that fail or don't fit are turned away without leaving hooks behind" {
     Probe.reset();
-    var plugins: Plugins = .init(testing.allocator, &.{}, .{});
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
     defer plugins.deinit();
 
     try testing.expectError(error.PluginInitFailed, plugins.add(Probe.failing, null));
@@ -353,7 +591,7 @@ test "plugins that fail or don't fit are turned away without leaving hooks behin
 
 test "plugins get events, can't subscribe late and shut down newest first" {
     Probe.reset();
-    var plugins: Plugins = .init(testing.allocator, &.{}, .{});
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
     try plugins.add(Probe.first, null);
     try plugins.add(Probe.second, null);
     plugins.emit(&.{ .kind = .player_connected }, null);
@@ -369,7 +607,7 @@ test "plugins get events, can't subscribe late and shut down newest first" {
 test "host calls check handles and backends" {
     Probe.reset();
     const backends = [_]Backend{try .init("lobby", .{ .ip4 = .loopback(19133) })};
-    var plugins: Plugins = .init(testing.allocator, &backends, .{});
+    var plugins: Plugins = try .init(testing.allocator, &backends, .{});
     defer plugins.deinit();
     try plugins.add(Probe.first, null);
     const host = Probe.seen_host.?;
