@@ -266,7 +266,8 @@ fn cancelDial(self: *Link) void {
 
 fn fail(self: *Link, err: anyerror) void {
     log.debug("closing link: {t}", .{err});
-    self.endTransfer(.source_failed);
+    const committed = if (self.transfer) |transfer| transfer.state.phase.committed() else false;
+    self.endTransfer(if (committed) .target_failed else .source_failed);
     self.dropBackend();
     self.closeSession();
 }

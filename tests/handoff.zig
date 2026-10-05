@@ -55,7 +55,6 @@ test "a same-dimension move detours once and lands on the target spawn" {
         try std.testing.expectEqual(@as(usize, 2), player.changes.items.len);
         try std.testing.expectEqual(@as(i32, nether), player.changes.items[0].dimension_id);
         try expectLanded(player, overworld, position);
-        // One blank chunk for the detour and the target's own, nothing replayed twice
         try std.testing.expectEqual(@as(usize, 2), player.received(.level_chunk));
         try std.testing.expectEqual(@as(usize, 1), player.received(.chunk_radius_updated));
         try std.testing.expect(player.lastIndex(.level_chunk).? > player.lastIndex(.change_dimension).?);
@@ -190,6 +189,21 @@ test "a target that spawns before sending its world still lands once" {
     try moveTo(&rig, 1, 1);
     try std.testing.expectEqual(@as(usize, 2), rig.player.received(.level_chunk));
     try std.testing.expectEqual(@as(u32, 1), rig.b.spawns.load(.acquire));
+}
+
+test "a target that drops right after the switch disconnects the player" {
+    var rig: Rig = undefined;
+    try rig.start(.{});
+    defer rig.deinit();
+    rig.b.hold_spawn.store(true, .release);
+
+    try rig.transfer(1);
+    try waitForChanges(&rig, 2);
+    try fixtures.waitFor(io, &rig.b.chunk_requests, 1);
+    rig.b.drop_all.store(true, .release);
+    try rig.running.waitForStat(.transfers_failed_after_commit, 1);
+    try rig.player.awaitClosed();
+    try std.testing.expectEqual(@as(u64, 0), rig.stats().transfers_committed);
 }
 
 test "hundreds of round trips keep transfer time and memory flat" {
