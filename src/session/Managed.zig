@@ -6,6 +6,7 @@ const Stats = @import("../proxy/Stats.zig");
 const packs = @import("../content/packs.zig");
 pub const registries = @import("../content/registries.zig");
 pub const Upstream = @import("Upstream.zig");
+const ClientState = @import("ClientState.zig");
 
 const protocol = bedwire.protocol;
 const Current = protocol.Current;
@@ -81,6 +82,7 @@ client_data: ?[]u8 = null,
 initial_packs: packs.Fingerprint = .{},
 initial_registries: registries.Fingerprint = .{},
 transferred: bool = false,
+client_state: ClientState = .{},
 // Player packets sent before the backend is ready
 early: PacketQueue,
 
@@ -104,6 +106,7 @@ pub fn destroy(self: *Managed) void {
     self.upstream.deinit();
     if (self.identity) |*identity| identity.deinit();
     if (self.client_data) |json| self.gpa.free(json);
+    self.client_state.deinit(self.gpa);
     self.early.deinit(self.gpa);
     self.gpa.destroy(self);
 }
@@ -133,11 +136,45 @@ pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
         const header = protocol.packet.decode(packet, .{ .max_packet_bytes = @max(packet.len, 1) }) catch continue;
         const kind = Current.packetKind(header.header.packet_id);
         if (!self.player.state.permits(Current.features, .server, kind)) continue;
+        if (ClientState.tracks(kind)) self.observeClient(packet);
         self.shared.batch[count] = packet;
         count += 1;
     }
     if (count != 0) try self.sendToPlayer(ends, self.shared.batch[0..count]);
     return packets.len - count;
+}
+
+pub fn resetClient(self: *Managed, ends: Ends) !void {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(self.gpa);
+    var lengths: std.ArrayList(u32) = .empty;
+    defer lengths.deinit(self.gpa);
+    try self.client_state.reset(self.gpa, &bytes, &lengths);
+    var offset: usize = 0;
+    var start: usize = 0;
+    while (start < lengths.items.len) {
+        const count = @min(lengths.items.len - start, self.shared.batch.len);
+        for (lengths.items[start..][0..count], self.shared.batch[0..count]) |len, *slice| {
+            slice.* = bytes.items[offset..][0..len];
+            offset += len;
+        }
+        try self.sendToPlayer(ends, self.shared.batch[0..count]);
+        start += count;
+    }
+}
+
+fn observeClient(self: *Managed, packet: []const u8) void {
+    const decoded = Current.decodeBorrowed(packet, protocolLimits()) catch {
+        self.client_state.untracked = true;
+        return;
+    };
+    self.client_state.observe(self.gpa, decoded) catch {
+        self.client_state.untracked = true;
+    };
+}
+
+fn protocolLimits() protocol.DecodeLimits {
+    return .{ .max_packet_bytes = limits.max_packet_bytes, .max_string_bytes = limits.max_packet_bytes, .max_byte_array_bytes = limits.max_packet_bytes, .max_nbt_bytes = limits.max_packet_bytes };
 }
 
 pub fn backendConnected(self: *Managed, ends: Ends) !void {
@@ -229,6 +266,7 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
     var next_state: ?bedwire.State = null;
     var count: usize = 0;
     while (packets.next()) |packet| {
+        if (packet.kind == .container_close) self.client_state.containerClosed();
         if (try self.playerMilestone(packet)) |state| next_state = state;
         if (self.upstream.phase != .ready) {
             try self.early.push(self.gpa, packet.bytes);
@@ -250,8 +288,13 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
                 try self.checkRegistry(packet);
                 continue;
             }
-            if (self.player.state != .in_game) try self.initial_registries.record(try self.upstream.session.decodePacket(packet));
+            if (self.player.state != .in_game) {
+                const decoded = try self.upstream.session.decodePacket(packet);
+                try self.initial_registries.record(decoded);
+                if (decoded.value == .typed and decoded.value.typed == .start_game) self.client_state.own_runtime_id = decoded.value.typed.start_game.runtime_id;
+            }
         }
+        if (ClientState.tracks(packet.kind)) self.observeClient(packet.bytes);
         if (packet.kind == .start_game) start_game = true;
         if (self.player.state == .resource_packs) try self.capturePacks(packet);
         self.shared.batch[count] = packet.bytes;

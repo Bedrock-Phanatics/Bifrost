@@ -153,11 +153,9 @@ pub const Player = struct {
         const buffer = try gpa.alloc(u8, payload.len + 8);
         defer gpa.free(buffer);
         try self.send(&.{try rawPacket(buffer, game_packet_id, payload)});
-        var packets = try self.receive();
-        defer packets.deinit();
-        const packet = packets.next() orelse return error.NoPacket;
-        try std.testing.expectEqual(@as(u10, game_packet_id), packet.id);
-        try std.testing.expectEqualSlices(u8, payload, packet.bytes[packet.bytes.len - payload.len ..]);
+        const echoed = try gpa.alloc(u8, payload.len + 8);
+        defer gpa.free(echoed);
+        try std.testing.expectEqualSlices(u8, payload, try self.nextGamePacket(echoed));
     }
 
     pub fn nextGamePacket(self: *Player, out: []u8) ![]const u8 {

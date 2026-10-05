@@ -300,6 +300,7 @@ fn commit(self: *Transfer, host: Host) !void {
     host.backend.* = self.client;
     self.client = null;
     self.upstream = managed.swapUpstream(self.upstream);
+    try managed.resetClient(host.ends());
     var slices: [max_queued_packets][]const u8 = undefined;
     const skipped = try managed.deliver(host.ends(), self.queue.slices(&slices));
     if (skipped != 0) log.debug("transfer {d}: held back {d} world packets for client sync", .{ self.state.epoch, skipped });

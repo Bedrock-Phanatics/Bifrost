@@ -35,4 +35,5 @@ test {
     _ = @import("content/nbt.zig");
     _ = @import("content/registries.zig");
     _ = @import("content/packs.zig");
+    _ = @import("session/ClientState.zig");
 }
