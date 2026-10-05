@@ -141,6 +141,15 @@ pub const Player = struct {
             if (start.kind != .start_game) return error.UnexpectedPacket;
         }
         try self.session.advance(.spawn_ready);
+        try self.send(&.{try typedPacket(&buffer, .{ .request_chunk_radius = .{ .chunk_radius = 8, .max_chunk_radius = 12 } })});
+        while (true) {
+            var packets = try self.receive();
+            defer packets.deinit();
+            const spawned = while (packets.next()) |packet| {
+                if (packet.kind == .play_status) break true;
+            } else false;
+            if (spawned) break;
+        }
         try self.send(&.{try rawPacket(&buffer, Current.packetId(.set_local_player_as_initialised).?, &.{1})});
         try self.session.advance(.in_game);
     }
@@ -274,6 +283,8 @@ pub const Backend = struct {
     logins: std.atomic.Value(u32) = .init(0),
     echoes: std.atomic.Value(u32) = .init(0),
     handshakes: std.atomic.Value(u32) = .init(0),
+    chunk_requests: std.atomic.Value(u32) = .init(0),
+    spawns: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
     refuse: bool = false,
     mode: Mode = .normal,
@@ -460,7 +471,19 @@ pub const Backend = struct {
                 try sendFrame(session, carrier, batch[0..count]);
                 try session.advance(.spawn_ready);
             },
-            .set_local_player_as_initialised => try session.advance(.in_game),
+            .request_chunk_radius => {
+                var updated: [16]u8 = undefined;
+                var spawned: [16]u8 = undefined;
+                try sendFrame(session, carrier, &.{
+                    try typedPacket(&updated, .{ .chunk_radius_updated = .{ .chunk_radius = 8 } }),
+                    try typedPacket(&spawned, .{ .play_status = .{ .status = .playerspawn } }),
+                });
+                _ = self.chunk_requests.fetchAdd(1, .release);
+            },
+            .set_local_player_as_initialised => {
+                if (session.state == .spawn_ready) try session.advance(.in_game);
+                _ = self.spawns.fetchAdd(1, .release);
+            },
             else => {},
         };
     }

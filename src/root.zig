@@ -37,4 +37,5 @@ test {
     _ = @import("content/packs.zig");
     _ = @import("session/ClientState.zig");
     _ = @import("transfer/Handoff.zig");
+    _ = @import("session/self_id.zig");
 }

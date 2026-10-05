@@ -8,6 +8,7 @@ pub const registries = @import("../content/registries.zig");
 pub const Upstream = @import("Upstream.zig");
 const ClientState = @import("ClientState.zig");
 pub const Outbox = @import("Outbox.zig");
+const self_id = @import("self_id.zig");
 const Queue = @import("../transfer/Queue.zig");
 const Handoff = @import("../transfer/Handoff.zig");
 
@@ -53,6 +54,7 @@ pub const Shared = struct {
     key: Ecdsa.KeyPair,
     keys: *const bedwire.auth.KeySet,
     batch: [][]const u8,
+    rewrites: std.ArrayList(u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, key: Ecdsa.KeyPair, keys: *const bedwire.auth.KeySet) !Shared {
         var pool: bedwire.BufferPool = try .init(gpa, limits, .{ .rx_slots = 1, .tx_slots = 1 });
@@ -61,6 +63,7 @@ pub const Shared = struct {
     }
 
     pub fn deinit(self: *Shared, gpa: std.mem.Allocator) void {
+        self.rewrites.deinit(gpa);
         gpa.free(self.batch);
         self.pool.deinit();
     }
@@ -91,6 +94,10 @@ client_dimension: i32 = Handoff.overworld,
 hold: ?*Queue = null,
 syncing: bool = false,
 dimension_acks: u32 = 0,
+target_spawned: bool = false,
+backend_runtime_id: u64 = 0,
+chunk_radius: ?struct { radius: i32, max: u8 } = null,
+cache_supported: ?bool = null,
 // Player packets sent before the backend is ready
 early: PacketQueue,
 
@@ -139,18 +146,66 @@ pub fn swapUpstream(self: *Managed, next: Upstream) Upstream {
 }
 
 pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
-    var count: usize = 0;
+    var batch: Batch = .{ .managed = self, .ends = ends, .to_player = true };
+    var skipped: usize = 0;
     for (packets) |packet| {
-        const header = protocol.packet.decode(packet, .{ .max_packet_bytes = @max(packet.len, 1) }) catch continue;
+        const header = protocol.packet.decode(packet, .{ .max_packet_bytes = @max(packet.len, 1) }) catch {
+            skipped += 1;
+            continue;
+        };
         const kind = Current.packetKind(header.header.packet_id);
-        if (!self.player.state.permits(Current.features, .server, kind)) continue;
+        if (!self.player.state.permits(Current.features, .server, kind)) {
+            skipped += 1;
+            continue;
+        }
         if (ClientState.tracks(kind)) self.observeClient(packet);
-        self.shared.batch[count] = packet;
-        count += 1;
+        try batch.add(kind, packet);
     }
-    if (count != 0) try self.sendToPlayer(ends, self.shared.batch[0..count]);
-    return packets.len - count;
+    try batch.flush();
+    return skipped;
 }
+
+pub fn spawnTarget(self: *Managed, ends: Ends) !void {
+    var buffer: [16]u8 = undefined;
+    try self.upstream.send(self.upstreamContext(ends, ends.backend orelse return error.BackendClosed), &.{try encodeTyped(&buffer, .{ .set_local_player_as_initialised = .{ .player_id = self.backend_runtime_id } })});
+    if (self.upstream.session.state == .spawn_ready) try self.upstream.session.advance(.in_game);
+}
+
+fn swap(self: *const Managed) ?self_id.Swap {
+    const ids: self_id.Swap = .{ .a = self.client_state.own_runtime_id, .b = self.backend_runtime_id };
+    return if (self.transferred and ids.active()) ids else null;
+}
+
+const Batch = struct {
+    managed: *Managed,
+    ends: Ends,
+    to_player: bool,
+    count: usize = 0,
+
+    fn add(self: *Batch, kind: ?bedwire.PacketKind, bytes: []const u8) !void {
+        const shared = self.managed.shared;
+        var packet = bytes;
+        if (self.count == shared.batch.len) try self.flush();
+        if (self.managed.swap()) |ids| if (self_id.leadsWithRuntimeId(kind)) {
+            if (shared.rewrites.unusedCapacitySlice().len < bytes.len + self_id.max_growth) {
+                try self.flush();
+                try shared.rewrites.ensureUnusedCapacity(self.managed.gpa, bytes.len + self_id.max_growth);
+            }
+            packet = try ids.apply(bytes, &shared.rewrites) orelse bytes;
+        };
+        shared.batch[self.count] = packet;
+        self.count += 1;
+    }
+
+    fn flush(self: *Batch) !void {
+        defer self.managed.shared.rewrites.clearRetainingCapacity();
+        if (self.count == 0) return;
+        const packets = self.managed.shared.batch[0..self.count];
+        self.count = 0;
+        if (self.to_player) return self.managed.sendToPlayer(self.ends, packets);
+        try self.managed.upstream.send(self.managed.upstreamContext(self.ends, self.ends.backend orelse return error.BackendClosed), packets);
+    }
+};
 
 pub fn sendOutbox(self: *Managed, ends: Ends, outbox: *const Outbox) !void {
     var start: usize = 0;
@@ -262,8 +317,16 @@ fn authenticate(self: *Managed, ends: Ends, packet: PlayerSession.Packet) !void 
 
 fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) !void {
     var next_state: ?bedwire.State = null;
-    var count: usize = 0;
+    var batch: Batch = .{ .managed = self, .ends = ends, .to_player = false };
     while (packets.next()) |packet| {
+        if (packet.kind) |kind| switch (kind) {
+            .request_chunk_radius => {
+                const request = try typed(try self.player.decodePacket(packet), .request_chunk_radius);
+                self.chunk_radius = .{ .radius = request.chunk_radius, .max = request.max_chunk_radius };
+            },
+            .client_cache_status => self.cache_supported = (try typed(try self.player.decodePacket(packet), .client_cache_status)).is_cache_supported,
+            else => {},
+        };
         if (self.syncing) if (packet.kind) |kind| switch (kind) {
             .player_action => if (Handoff.isAck(try self.player.decodePacket(packet))) {
                 self.dimension_acks += 1;
@@ -278,17 +341,22 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
             try self.early.push(self.gpa, packet.bytes);
             continue;
         }
-        self.shared.batch[count] = packet.bytes;
-        count += 1;
+        try batch.add(packet.kind, packet.bytes);
     }
-    if (count != 0) try self.upstream.send(self.upstreamContext(ends, ends.backend orelse return error.BackendClosed), self.shared.batch[0..count]);
+    try batch.flush();
     if (next_state) |state| try self.advance(state);
 }
 
 fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets) !void {
     var start_game = false;
-    var count: usize = 0;
+    var batch: Batch = .{ .managed = self, .ends = ends, .to_player = true };
     while (packets.next()) |packet| {
+        if (self.syncing and packet.kind == .play_status) {
+            if ((try typed(try self.upstream.session.decodePacket(packet), .play_status)).status == .playerspawn) {
+                self.target_spawned = true;
+                continue;
+            }
+        }
         if (registries.isRegistry(packet.kind)) {
             if (self.transferred) {
                 try self.checkRegistry(packet);
@@ -314,10 +382,9 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
         }
         if (packet.kind == .start_game) start_game = true;
         if (self.player.state == .resource_packs) try self.capturePacks(packet);
-        self.shared.batch[count] = packet.bytes;
-        count += 1;
+        try batch.add(packet.kind, packet.bytes);
     }
-    try self.sendToPlayer(ends, self.shared.batch[0..count]);
+    try batch.flush();
     if (start_game) try self.advance(.spawn_ready);
 }
 

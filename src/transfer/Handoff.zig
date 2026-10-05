@@ -48,6 +48,10 @@ pub fn acknowledged(self: *Handoff, outbox: *Outbox) !Progress {
     }
 }
 
+pub fn arrived(self: *const Handoff) bool {
+    return self.step == .arrived;
+}
+
 pub fn waitingForTarget(self: *const Handoff) bool {
     return self.step == .via;
 }

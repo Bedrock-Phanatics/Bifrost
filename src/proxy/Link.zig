@@ -158,6 +158,7 @@ pub fn service(self: *Link) error{Canceled}!void {
         };
     }
     if (client.isClosed()) return if (self.backend_closing) self.dropBackend() else self.fail(error.ConnectionClosed);
+    if (self.transfer) |transfer| if (self.session) |session| transfer.syncClient(self.transferHost(session)) catch |err| return self.fail(err);
     self.watch.arm(self.env.io, client, Scheduler.linkNotify(self)) catch |err| return self.fail(err);
     if (!drained) self.env.scheduler.schedule(self);
 }

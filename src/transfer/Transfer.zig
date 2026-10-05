@@ -49,6 +49,7 @@ pub const Settings = struct {
 const Seen = packed struct {
     logged_in: bool = false,
     started: bool = false,
+    spawned: bool = false,
     world: bool = false,
     failed: bool = false,
 };
@@ -70,6 +71,7 @@ content_policy: content.Policy,
 target_packs: packs.Fingerprint = .{},
 target_registries: registries.Fingerprint = .{},
 target_spawn: ?Handoff.Target = null,
+target_runtime_id: u64 = 0,
 handoff: ?Handoff = null,
 managed: *Managed,
 mismatch: ?content.Mismatch = null,
@@ -202,15 +204,18 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
     var packets = try self.upstream.session.ingest(frame);
     defer packets.deinit();
     const ctx = self.context(host);
+    var buffer: [64]u8 = undefined;
     if (self.upstream.phase != .ready) {
         const packet = packets.next() orelse return error.MalformedBatch;
         switch (try self.upstream.receive(ctx, packet)) {
             .wants_login => try host.managed.loginUpstream(&self.upstream, ctx),
-            .logged_in => self.seen.logged_in = true,
+            .logged_in => {
+                self.seen.logged_in = true;
+                if (host.managed.cache_supported) |supported| try self.upstream.send(ctx, &.{try Managed.encodeTyped(&buffer, .{ .client_cache_status = .{ .is_cache_supported = supported } })});
+            },
         }
         return;
     }
-    var buffer: [64]u8 = undefined;
     while (packets.next()) |packet| {
         if (registries.isRegistry(packet.kind)) {
             const decoded = try self.upstream.session.decodePacket(packet);
@@ -218,12 +223,17 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
             if (packet.kind == .start_game) {
                 const start = try Managed.typed(decoded, .start_game);
                 self.target_spawn = .{ .dimension = start.settings.spawn_settings.dimension, .position = finite(start.position) };
+                self.target_runtime_id = start.runtime_id;
                 self.seen.started = true;
             }
             continue;
         }
         if (self.seen.started) {
             if (endsRegistries(packet.kind)) self.seen.world = true;
+            if (packet.kind == .play_status and (try Managed.typed(try self.upstream.session.decodePacket(packet), .play_status)).status == .playerspawn) {
+                self.seen.spawned = true;
+                continue;
+            }
             try self.queue.push(host.gpa, packet.bytes);
             continue;
         }
@@ -241,7 +251,13 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
             else => {},
         }
     }
-    if (self.seen.started and self.upstream.session.state == .waiting_for_start_game) try self.upstream.session.advance(.spawn_ready);
+    if (self.seen.started and self.upstream.session.state == .waiting_for_start_game) {
+        try self.upstream.session.advance(.spawn_ready);
+        if (host.managed.chunk_radius) |radius| try self.upstream.send(ctx, &.{try Managed.encodeTyped(&buffer, .{ .request_chunk_radius = .{
+            .chunk_radius = radius.radius,
+            .max_chunk_radius = radius.max,
+        } })});
+    }
 }
 
 fn endsRegistries(kind: ?bedwire.PacketKind) bool {
@@ -295,6 +311,8 @@ fn commit(self: *Transfer, host: Host) !void {
     self.handoff = try .begin(managed.client_dimension, self.target_spawn.?, &outbox);
     managed.syncing = true;
     managed.dimension_acks = 0;
+    managed.target_spawned = self.seen.spawned;
+    managed.backend_runtime_id = self.target_runtime_id;
     try managed.sendOutbox(host.ends(), &outbox);
     if (self.handoff.?.waitingForTarget()) {
         managed.hold = &self.queue;
@@ -310,24 +328,24 @@ fn release(self: *Transfer, host: Host) !void {
     self.queue.clear();
 }
 
-fn syncClient(self: *Transfer, host: Host) !void {
+pub fn syncClient(self: *Transfer, host: Host) !void {
     const managed = host.managed;
-    while (managed.dimension_acks != 0 and self.state.phase == .syncing_client) {
+    if (self.state.phase != .syncing_client) return;
+    while (managed.dimension_acks != 0 and !self.handoff.?.arrived()) {
         managed.dimension_acks -= 1;
         var outbox: Managed.Outbox = .init(host.gpa);
         defer outbox.deinit();
-        const progress = try self.handoff.?.acknowledged(&outbox);
-        try managed.sendOutbox(host.ends(), &outbox);
-        switch (progress) {
-            .sent_target => try self.release(host),
-            .arrived => {
-                managed.syncing = false;
-                managed.client_dimension = self.handoff.?.target.dimension;
-                if (managed.upstream.session.state == .spawn_ready) try managed.upstream.session.advance(.in_game);
-                self.on(host, .client_synced);
-            },
+        if (try self.handoff.?.acknowledged(&outbox) == .sent_target) {
+            try managed.sendOutbox(host.ends(), &outbox);
+            try self.release(host);
         }
     }
+    // The client's ack and the target's spawn can land in either order
+    if (!self.handoff.?.arrived() or !managed.target_spawned) return;
+    managed.syncing = false;
+    managed.client_dimension = self.handoff.?.target.dimension;
+    try managed.spawnTarget(host.ends());
+    self.on(host, .client_synced);
 }
 
 fn finite(position: bedwire.protocol.Vec3f) bedwire.protocol.Vec3f {
