@@ -58,6 +58,7 @@ pub const Options = struct {
     health: ?*Health = null,
     proxy_key: ?proxy_key.Ecdsa.KeyPair = null,
     plugins: ?*Plugins = null,
+    worker: u32 = 0,
 };
 
 pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Proxy {
@@ -106,6 +107,9 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .env = undefined,
     };
     self.admission = options.admission orelse &self.own_admission;
+    if (self.managed) |*shared| if (options.plugins) |plugins| {
+        shared.hooks = .{ .plugins = plugins, .worker = options.worker };
+    };
     self.router = .init(self.config.backends(), options.health);
     self.env = .{
         .gpa = gpa,
@@ -299,6 +303,7 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     errdefer link.destroy();
     link.id = self.next_player + 1;
     link.player = self.env.events.connected(.{ .context = self, .link = link.id, .transfer = routeTransfer }, session.address);
+    if (link.managed) |managed| managed.plugin_player = link.player;
 
     try link.connect();
     self.next_player += 1;

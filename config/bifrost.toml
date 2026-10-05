@@ -11,6 +11,8 @@ max_players_per_ip = 0
 connect_timeout_ms = 5000
 pending_packets = 64
 pending_bytes = 1048576
+# Plugin callbacks slower than this get a warning, at most every 10 s per plugin
+slow_plugin_callback_ms = 5
 
 [health]
 interval_ms = 5000
@@ -42,6 +44,5 @@ address = "127.0.0.1:19133"
 name = "survival"
 address = "127.0.0.1:19134"
 
-# Native plugins load in order at startup and unload in reverse at shutdown
 # [[plugin]]
 # path = "plugins/libexample.so"

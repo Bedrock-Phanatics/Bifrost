@@ -51,13 +51,14 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
     var created: usize = 0;
     errdefer for (self.proxies[0..created]) |proxy| proxy.destroy();
     var worker_config = config;
-    for (self.proxies, self.watchers) |*proxy, *watcher| {
+    for (self.proxies, self.watchers, 0..) |*proxy, *watcher, worker| {
         proxy.* = try Proxy.create(gpa, io, worker_config, .{
             .auth = options.auth,
             .admission = &self.admission,
             .health = &self.health,
             .proxy_key = options.proxy_key,
             .plugins = options.plugins,
+            .worker = @intCast(worker),
         });
         watcher.* = proxy.*.healthNotify();
         created += 1;

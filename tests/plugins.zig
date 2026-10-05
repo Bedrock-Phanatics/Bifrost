@@ -88,7 +88,7 @@ fn loadRecorder(plugins: *bifrost.Plugins) !void {
 }
 
 test "a passthrough player's life is visible without decrypting anything" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{});
+    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     var backend: fixtures.Backend = undefined;
@@ -113,7 +113,7 @@ test "a passthrough player's life is visible without decrypting anything" {
 }
 
 test "a managed player is named, followed across a transfer and goes stale on leaving" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{});
+    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     var rig: Rig = undefined;
@@ -147,7 +147,7 @@ test "a managed player is named, followed across a transfer and goes stale on le
 }
 
 test "a transfer request can be cancelled" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{});
+    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     Recorder.action = .cancel;
@@ -164,7 +164,7 @@ test "a transfer request can be cancelled" {
 }
 
 test "a transfer request can be redirected" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{});
+    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     Recorder.action = .redirect;
@@ -181,7 +181,7 @@ test "a transfer request can be redirected" {
 }
 
 test "a failed transfer says why" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{});
+    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try loadRecorder(&plugins);
     var rig: Rig = undefined;
@@ -204,6 +204,7 @@ test "the C header matches the Zig ABI" {
         .{ abi.TransferDecision, header.bifrost_transfer_decision },
         .{ abi.Host, header.bifrost_host },
         .{ abi.Plugin, header.bifrost_plugin },
+        .{ abi.Packet, header.bifrost_packet },
     }) |pair| {
         try std.testing.expectEqual(@sizeOf(pair[0]), @sizeOf(pair[1]));
         inline for (comptime std.meta.fieldNames(pair[0])) |field| {
@@ -215,6 +216,10 @@ test "the C header matches the Zig ABI" {
     try expectConstants(abi.EventKind, "BIFROST_EVENT_");
     try expectConstants(abi.TransferFailure, "BIFROST_FAILURE_");
     try expectConstants(abi.TransferAction, "BIFROST_TRANSFER_");
+    try expectConstants(abi.Direction, "BIFROST_DIRECTION_");
+    try expectConstants(abi.PacketPhase, "BIFROST_PHASE_");
+    try expectConstants(abi.PacketAction, "BIFROST_PACKET_");
+    try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .validated = true })), header.BIFROST_PACKET_VALIDATED);
     try std.testing.expectEqual(abi.version, header.BIFROST_ABI_VERSION);
     try std.testing.expectEqual(abi.no_backend, header.BIFROST_NO_BACKEND);
     try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .packets = true })), header.BIFROST_CAPABILITY_PACKETS);
@@ -231,7 +236,7 @@ fn expectConstants(comptime Enum: type, comptime prefix: []const u8) !void {
 }
 
 test "the example plugin loads from disk and keeps players off maintenance" {
-    var plugins: bifrost.Plugins = .init(gpa, &.{});
+    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try plugins.open(test_options.example_plugin);
     var rig: Rig = undefined;
@@ -243,4 +248,77 @@ test "the example plugin loads from disk and keeps players off maintenance" {
     try rig.waitFor(.transfers_rejected, 1);
     try rig.expectOn(&rig.a);
     try std.testing.expectEqual(@as(u64, 0), rig.stats().transfers_started);
+}
+
+const Hook = struct {
+    const Mode = enum(u8) { pass, cancel, replace, corrupt };
+    var mode: std.atomic.Value(Mode) = .init(.pass);
+    var calls: std.atomic.Value(u32) = .init(0);
+
+    fn init(host_api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("hook");
+        plugin.plugin_version = .of("1.0.0");
+        plugin.capabilities = .{ .packets = true };
+        return host_api.subscribe_packet(host_api.context, .from_player, managed.game_packet_id, .in_game, .{}, onPacket, null);
+    }
+
+    fn onPacket(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        _ = calls.fetchAdd(1, .acq_rel);
+        const out = packet.replacement.?[0..packet.replacement_capacity];
+        switch (mode.load(.acquire)) {
+            .pass => return .pass,
+            .cancel => return .cancel,
+            .replace => {
+                @memcpy(out[0..2], packet.bytes.slice()[0..2]);
+                @memcpy(out[2..6], "pong");
+                packet.replacement_len = 6;
+            },
+            .corrupt => {
+                out[0] = 0xff;
+                packet.replacement_len = 1;
+            },
+        }
+        return .replace;
+    }
+
+    fn sendWith(rig: *Rig, next: Mode, payload: []const u8) !void {
+        mode.store(next, .release);
+        const before = calls.load(.acquire);
+        var buffer: [16]u8 = undefined;
+        try rig.player.send(&.{try managed.rawPacket(&buffer, managed.game_packet_id, payload)});
+        for (0..500) |_| {
+            if (calls.load(.acquire) > before) return;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.WaitTimedOut;
+    }
+};
+
+test "a packet hook can pass, cancel or replace player packets" {
+    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    Hook.mode.store(.pass, .release);
+    Hook.calls.store(0, .release);
+    try plugins.add(Hook.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    var buffer: [16]u8 = undefined;
+
+    try Hook.sendWith(&rig, .cancel, "dropped");
+    try Hook.sendWith(&rig, .replace, "ping");
+    try std.testing.expectEqualStrings("pong", try rig.player.nextGamePacket(&buffer));
+
+    Hook.mode.store(.corrupt, .release);
+    try rig.expectOn(&rig.a);
+    const totals = plugins.totals(0);
+    try std.testing.expectEqual(@as(u64, 1), totals.errors);
+    try std.testing.expectEqual(@as(u64, Hook.calls.load(.acquire)), totals.calls);
+    try std.testing.expectEqual(@as(u32, 3), rig.a.echoes.load(.acquire));
+}
+
+test "passthrough refuses packet subscriptions" {
+    var plugins: bifrost.Plugins = .init(gpa, &.{}, .{ .packets = false });
+    defer plugins.deinit();
+    try std.testing.expectError(error.PluginInitFailed, plugins.add(Hook.init, null));
 }

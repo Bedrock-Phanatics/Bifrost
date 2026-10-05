@@ -3,11 +3,25 @@ const abi = @import("abi.zig");
 const Backend = @import("../backend/Backend.zig");
 const Library = @import("Library.zig").Library;
 pub const Handles = @import("Handles.zig");
+pub const Packets = @import("Packets.zig");
 
 const Plugins = @This();
 const log = std.log.scoped(.plugin);
 
 pub const max_name_len = 64;
+
+pub const Options = struct {
+    workers: u32 = 1,
+    packets: bool = true,
+    slow_callback_ns: u64 = 5 * std.time.ns_per_ms,
+};
+
+pub const Totals = struct {
+    calls: u64 = 0,
+    total_ns: u64 = 0,
+    max_ns: u64 = 0,
+    errors: u64 = 0,
+};
 
 const Subscriber = struct {
     callback: abi.EventFn,
@@ -26,6 +40,7 @@ const Loaded = struct {
     library: ?Library,
     name: [max_name_len]u8 = undefined,
     name_len: usize = 0,
+    metrics: []Packets.Metrics = &.{},
 
     fn label(self: *const Loaded) []const u8 {
         return self.name[0..self.name_len];
@@ -34,16 +49,20 @@ const Loaded = struct {
 
 gpa: std.mem.Allocator,
 backends: []const Backend,
+options: Options,
 loaded: std.ArrayList(*Loaded) = .empty,
 subscribers: [abi.EventKind.count]std.ArrayList(Subscriber) = @splat(.empty),
 pending: std.ArrayList(Pending) = .empty,
+pending_packets: std.ArrayList(Packets.Registration) = .empty,
+registrations: std.ArrayList(Packets.Registration) = .empty,
+tables: [2]Packets.Table = .{ .{}, .{} },
 initializing: std.atomic.Value(?*Loaded) = .init(null),
 handles: Handles = .{},
 started: std.atomic.Value(bool) = .init(false),
 stopping: std.atomic.Value(bool) = .init(false),
 
-pub fn init(gpa: std.mem.Allocator, backends: []const Backend) Plugins {
-    return .{ .gpa = gpa, .backends = backends };
+pub fn init(gpa: std.mem.Allocator, backends: []const Backend, options: Options) Plugins {
+    return .{ .gpa = gpa, .backends = backends, .options = options };
 }
 
 pub fn deinit(self: *Plugins) void {
@@ -51,6 +70,8 @@ pub fn deinit(self: *Plugins) void {
     for (&self.subscribers) |*list| list.deinit(self.gpa);
     self.loaded.deinit(self.gpa);
     self.pending.deinit(self.gpa);
+    self.pending_packets.deinit(self.gpa);
+    self.registrations.deinit(self.gpa);
     self.handles.deinit(self.gpa);
 }
 
@@ -67,8 +88,12 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
     errdefer self.gpa.destroy(loaded);
     loaded.* = .{ .owner = self, .library = library };
     loaded.host = hostFor(loaded);
+    loaded.metrics = try self.gpa.alloc(Packets.Metrics, self.options.workers);
+    errdefer self.gpa.free(loaded.metrics);
+    @memset(loaded.metrics, .{});
 
     self.pending.clearRetainingCapacity();
+    self.pending_packets.clearRetainingCapacity();
     self.initializing.store(loaded, .release);
     const status = entry(&loaded.host, &loaded.plugin);
     self.initializing.store(null, .release);
@@ -92,6 +117,7 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
     }
 
     for (self.pending.items) |item| try self.subscribers[@backingInt(item.kind)].ensureUnusedCapacity(self.gpa, countKind(self.pending.items, item.kind));
+    if (self.pending_packets.items.len != 0) try self.addPacketHooks(loaded);
     for (self.pending.items) |item| self.subscribers[@backingInt(item.kind)].appendAssumeCapacity(item.subscriber);
     self.loaded.appendAssumeCapacity(loaded);
     log.info("loaded plugin {s} {s}", .{ loaded.label(), plugin.plugin_version.slice() });
@@ -99,11 +125,47 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
 
 pub fn unload(self: *Plugins) void {
     for (&self.subscribers) |*list| list.clearRetainingCapacity();
+    for (&self.tables) |*table| table.deinit(self.gpa);
+    self.registrations.clearRetainingCapacity();
     while (self.loaded.pop()) |loaded| {
         shutdown(loaded);
         if (loaded.library) |*library| library.close();
+        self.gpa.free(loaded.metrics);
         self.gpa.destroy(loaded);
     }
+}
+
+pub fn packetTable(self: *const Plugins, direction: abi.Direction) ?*const Packets.Table {
+    const table = &self.tables[@backingInt(direction)];
+    return if (table.subscribers.len == 0) null else table;
+}
+
+pub fn totals(self: *const Plugins, index: usize) Totals {
+    var sum: Totals = .{};
+    for (self.loaded.items[index].metrics) |*metrics| {
+        sum.calls += metrics.calls.load(.monotonic);
+        sum.total_ns += metrics.total_ns.load(.monotonic);
+        sum.max_ns = @max(sum.max_ns, metrics.max_ns.load(.monotonic));
+        sum.errors += metrics.errors.load(.monotonic);
+    }
+    return sum;
+}
+
+// Tables only change while plugins load, before any worker reads them
+fn addPacketHooks(self: *Plugins, loaded: *Loaded) !void {
+    const before = self.registrations.items.len;
+    errdefer self.registrations.shrinkRetainingCapacity(before);
+    for (self.pending_packets.items) |*item| {
+        item.subscriber.name = loaded.label();
+        item.subscriber.metrics = loaded.metrics;
+    }
+    try self.registrations.appendSlice(self.gpa, self.pending_packets.items);
+    var tables: [2]Packets.Table = undefined;
+    tables[0] = try .build(self.gpa, .from_player, self.registrations.items);
+    errdefer tables[0].deinit(self.gpa);
+    tables[1] = try .build(self.gpa, .from_backend, self.registrations.items);
+    for (&self.tables) |*table| table.deinit(self.gpa);
+    self.tables = tables;
 }
 
 pub fn emit(self: *const Plugins, event: *const abi.Event, decision: ?*abi.TransferDecision) void {
@@ -133,6 +195,8 @@ fn hostFor(loaded: *Loaded) abi.Host {
         .backend_name = hostBackendName,
         .player_name = hostPlayerName,
         .transfer = hostTransfer,
+        .worker_count = hostWorkerCount,
+        .subscribe_packet = hostSubscribePacket,
     };
 }
 
@@ -158,6 +222,27 @@ fn hostSubscribe(context: *anyopaque, kind: abi.EventKind, callback: ?abi.EventF
     if (@backingInt(kind) >= abi.EventKind.count) return .invalid_argument;
     owner.pending.append(owner.gpa, .{ .kind = kind, .subscriber = .{ .callback = callback orelse return .invalid_argument, .user = user } }) catch return .failed;
     return .ok;
+}
+
+fn hostSubscribePacket(context: *anyopaque, direction: abi.Direction, id: u32, phase: abi.PacketPhase, flags: abi.PacketFlags, callback: ?abi.PacketFn, user: ?*anyopaque) callconv(.c) abi.Status {
+    const loaded = from(context);
+    const owner = loaded.owner;
+    if (owner.initializing.load(.acquire) != loaded) return .too_late;
+    if (!owner.options.packets) return .unsupported;
+    if (@backingInt(direction) > 1 or id >= Packets.id_count or @backingInt(phase) > 2) return .invalid_argument;
+    owner.pending_packets.append(owner.gpa, .{ .direction = direction, .id = @intCast(id), .subscriber = .{
+        .callback = callback orelse return .invalid_argument,
+        .user = user,
+        .phase = phase,
+        .validated = flags.validated,
+        .name = "",
+        .metrics = &.{},
+    } }) catch return .failed;
+    return .ok;
+}
+
+fn hostWorkerCount(context: *anyopaque) callconv(.c) u32 {
+    return from(context).owner.options.workers;
 }
 
 fn hostBackendCount(context: *anyopaque) callconv(.c) u32 {
@@ -241,7 +326,7 @@ const Probe = struct {
 
     fn greedy(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
         describe(plugin, 5);
-        plugin.capabilities.packets = true;
+        plugin.capabilities = @bitCast(@as(u64, 1) << 40);
         return host.subscribe(host.context, .player_connected, onEvent, null);
     }
 };
@@ -254,7 +339,7 @@ fn routedTransfer(context: *anyopaque, link: u64, backend: u32) abi.Status {
 
 test "plugins that fail or don't fit are turned away without leaving hooks behind" {
     Probe.reset();
-    var plugins: Plugins = .init(testing.allocator, &.{});
+    var plugins: Plugins = .init(testing.allocator, &.{}, .{});
     defer plugins.deinit();
 
     try testing.expectError(error.PluginInitFailed, plugins.add(Probe.failing, null));
@@ -268,7 +353,7 @@ test "plugins that fail or don't fit are turned away without leaving hooks behin
 
 test "plugins get events, can't subscribe late and shut down newest first" {
     Probe.reset();
-    var plugins: Plugins = .init(testing.allocator, &.{});
+    var plugins: Plugins = .init(testing.allocator, &.{}, .{});
     try plugins.add(Probe.first, null);
     try plugins.add(Probe.second, null);
     plugins.emit(&.{ .kind = .player_connected }, null);
@@ -284,7 +369,7 @@ test "plugins get events, can't subscribe late and shut down newest first" {
 test "host calls check handles and backends" {
     Probe.reset();
     const backends = [_]Backend{try .init("lobby", .{ .ip4 = .loopback(19133) })};
-    var plugins: Plugins = .init(testing.allocator, &backends);
+    var plugins: Plugins = .init(testing.allocator, &backends, .{});
     defer plugins.deinit();
     try plugins.add(Probe.first, null);
     const host = Probe.seen_host.?;

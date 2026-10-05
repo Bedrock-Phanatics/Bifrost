@@ -5,7 +5,9 @@ pub const Player = abi.Player;
 pub const Event = abi.Event;
 pub const EventKind = abi.EventKind;
 pub const TransferDecision = abi.TransferDecision;
+pub const Packet = abi.Packet;
 pub const Handler = fn (event: *const Event, decision: ?*TransferDecision) void;
+pub const PacketHandler = fn (packet: *Packet) abi.PacketAction;
 
 pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy };
 
@@ -25,6 +27,19 @@ pub const Host = struct {
             }
         };
         try check(self.raw.subscribe(self.raw.context, kind, Trampoline.call, null));
+    }
+
+    pub fn onPacket(self: Host, direction: abi.Direction, id: u10, phase: abi.PacketPhase, flags: abi.PacketFlags, comptime handler: PacketHandler) Error!void {
+        const Trampoline = struct {
+            fn call(_: ?*anyopaque, packet: *Packet) callconv(.c) abi.PacketAction {
+                return handler(packet);
+            }
+        };
+        try check(self.raw.subscribe_packet(self.raw.context, direction, id, phase, flags, Trampoline.call, null));
+    }
+
+    pub fn workerCount(self: Host) u32 {
+        return self.raw.worker_count(self.raw.context);
     }
 
     pub fn transfer(self: Host, player: Player, backend: u32) Error!void {
@@ -48,7 +63,6 @@ pub const Host = struct {
     }
 };
 
-/// Exports `bifrost_plugin_init` for a plugin type with `name`, `version`, `init(Host) !void` and an optional `deinit()`.
 pub fn exportPlugin(comptime Plugin: type) void {
     const Entry = struct {
         fn init(raw: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
@@ -56,7 +70,7 @@ pub fn exportPlugin(comptime Plugin: type) void {
             plugin.* = .{
                 .name = .of(Plugin.name),
                 .plugin_version = .of(Plugin.version),
-                .capabilities = .{ .events = true },
+                .capabilities = if (@hasDecl(Plugin, "capabilities")) Plugin.capabilities else .{ .events = true },
                 .shutdown = shutdown,
             };
             Plugin.init(.{ .raw = raw }) catch return .failed;

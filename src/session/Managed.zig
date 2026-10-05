@@ -11,6 +11,9 @@ pub const Outbox = @import("Outbox.zig");
 const self_id = @import("self_id.zig");
 const Queue = @import("../transfer/Queue.zig");
 const Handoff = @import("../transfer/Handoff.zig");
+const Plugins = @import("../plugin/Plugins.zig");
+const Packets = Plugins.Packets;
+const abi = @import("../plugin/abi.zig");
 
 const protocol = bedwire.protocol;
 const Current = protocol.Current;
@@ -55,6 +58,7 @@ pub const Shared = struct {
     keys: *const bedwire.auth.KeySet,
     batch: [][]const u8,
     rewrites: std.ArrayList(u8) = .empty,
+    hooks: ?Hooks = null,
 
     pub fn init(gpa: std.mem.Allocator, key: Ecdsa.KeyPair, keys: *const bedwire.auth.KeySet) !Shared {
         var pool: bedwire.BufferPool = try .init(gpa, limits, .{ .rx_slots = 1, .tx_slots = 1 });
@@ -67,6 +71,11 @@ pub const Shared = struct {
         gpa.free(self.batch);
         self.pool.deinit();
     }
+};
+
+pub const Hooks = struct {
+    plugins: *const Plugins,
+    worker: u32,
 };
 
 pub const Ends = struct {
@@ -98,6 +107,7 @@ target_spawned: bool = false,
 backend_runtime_id: u64 = 0,
 chunk_radius: ?struct { radius: i32, max: u8 } = null,
 cache_supported: ?bool = null,
+plugin_player: abi.Player = .{},
 // Player packets sent before the backend is ready
 early: PacketQueue,
 
@@ -146,7 +156,7 @@ pub fn swapUpstream(self: *Managed, next: Upstream) Upstream {
 }
 
 pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
-    var batch: Batch = .{ .managed = self, .ends = ends, .to_player = true };
+    var batch = self.newBatch(ends, true);
     var skipped: usize = 0;
     for (packets) |packet| {
         const header = protocol.packet.decode(packet, .{ .max_packet_bytes = @max(packet.len, 1) }) catch {
@@ -176,25 +186,58 @@ fn swap(self: *const Managed) ?self_id.Swap {
     return if (self.transferred and ids.active()) ids else null;
 }
 
+fn newBatch(self: *Managed, ends: Ends, to_player: bool) Batch {
+    const hooks = self.shared.hooks orelse return .{ .managed = self, .ends = ends, .to_player = to_player };
+    return .{ .managed = self, .ends = ends, .to_player = to_player, .table = hooks.plugins.packetTable(if (to_player) .from_backend else .from_player) };
+}
+
 const Batch = struct {
     managed: *Managed,
     ends: Ends,
     to_player: bool,
+    table: ?*const Packets.Table = null,
     count: usize = 0,
 
-    fn add(self: *Batch, kind: ?bedwire.PacketKind, bytes: []const u8) !void {
+    fn add(self: *Batch, original_kind: ?bedwire.PacketKind, bytes: []const u8) !void {
         const shared = self.managed.shared;
+        var kind = original_kind;
         var packet = bytes;
         if (self.count == shared.batch.len) try self.flush();
-        if (self.managed.swap()) |ids| if (self_id.leadsWithRuntimeId(kind)) {
-            if (shared.rewrites.unusedCapacitySlice().len < bytes.len + self_id.max_growth) {
-                try self.flush();
-                try shared.rewrites.ensureUnusedCapacity(self.managed.gpa, bytes.len + self_id.max_growth);
+        if (self.table) |table| {
+            try self.reserve(Packets.scratch_bytes + self_id.max_growth);
+            const hooks = shared.hooks.?;
+            const call: Packets.Call = .{
+                .io = self.ends.io,
+                .worker = hooks.worker,
+                .player = self.managed.plugin_player,
+                .direction = if (self.to_player) .from_backend else .from_player,
+                .in_game = self.managed.player.state == .in_game,
+                .slow_ns = hooks.plugins.options.slow_callback_ns,
+            };
+            switch (Packets.run(table, call, bytes, shared.rewrites.unusedCapacitySlice(), Checker{ .managed = self.managed, .to_player = self.to_player })) {
+                .pass => {},
+                .cancel => return,
+                .replace => |replacement| {
+                    shared.rewrites.items.len += replacement.len;
+                    packet = shared.rewrites.items[shared.rewrites.items.len - replacement.len ..];
+                    kind = Current.packetKind(Packets.packetId(packet).?);
+                },
             }
-            packet = try ids.apply(bytes, &shared.rewrites) orelse bytes;
+        }
+        if (self.managed.swap()) |ids| if (self_id.leadsWithRuntimeId(kind)) {
+            try self.reserve(packet.len + self_id.max_growth);
+            packet = try ids.apply(packet, &shared.rewrites) orelse packet;
         };
         shared.batch[self.count] = packet;
         self.count += 1;
+    }
+
+    // Flushing clears rewrites, so it must happen before this packet points into them
+    fn reserve(self: *Batch, bytes: usize) !void {
+        const rewrites = &self.managed.shared.rewrites;
+        if (rewrites.unusedCapacitySlice().len >= bytes) return;
+        try self.flush();
+        try rewrites.ensureUnusedCapacity(self.managed.gpa, bytes);
     }
 
     fn flush(self: *Batch) !void {
@@ -204,6 +247,20 @@ const Batch = struct {
         self.count = 0;
         if (self.to_player) return self.managed.sendToPlayer(self.ends, packets);
         try self.managed.upstream.send(self.managed.upstreamContext(self.ends, self.ends.backend orelse return error.BackendClosed), packets);
+    }
+};
+
+const Checker = struct {
+    managed: *Managed,
+    to_player: bool,
+
+    pub fn valid(self: Checker, bytes: []const u8) bool {
+        const header = protocol.packet.decode(bytes, .{ .max_packet_bytes = limits.max_packet_bytes }) catch return false;
+        const kind = Current.packetKind(header.header.packet_id);
+        if (!self.managed.player.state.permits(Current.features, if (self.to_player) .server else .client, kind)) return false;
+        if (kind == null) return true;
+        _ = Current.decodeBorrowed(bytes, protocolLimits()) catch return false;
+        return true;
     }
 };
 
@@ -317,7 +374,7 @@ fn authenticate(self: *Managed, ends: Ends, packet: PlayerSession.Packet) !void 
 
 fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) !void {
     var next_state: ?bedwire.State = null;
-    var batch: Batch = .{ .managed = self, .ends = ends, .to_player = false };
+    var batch = self.newBatch(ends, false);
     while (packets.next()) |packet| {
         if (packet.kind) |kind| switch (kind) {
             .request_chunk_radius => {
@@ -349,7 +406,7 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
 
 fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets) !void {
     var start_game = false;
-    var batch: Batch = .{ .managed = self, .ends = ends, .to_player = true };
+    var batch = self.newBatch(ends, true);
     while (packets.next()) |packet| {
         if (self.syncing and packet.kind == .play_status) {
             if ((try typed(try self.upstream.session.decodePacket(packet), .play_status)).status == .playerspawn) {

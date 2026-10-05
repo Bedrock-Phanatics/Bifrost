@@ -32,7 +32,11 @@ pub fn main(init: std.process.Init) !void {
     const rt = try zio.Runtime.init(init.gpa, .{ .executors = .exact(config.workers) });
     defer rt.deinit();
 
-    var plugins: bifrost.Plugins = .init(init.gpa, config.backends());
+    var plugins: bifrost.Plugins = .init(init.gpa, config.backends(), .{
+        .workers = config.workers,
+        .packets = config.session_mode == .managed,
+        .slow_callback_ns = @as(u64, config.slow_plugin_callback_ms) * std.time.ns_per_ms,
+    });
     defer plugins.deinit();
     for (0..config.plugin_count) |i| plugins.open(config.pluginPath(i)) catch |err| {
         log.err("plugin {s}: {t}", .{ config.pluginPath(i), err });

@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-/* Same contract as src/plugin/abi.zig. Callbacks run on worker threads, possibly at the same time, and must not block. */
+/* Callbacks can run on several worker threads at once, so never block in them */
 
 #define BIFROST_ABI_VERSION 1u
 #define BIFROST_NO_BACKEND UINT32_MAX
@@ -31,7 +31,7 @@ enum {
     BIFROST_STATUS_BUSY = -7,
 };
 
-/* Borrowed, only valid during the call */
+/* Only valid until the call returns */
 typedef struct bifrost_str {
     const uint8_t *ptr;
     size_t len;
@@ -102,6 +102,43 @@ typedef struct bifrost_transfer_decision {
     uint32_t backend;
 } bifrost_transfer_decision;
 
+typedef uint32_t bifrost_direction;
+enum {
+    BIFROST_DIRECTION_FROM_PLAYER = 0,
+    BIFROST_DIRECTION_FROM_BACKEND = 1,
+};
+
+typedef uint32_t bifrost_packet_phase;
+enum {
+    BIFROST_PHASE_ANY = 0,
+    BIFROST_PHASE_BEFORE_GAME = 1,
+    BIFROST_PHASE_IN_GAME = 2,
+};
+
+#define BIFROST_PACKET_VALIDATED (UINT32_C(1) << 0)
+
+typedef uint32_t bifrost_packet_action;
+enum {
+    BIFROST_PACKET_PASS = 0,
+    BIFROST_PACKET_CANCEL = 1,
+    BIFROST_PACKET_REPLACE = 2,
+};
+
+/* Whole packets, header included, for both bytes and the replacement */
+typedef struct bifrost_packet {
+    uint32_t struct_size;
+    bifrost_direction direction;
+    uint32_t id;
+    uint32_t worker;
+    bifrost_player player;
+    bifrost_str bytes;
+    uint8_t *replacement;
+    size_t replacement_capacity;
+    size_t replacement_len;
+} bifrost_packet;
+
+typedef bifrost_packet_action (*bifrost_packet_fn)(void *user, bifrost_packet *packet);
+
 typedef void (*bifrost_event_fn)(void *user, const bifrost_event *event, bifrost_transfer_decision *decision);
 
 typedef struct bifrost_host {
@@ -109,12 +146,13 @@ typedef struct bifrost_host {
     uint32_t abi_version;
     void *context;
     void (*log)(void *context, bifrost_log_level level, bifrost_str message);
-    /* Only works inside bifrost_plugin_init */
     bifrost_status (*subscribe)(void *context, bifrost_event_kind kind, bifrost_event_fn callback, void *user);
     uint32_t (*backend_count)(void *context);
     bifrost_status (*backend_name)(void *context, uint32_t backend, bifrost_str *name);
     bifrost_status (*player_name)(void *context, bifrost_player player, uint8_t *out, size_t capacity, size_t *len);
     bifrost_status (*transfer)(void *context, bifrost_player player, uint32_t backend);
+    uint32_t (*worker_count)(void *context);
+    bifrost_status (*subscribe_packet)(void *context, bifrost_direction direction, uint32_t id, bifrost_packet_phase phase, uint32_t flags, bifrost_packet_fn callback, void *user);
 } bifrost_host;
 
 typedef struct bifrost_plugin {

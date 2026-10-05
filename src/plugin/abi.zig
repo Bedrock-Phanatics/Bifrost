@@ -1,4 +1,4 @@
-// Callbacks run on worker threads, possibly at the same time, and must not block
+// Callbacks can run on several worker threads at once, so never block in them
 
 const std = @import("std");
 
@@ -18,7 +18,7 @@ pub const Status = enum(i32) {
     _,
 };
 
-// Borrowed, only valid during the call
+// Only valid until the call returns
 pub const Str = extern struct {
     ptr: ?[*]const u8 = null,
     len: usize = 0,
@@ -43,7 +43,7 @@ pub const Capabilities = packed struct(u64) {
     tasks: bool = false,
     _: u60 = 0,
 
-    pub const supported: Capabilities = .{ .events = true };
+    pub const supported: Capabilities = .{ .events = true, .packets = true };
 };
 
 pub const LogLevel = enum(u32) { err, warn, info, debug, _ };
@@ -93,6 +93,32 @@ pub const TransferDecision = extern struct {
     backend: u32 = no_backend,
 };
 
+pub const Direction = enum(u32) { from_player, from_backend, _ };
+
+pub const PacketPhase = enum(u32) { any, before_game, in_game, _ };
+
+pub const PacketFlags = packed struct(u32) {
+    validated: bool = false,
+    _: u31 = 0,
+};
+
+pub const PacketAction = enum(u32) { pass, cancel, replace, _ };
+
+// Whole packets, header included, for both bytes and the replacement
+pub const Packet = extern struct {
+    struct_size: u32 = @sizeOf(Packet),
+    direction: Direction,
+    id: u32,
+    worker: u32,
+    player: Player,
+    bytes: Str,
+    replacement: ?[*]u8 = null,
+    replacement_capacity: usize = 0,
+    replacement_len: usize = 0,
+};
+
+pub const PacketFn = *const fn (user: ?*anyopaque, packet: *Packet) callconv(.c) PacketAction;
+
 pub const EventFn = *const fn (user: ?*anyopaque, event: *const Event, decision: ?*TransferDecision) callconv(.c) void;
 
 pub const Host = extern struct {
@@ -100,12 +126,13 @@ pub const Host = extern struct {
     abi_version: u32 = version,
     context: *anyopaque,
     log: *const fn (context: *anyopaque, level: LogLevel, message: Str) callconv(.c) void,
-    // Only works inside bifrost_plugin_init
     subscribe: *const fn (context: *anyopaque, kind: EventKind, callback: ?EventFn, user: ?*anyopaque) callconv(.c) Status,
     backend_count: *const fn (context: *anyopaque) callconv(.c) u32,
     backend_name: *const fn (context: *anyopaque, backend: u32, name: ?*Str) callconv(.c) Status,
     player_name: *const fn (context: *anyopaque, player: Player, out: ?[*]u8, capacity: usize, len: ?*usize) callconv(.c) Status,
     transfer: *const fn (context: *anyopaque, player: Player, backend: u32) callconv(.c) Status,
+    worker_count: *const fn (context: *anyopaque) callconv(.c) u32,
+    subscribe_packet: *const fn (context: *anyopaque, direction: Direction, id: u32, phase: PacketPhase, flags: PacketFlags, callback: ?PacketFn, user: ?*anyopaque) callconv(.c) Status,
 };
 
 pub const Plugin = extern struct {

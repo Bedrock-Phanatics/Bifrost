@@ -175,6 +175,8 @@ fn readLimits(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
             config.pending_packets = try integer(u32, diag, key, value, 1, 4096);
         } else if (eql(key.name.?, "pending_bytes")) {
             config.pending_bytes = try integer(u32, diag, key, value, 1, 64 * 1024 * 1024);
+        } else if (eql(key.name.?, "slow_plugin_callback_ms")) {
+            config.slow_plugin_callback_ms = try integer(u32, diag, key, value, 1, 60_000);
         } else return fail(diag, key, "unknown key", .{});
     }
 }
@@ -327,6 +329,7 @@ test "full config reads every key" {
         \\connect_timeout_ms = 2000
         \\pending_packets = 8
         \\pending_bytes = 4096
+        \\slow_plugin_callback_ms = 20
         \\
         \\[[backend]]
         \\name = "lobby"
@@ -342,6 +345,7 @@ test "full config reads every key" {
     try std.testing.expectEqual(@as(u32, 2000), config.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 8), config.pending_packets);
     try std.testing.expectEqual(@as(u32, 4096), config.pending_bytes);
+    try std.testing.expectEqual(@as(u32, 20), config.slow_plugin_callback_ms);
     try std.testing.expectEqual(@as(u16, 2000), config.backends()[0].address.getPort());
     try std.testing.expectEqualStrings("lobby", config.backends()[0].name());
     try std.testing.expectEqual(@as(u16, 3000), config.backends()[1].address.getPort());
