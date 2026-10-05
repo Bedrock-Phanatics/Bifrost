@@ -24,7 +24,7 @@ test "a player moves from one backend to another" {
     try std.testing.expectEqual(@as(u64, 1), rig.stats().transfers_started);
     try std.testing.expectEqual(@as(u32, 1), rig.b.chunk_requests.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), rig.b.spawns.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 2), rig.player.dimension_changes);
+    try std.testing.expectEqual(@as(usize, 2), rig.player.changes.items.len);
 }
 
 test "a player can bounce between backends" {

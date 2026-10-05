@@ -62,6 +62,20 @@ Joins: 1.9 ms per player passthrough, 15.1 ms managed (token check, proxy login,
 Below the compression threshold managed costs about 5%. Above it, re-compressing every batch makes the proxy
 CPU-bound at roughly a quarter to a third of passthrough; that is the first thing to optimise in managed mode.
 
+## Transfers
+
+`zig build test -Doptimize=ReleaseFast -Dtransfer-report=true`. The stress test moves one player A↔B 200 times and
+times each request until the client is synced and its echo comes back from the target. Windows 11, Zig 0.17.
+
+| build | p50 / p99 ms | proxy live heap after 20 / 200 transfers |
+|---|---|---|
+| ReleaseFast | 31.1 / 32.7 | 16053437 / 16053437 B |
+| ReleaseSafe | 31.0 / 32.7 | 16053525 / 16053525 B |
+| Debug | 189.4 / 236.3 | 16053525 / 16053525 B |
+
+WSL2 Ubuntu: ReleaseFast 33.7 / 34.4 ms, ReleaseSafe 33.9 / 35.6 ms, same flat heap.
+The test fails if the live heap grows more than 64 KiB between those points.
+
 ## ReleaseSafe
 
 `-- --quick`, Zig 0.17, work_stealing: relay 512 B 1x1 8554 round trips/s (p50 91 us, p99 221 us), 8 KiB 8x32 23.8 MiB/s,

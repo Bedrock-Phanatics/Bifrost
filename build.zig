@@ -53,6 +53,9 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     integration_tests.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
+    const test_options = b.addOptions();
+    test_options.addOption(bool, "report", b.option(bool, "transfer-report", "Print transfer stress timings and memory") orelse false);
+    integration_tests.root_module.addImport("test_options", test_options.createModule());
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);

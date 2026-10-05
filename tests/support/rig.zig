@@ -26,6 +26,8 @@ pub const Rig = struct {
         connect_timeout_ms: u32 = 500,
         phase_timeout_ms: u32 = 5_000,
         timeout_ms: u32 = 15_000,
+        cache: ?bool = null,
+        allocator: std.mem.Allocator = std.testing.allocator,
     };
 
     pub fn start(self: *Rig, options: Options) !void {
@@ -45,11 +47,15 @@ pub const Rig = struct {
         proxy_config.transfer_phase_timeout_ms = options.phase_timeout_ms;
         proxy_config.transfer_timeout_ms = options.timeout_ms;
         proxy_config.content_policy = options.content_policy;
-        try self.running.start(io, proxy_config, .{ .auth = .{ .verify = &self.keys }, .proxy_key = proxy_key });
+        try self.running.startWith(io, options.allocator, proxy_config, .{ .auth = .{ .verify = &self.keys }, .proxy_key = proxy_key });
         errdefer self.running.deinit();
         self.player = try Player.connect(io, self.running.address(), 2);
         errdefer self.player.destroy();
         try self.player.login("Steve", "2535400000000001");
+        if (options.cache) |supported| {
+            var buffer: [8]u8 = undefined;
+            try self.player.send(&.{try sample.typedPacket(&buffer, .{ .client_cache_status = .{ .is_cache_supported = supported } })});
+        }
         try self.player.spawn();
         // Waits until the proxy has the player in game
         if (options.a != .chatter) try self.expectOn(&self.a);
@@ -69,6 +75,17 @@ pub const Rig = struct {
         self.player.timeout_ms = 20;
         for (0..500) |_| {
             if (@field(self.stats(), @tagName(field)) >= value) return;
+            self.player.pump() catch |err| if (err != error.NoMessage) return err;
+        }
+        return error.WaitTimedOut;
+    }
+
+    pub fn pumpUntil(self: *Rig, context: anytype, comptime check: fn (@TypeOf(context)) bool) !void {
+        const saved = self.player.timeout_ms;
+        defer self.player.timeout_ms = saved;
+        self.player.timeout_ms = 20;
+        for (0..500) |_| {
+            if (check(context)) return;
             self.player.pump() catch |err| if (err != error.NoMessage) return err;
         }
         return error.WaitTimedOut;

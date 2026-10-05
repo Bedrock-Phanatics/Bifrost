@@ -52,8 +52,10 @@ pub const Player = struct {
     current: ?[]u8 = null,
     timeout_ms: i64 = 5_000,
     game_packets: std.ArrayList([]u8) = .empty,
-    dimension_changes: usize = 0,
-    dimensions: [8]i32 = undefined,
+    kinds: std.ArrayList(bedwire.PacketKind) = .empty,
+    changes: std.ArrayList(protocol.packets.change_dimension.Packet) = .empty,
+    hold_acks: bool = false,
+    held_acks: usize = 0,
 
     pub fn connect(io: std.Io, address: IpAddress, seed: u8) !*Player {
         const self = try gpa.create(Player);
@@ -82,6 +84,8 @@ pub const Player = struct {
         self.frames.deinit(gpa);
         for (self.game_packets.items) |packet| gpa.free(packet);
         self.game_packets.deinit(gpa);
+        self.kinds.deinit(gpa);
+        self.changes.deinit(gpa);
         gpa.destroy(self);
     }
 
@@ -186,28 +190,47 @@ pub const Player = struct {
         {
             var packets = try self.receive();
             defer packets.deinit();
-            while (packets.next()) |packet| switch (packet.kind orelse {
-                try self.game_packets.ensureUnusedCapacity(gpa, 1);
-                self.game_packets.appendAssumeCapacity(try gpa.dupe(u8, packet.bytes[2..]));
-                continue;
-            }) {
-                .change_dimension => {
-                    const change = (try self.session.decodePacket(packet)).value.typed.change_dimension;
-                    if (self.dimension_changes < self.dimensions.len) self.dimensions[self.dimension_changes] = change.dimension_id;
-                    self.dimension_changes += 1;
+            while (packets.next()) |packet| {
+                const kind = packet.kind orelse {
+                    try self.game_packets.ensureUnusedCapacity(gpa, 1);
+                    self.game_packets.appendAssumeCapacity(try gpa.dupe(u8, packet.bytes[2..]));
+                    continue;
+                };
+                try self.kinds.append(gpa, kind);
+                if (kind == .change_dimension) {
+                    try self.changes.append(gpa, (try self.session.decodePacket(packet)).value.typed.change_dimension);
                     acks += 1;
-                },
-                else => {},
-            };
+                }
+            }
         }
+        if (self.hold_acks) {
+            self.held_acks += acks;
+        } else try self.ack(acks);
+    }
+
+    pub fn releaseAcks(self: *Player) !void {
+        self.hold_acks = false;
+        try self.ack(self.held_acks);
+        self.held_acks = 0;
+    }
+
+    fn ack(self: *Player, count: usize) !void {
         var buffer: [64]u8 = undefined;
-        for (0..acks) |_| try self.send(&.{try typedPacket(&buffer, .{ .player_action = .{
+        for (0..count) |_| try self.send(&.{try typedPacket(&buffer, .{ .player_action = .{
             .player_runtime_id = 0,
             .action = .changedimensionack,
             .block_position = .{ .x = 0, .y = 0, .z = 0 },
             .result_pos = .{ .x = 0, .y = 0, .z = 0 },
             .face = 0,
         } })});
+    }
+
+    pub fn received(self: *const Player, kind: bedwire.PacketKind) usize {
+        return std.mem.count(bedwire.PacketKind, self.kinds.items, &.{kind});
+    }
+
+    pub fn lastIndex(self: *const Player, kind: bedwire.PacketKind) ?usize {
+        return std.mem.lastIndexOfScalar(bedwire.PacketKind, self.kinds.items, kind);
     }
 
     pub fn countGamePackets(self: *Player, suffix: []const u8, ms: i64) !usize {
@@ -271,7 +294,8 @@ pub const Backend = struct {
         carrier: *raknet.Session,
     };
 
-    pub const Mode = enum { normal, silent_login, kick_login, silent_stack, kick_packs, welcome, flood, chatter };
+    pub const Mode = enum { normal, silent_login, kick_login, silent_stack, kick_packs, welcome, flood, chatter, spawn_first };
+    pub const scene_entities = 200;
 
     io: std.Io,
     listener: *raknet.Server,
@@ -286,6 +310,12 @@ pub const Backend = struct {
     chunk_requests: std.atomic.Value(u32) = .init(0),
     spawns: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
+    sub_chunk_requests: std.atomic.Value(u32) = .init(0),
+    cache_reports: std.atomic.Value(u32) = .init(0),
+    cache_supported: std.atomic.Value(bool) = .init(false),
+    hold_spawn: std.atomic.Value(bool) = .init(false),
+    drop_all: std.atomic.Value(bool) = .init(false),
+    held: ?*Connection = null,
     refuse: bool = false,
     mode: Mode = .normal,
     content: sample.Content = .{},
@@ -339,7 +369,70 @@ pub const Backend = struct {
                 .disconnected = onDisconnected,
             }) catch {};
             if (self.mode == .chatter) self.chatter();
+            if (self.held) |connection| if (!self.hold_spawn.load(.acquire)) {
+                self.held = null;
+                self.sendWorld(connection, .spawn_only) catch {};
+            };
+            if (self.drop_all.swap(false, .acq_rel)) {
+                var i = self.connections.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (i < self.connections.items.len) self.connections.items[i].carrier.close();
+                }
+            }
         }
+    }
+
+    const World = enum { full, without_spawn, spawn_only };
+
+    fn sendWorld(self: *Backend, connection: *Connection, world: World) !void {
+        var buffers: [4][64]u8 = undefined;
+        var packets: [4][]const u8 = undefined;
+        var count: usize = 0;
+        const spawned = try typedPacket(&buffers[3], .{ .play_status = .{ .status = .playerspawn } });
+        if (world == .spawn_only) return sendFrame(&connection.session, connection.carrier, &.{spawned});
+        if (world == .full and self.mode == .spawn_first) {
+            packets[count] = spawned;
+            count += 1;
+        }
+        const position = self.content.position orelse protocol.Vec3f{ .x = 0, .y = 0, .z = 0 };
+        const block: protocol.BlockPosition = .{ .x = std.math.lossyCast(i32, position.x), .y = std.math.lossyCast(i32, position.y), .z = std.math.lossyCast(i32, position.z) };
+        packets[count] = try typedPacket(&buffers[0], .{ .chunk_radius_updated = .{ .chunk_radius = 8 } });
+        packets[count + 1] = try typedPacket(&buffers[1], .{ .network_chunk_publisher_update = .{ .new_position_for_view = block, .new_radius_for_view = 128, .server_built_chunks_list = .empty } });
+        packets[count + 2] = try typedPacket(&buffers[2], .{ .level_chunk = .{
+            .chunk_position = .{ .x = block.x >> 4, .z = block.z >> 4 },
+            .dimension_id = self.content.dimension orelse 0,
+            .sub_chunks_count = 0,
+            .client_request_sub_chunk_limit = null,
+            .cache_enabled = false,
+            .cache_metadata = .empty,
+            .serialized_chunk_data = "",
+        } });
+        count += 3;
+        if (world == .full and self.mode != .spawn_first) {
+            packets[count] = spawned;
+            count += 1;
+        }
+        try sendFrame(&connection.session, connection.carrier, packets[0..count]);
+    }
+
+    fn sendScene(connection: *Connection) !void {
+        var buffers: [50][128]u8 = undefined;
+        var packets: [50][]const u8 = undefined;
+        var next: i64 = 1000;
+        while (next < 1000 + scene_entities) {
+            for (&buffers, &packets) |*buffer, *packet| {
+                packet.* = try typedPacket(buffer, .{ .add_painting = .{ .target_actor_id = next, .target_runtime_id = @intCast(next), .position = .{ .x = 0, .y = 0, .z = 0 }, .direction = 0, .motif = "Kebab" } });
+                next += 1;
+            }
+            try sendFrame(&connection.session, connection.carrier, &packets);
+        }
+        try sendFrame(&connection.session, connection.carrier, &.{
+            try typedPacket(&buffers[0], .{ .container_open = .{ .container_id = 3, .container_type = 0, .position = .{ .x = 0, .y = 0, .z = 0 }, .target_actor_id = -1 } }),
+            try typedPacket(&buffers[1], .{ .set_display_objective = .{ .display_slot_name = "sidebar", .objective_name = "kills", .objective_display_name = "Kills", .criteria_name = "dummy", .sort_order = 0 } }),
+            try typedPacket(&buffers[2], .{ .boss_event = .{ .target_actor_id = 5, .event_type = .add, .name = "boss", .filtered_name = "", .health_percent = 1, .color = .red, .overlay = .progress } }),
+            try typedPacket(&buffers[3], .{ .mob_effect = .{ .target_runtime_id = sample.runtimeId(), .event_id = .add, .effect_id = 1, .effect_amplifier = 0, .show_particles = true, .effect_duration_ticks = 100, .tick = 0, .ambient = false } }),
+        });
     }
 
     fn chatter(self: *Backend) void {
@@ -375,6 +468,7 @@ pub const Backend = struct {
         _ = self.disconnects.fetchAdd(1, .release);
         const connection: *Connection = @ptrCast(@alignCast(session.userData() orelse return));
         session.setUserData(null);
+        if (self.held == connection) self.held = null;
         for (self.connections.items, 0..) |item, i| if (item == connection) {
             _ = self.connections.swapRemove(i);
             break;
@@ -400,6 +494,10 @@ pub const Backend = struct {
         var buffer: [512]u8 = undefined;
         while (packets.next()) |packet| switch (packet.kind orelse {
             if (std.mem.endsWith(u8, packet.bytes, "kick")) return carrier.close();
+            if (std.mem.endsWith(u8, packet.bytes, "scene")) {
+                try sendScene(connection);
+                continue;
+            }
             _ = self.echoes.fetchAdd(1, .release);
             try sendFrame(session, carrier, &.{packet.bytes});
             continue;
@@ -472,14 +570,18 @@ pub const Backend = struct {
                 try session.advance(.spawn_ready);
             },
             .request_chunk_radius => {
-                var updated: [16]u8 = undefined;
-                var spawned: [16]u8 = undefined;
-                try sendFrame(session, carrier, &.{
-                    try typedPacket(&updated, .{ .chunk_radius_updated = .{ .chunk_radius = 8 } }),
-                    try typedPacket(&spawned, .{ .play_status = .{ .status = .playerspawn } }),
-                });
+                if (self.hold_spawn.load(.acquire)) {
+                    try self.sendWorld(connection, .without_spawn);
+                    self.held = connection;
+                } else try self.sendWorld(connection, .full);
                 _ = self.chunk_requests.fetchAdd(1, .release);
             },
+            .client_cache_status => {
+                const status = (try session.decodePacket(packet)).value.typed.client_cache_status;
+                self.cache_supported.store(status.is_cache_supported, .release);
+                _ = self.cache_reports.fetchAdd(1, .release);
+            },
+            .sub_chunk_request => _ = self.sub_chunk_requests.fetchAdd(1, .release),
             .set_local_player_as_initialised => {
                 if (session.state == .spawn_ready) try session.advance(.in_game);
                 _ = self.spawns.fetchAdd(1, .release);

@@ -84,7 +84,14 @@ pub const Content = struct {
     custom_block: ?[]const u8 = null,
     custom_item: ?[]const u8 = null,
     authoritative_block_breaking: ?bool = null,
+    dimension: ?i32 = null,
+    position: ?protocol.Vec3f = null,
 };
+
+pub fn runtimeId() u64 {
+    const source = comptime fromHex(start_game_hex);
+    return (Current.decodeBorrowed(&source, .{}) catch unreachable).value.typed.start_game.runtime_id;
+}
 
 pub fn startGame(buffer: []u8, content: Content) ![]const u8 {
     const source = comptime fromHex(start_game_hex);
@@ -93,6 +100,8 @@ pub fn startGame(buffer: []u8, content: Content) ![]const u8 {
     const blocks = [_]protocol.packets.start_game.ServerBlockProperty{.{ .block_name = content.custom_block orelse "", .block_definition = &empty_compound }};
     if (content.custom_block != null) value.block_properties = .init(&blocks);
     if (content.authoritative_block_breaking) |enabled| value.movement_settings.server_authoritative_block_breaking = enabled;
+    value.settings.spawn_settings.dimension = content.dimension orelse 0;
+    if (content.position) |position| value.position = position;
     envelope.value = .{ .typed = .{ .start_game = value } };
     return encodeEnvelope(buffer, envelope);
 }

@@ -10,6 +10,7 @@ test {
     _ = @import("managed.zig");
     _ = @import("transfer.zig");
     _ = @import("content.zig");
+    _ = @import("handoff.zig");
 }
 
 test "the shipped config parses" {
