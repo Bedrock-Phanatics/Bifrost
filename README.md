@@ -30,6 +30,18 @@ world packets from the new backend are held back for now.
 `[transfer] content = "initial"` keeps the packs the player accepted from their first backend for the whole session;
 Bifrost answers each target's pack negotiation itself. `"match"` also refuses targets whose packs differ.
 
+## Plugins
+
+Native plugins are shared libraries listed under `[[plugin]] path = "..."`. They load at startup, in order, and
+unload in reverse once every worker has stopped. A plugin exports `bifrost_plugin_init` and talks to Bifrost only
+through the C ABI in [`include/bifrost_plugin.h`](include/bifrost_plugin.h); Zig plugins can use the `bifrost_plugin`
+module instead. [`examples/maintenance.zig`](examples/maintenance.zig) is built with `zig build` and keeps players
+off any backend named `maintenance`.
+
+Plugins get lifecycle and transfer events, can cancel or redirect a transfer before it starts, and can request
+transfers themselves. Callbacks run on worker threads and must not block. Player handles stop working once the player
+leaves.
+
 ## Benchmarks
 
 ```sh

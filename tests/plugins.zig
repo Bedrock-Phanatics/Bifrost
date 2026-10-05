@@ -3,6 +3,8 @@ const bifrost = @import("bifrost");
 const fixtures = @import("support/fixtures.zig");
 const managed = @import("support/managed.zig");
 const Rig = @import("support/rig.zig").Rig;
+const test_options = @import("test_options");
+const header = @import("bifrost_plugin_h");
 
 const abi = bifrost.plugin_abi;
 const io = std.testing.io;
@@ -192,4 +194,53 @@ test "a failed transfer says why" {
     try std.testing.expectEqual(@backingInt(abi.TransferFailure.failed_before_commit), Recorder.failure.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), Recorder.count(.transfer_completed));
     try rig.expectOn(&rig.a);
+}
+
+test "the C header matches the Zig ABI" {
+    inline for (.{
+        .{ abi.Str, header.bifrost_str },
+        .{ abi.Player, header.bifrost_player },
+        .{ abi.Event, header.bifrost_event },
+        .{ abi.TransferDecision, header.bifrost_transfer_decision },
+        .{ abi.Host, header.bifrost_host },
+        .{ abi.Plugin, header.bifrost_plugin },
+    }) |pair| {
+        try std.testing.expectEqual(@sizeOf(pair[0]), @sizeOf(pair[1]));
+        inline for (comptime std.meta.fieldNames(pair[0])) |field| {
+            try std.testing.expectEqual(@offsetOf(pair[0], field), @offsetOf(pair[1], field));
+        }
+    }
+    try expectConstants(abi.Status, "BIFROST_STATUS_");
+    try expectConstants(abi.LogLevel, "BIFROST_LOG_");
+    try expectConstants(abi.EventKind, "BIFROST_EVENT_");
+    try expectConstants(abi.TransferFailure, "BIFROST_FAILURE_");
+    try expectConstants(abi.TransferAction, "BIFROST_TRANSFER_");
+    try std.testing.expectEqual(abi.version, header.BIFROST_ABI_VERSION);
+    try std.testing.expectEqual(abi.no_backend, header.BIFROST_NO_BACKEND);
+    try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .packets = true })), header.BIFROST_CAPABILITY_PACKETS);
+}
+
+fn expectConstants(comptime Enum: type, comptime prefix: []const u8) !void {
+    inline for (comptime std.meta.tags(Enum)) |tag| {
+        const name = comptime upper: {
+            var buffer: [@tagName(tag).len]u8 = undefined;
+            break :upper prefix ++ std.ascii.upperString(&buffer, @tagName(tag));
+        };
+        try std.testing.expectEqual(@as(i64, @backingInt(tag)), @as(i64, @field(header, name)));
+    }
+}
+
+test "the example plugin loads from disk and keeps players off maintenance" {
+    var plugins: bifrost.Plugins = .init(gpa, &.{});
+    defer plugins.deinit();
+    try plugins.open(test_options.example_plugin);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins, .b_name = "maintenance" });
+    defer rig.deinit();
+    plugins.backends = rig.running.proxy.config.backends();
+
+    try rig.transfer(1);
+    try rig.waitFor(.transfers_rejected, 1);
+    try rig.expectOn(&rig.a);
+    try std.testing.expectEqual(@as(u64, 0), rig.stats().transfers_started);
 }

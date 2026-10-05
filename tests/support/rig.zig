@@ -29,6 +29,7 @@ pub const Rig = struct {
         cache: ?bool = null,
         allocator: std.mem.Allocator = std.testing.allocator,
         plugins: ?*bifrost.Plugins = null,
+        b_name: ?[]const u8 = null,
     };
 
     pub fn start(self: *Rig, options: Options) !void {
@@ -48,6 +49,7 @@ pub const Rig = struct {
         proxy_config.transfer_phase_timeout_ms = options.phase_timeout_ms;
         proxy_config.transfer_timeout_ms = options.timeout_ms;
         proxy_config.content_policy = options.content_policy;
+        if (options.b_name) |name| proxy_config.backend_storage[1] = try .init(name, proxy_config.backend_storage[1].address);
         try self.running.startWith(io, options.allocator, proxy_config, .{ .auth = .{ .verify = &self.keys }, .proxy_key = proxy_key, .plugins = options.plugins });
         errdefer self.running.deinit();
         self.player = try Player.connect(io, self.running.address(), 2);

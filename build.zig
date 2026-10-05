@@ -40,6 +40,21 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     b.step("run", "Run Bifrost").dependOn(&run_cmd.step);
 
+    const sdk = b.addModule("bifrost_plugin", .{ .root_source_file = b.path("src/plugin/sdk.zig") });
+    const example_plugin = b.addLibrary(.{ .name = "maintenance", .linkage = .dynamic, .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/maintenance.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "bifrost_plugin", .module = sdk }},
+    }) });
+    b.installArtifact(example_plugin);
+    const plugin_header = b.addTranslateC(.{
+        .root_source_file = b.path("include/bifrost_plugin.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const unit_tests = b.addTest(.{ .root_module = bifrost });
     const integration_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("tests/root.zig"),
@@ -55,7 +70,9 @@ pub fn build(b: *std.Build) void {
     integration_tests.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
     const test_options = b.addOptions();
     test_options.addOption(bool, "report", b.option(bool, "transfer-report", "Print transfer stress timings and memory") orelse false);
+    test_options.addOptionPath("example_plugin", example_plugin.getEmittedBin());
     integration_tests.root_module.addImport("test_options", test_options.createModule());
+    integration_tests.root_module.addImport("bifrost_plugin_h", plugin_header.createModule());
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
