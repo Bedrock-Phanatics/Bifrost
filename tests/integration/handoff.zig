@@ -207,7 +207,7 @@ test "a target that drops right after the switch disconnects the player" {
 }
 
 test "hundreds of round trips keep transfer time and memory flat" {
-    const rounds = 200;
+    const rounds = 200 * test_options.soak;
     const warm_up = 20;
     var counting: FailOnce = .{ .child = std.testing.allocator, .fail_at = std.math.maxInt(usize), .armed = .init(false) };
     var rig: Rig = undefined;
@@ -245,7 +245,7 @@ fn millis(ns: u64) f64 {
 }
 
 test "eight players moving at once keep transfer time and memory flat" {
-    const rounds = 50;
+    const rounds = 50 * test_options.soak;
     const warm_up = 5;
     var counting: FailOnce = .{ .child = std.testing.allocator, .fail_at = std.math.maxInt(usize), .armed = .init(false) };
     var rig: Rig = undefined;

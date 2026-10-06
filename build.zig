@@ -102,12 +102,17 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     integration_tests.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
     const options = b.addOptions();
     options.addOption(bool, "report", b.option(bool, "transfer-report", "Print transfer stress timings and memory") orelse false);
+    options.addOption(u32, "soak", b.option(u32, "soak", "Multiply the transfer stress rounds, e.g. 25 for a soak run") orelse 1);
     options.addOptionPath("example_plugin", plugin.example.getEmittedBin());
     integration_tests.root_module.addImport("test_options", options.createModule());
 
     const step = b.step("test", "Run unit and integration tests");
     step.dependOn(&b.addRunArtifact(unit_tests).step);
     step.dependOn(&b.addRunArtifact(integration_tests).step);
+
+    const stress = b.addRunArtifact(integration_tests);
+    stress.has_side_effects = true;
+    b.step("stress", "Run the integration tests again, never from cache").dependOn(&stress.step);
 }
 
 fn addBench(ctx: Context) void {
