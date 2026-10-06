@@ -20,7 +20,7 @@ const Link = @This();
 const log = std.log.scoped(.link);
 
 const max_polls_per_turn = 4;
-// Each attempt can take a full connect timeout
+// Each dial can take a full connect timeout; past this only health-checked backends are tried
 const max_dial_attempts = 3;
 
 pub const Env = struct {
@@ -92,8 +92,7 @@ pub fn destroy(self: *Link) void {
 
 pub fn connect(self: *Link) (error{NoBackendAvailable} || std.Io.ConcurrentError)!void {
     std.debug.assert(self.dial_task == null and self.backend == null);
-    if (self.tried.count() == max_dial_attempts) return error.NoBackendAvailable;
-    const id = self.env.router.pick(self.tried) orelse return error.NoBackendAvailable;
+    const id = self.env.router.pick(self.tried, self.tried.count() >= max_dial_attempts) orelse return error.NoBackendAvailable;
     self.tried.add(id);
     self.backend_id = id;
     self.env.events.backendSelected(self.player, id.index());

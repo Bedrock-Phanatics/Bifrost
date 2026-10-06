@@ -30,12 +30,13 @@ pub fn init(backends: []const Backend, health: ?*const Health) Router {
     return .{ .backends = backends, .health = health };
 }
 
-pub fn pick(self: *Router, skip: Set) ?Backend.Id {
+pub fn pick(self: *Router, skip: Set, healthy_only: bool) ?Backend.Id {
     for (0..self.backends.len) |_| {
         const id: Backend.Id = .of(self.next);
         self.next = (self.next + 1) % self.backends.len;
         if (skip.contains(id)) continue;
-        if (self.health) |health| if (health.status(id) == .unhealthy) continue;
+        const status = if (self.health) |health| health.status(id) else .unknown;
+        if (status == .unhealthy or (healthy_only and status != .healthy)) continue;
         return id;
     }
     return null;
@@ -54,7 +55,7 @@ fn testBackends(comptime count: usize) ![count]Backend {
 }
 
 fn pickPort(router: *Router) !u16 {
-    return router.get(router.pick(none) orelse return error.NoBackend).address.getPort();
+    return router.get(router.pick(none, false) orelse return error.NoBackend).address.getPort();
 }
 
 test "pick cycles through backends in order" {
@@ -67,9 +68,9 @@ test "pick never returns a skipped backend" {
     const backends = try testBackends(3);
     var router: Router = .init(&backends, null);
     var tried: Set = .{};
-    for (0..backends.len) |_| tried.add(router.pick(tried).?);
+    for (0..backends.len) |_| tried.add(router.pick(tried, false).?);
     try std.testing.expectEqual(backends.len, tried.count());
-    try std.testing.expectEqual(@as(?Backend.Id, null), router.pick(tried));
+    try std.testing.expectEqual(@as(?Backend.Id, null), router.pick(tried, false));
 }
 
 test "pick skips unhealthy backends and fails when none are left" {
@@ -82,5 +83,16 @@ test "pick skips unhealthy backends and fails when none are left" {
 
     health.markFailed(.of(0));
     health.markFailed(.of(2));
-    try std.testing.expectEqual(@as(?Backend.Id, null), router.pick(none));
+    try std.testing.expectEqual(@as(?Backend.Id, null), router.pick(none, false));
+}
+
+test "healthy_only skips backends health checks haven't vouched for" {
+    const backends = try testBackends(2);
+    var health: Health = .init(&backends, 1000, 100);
+    var router: Router = .init(&backends, &health);
+    try std.testing.expectEqual(@as(?Backend.Id, null), router.pick(none, true));
+    health.entries[1].status.store(.healthy, .release);
+    try std.testing.expectEqual(@as(?Backend.Id, .of(1)), router.pick(none, true));
+    var unchecked: Router = .init(&backends, null);
+    try std.testing.expectEqual(@as(?Backend.Id, null), unchecked.pick(none, true));
 }

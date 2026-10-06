@@ -204,6 +204,30 @@ test "a backend that dies after its health check fails over to the next one" {
     try std.testing.expectEqual(@as(u64, 1), running.stats().backends_connected);
 }
 
+test "a healthy backend is still tried after several others fail their dials" {
+    var backends: [4]Backend = undefined;
+    for (&backends) |*backend| try backend.start(io, .{});
+    defer for (&backends) |*backend| backend.deinit();
+    var addresses: [4]std.Io.net.IpAddress = undefined;
+    for (&backends, &addresses) |*backend, *address| address.* = backend.address();
+    const proxy_config = try fixtures.config(&addresses);
+    var health: bifrost.Health = .init(proxy_config.backends(), 60_000, 100);
+    try health.checkAll(io);
+    try std.testing.expectEqual(@as(usize, 4), health.healthyCount());
+    for (backends[0..3]) |*backend| backend.pause();
+
+    var running: Running = undefined;
+    try running.start(io, proxy_config, .{ .health = &health });
+    defer running.deinit();
+    var player: Player = try .connect(io, running.address());
+    defer player.deinit();
+    try player.roundTrip("þhello");
+
+    running.stop();
+    try std.testing.expectEqual(@as(u32, 1), backends[3].connects.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 3), running.stats().backend_failures);
+}
+
 test "a player skips several dead backends before reaching a live one" {
     var silent: Silent = .{};
     defer silent.close();
