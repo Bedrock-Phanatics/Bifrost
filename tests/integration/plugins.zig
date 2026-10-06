@@ -1,8 +1,8 @@
 const std = @import("std");
 const bifrost = @import("bifrost");
-const fixtures = @import("support/fixtures.zig");
-const managed = @import("support/managed.zig");
-const Rig = @import("support/rig.zig").Rig;
+const fixtures = @import("../support/fixtures.zig");
+const managed = @import("../support/managed.zig");
+const Rig = @import("../support/rig.zig").Rig;
 const test_options = @import("test_options");
 const header = @import("bifrost_plugin_h");
 

@@ -22,10 +22,10 @@ Settings live in [`config/bifrost.toml`](config/bifrost.toml).
 - A backend must trust exactly that key as its issuer and keep offline logins disabled. A backend that does not
   will refuse managed players.
 
-Managed players can be moved between backends with `Proxy.requestTransfer`. Bifrost logs in to the target and waits
-for its StartGame while the player stays on the old backend; only then does it switch over. Anything that fails
-before the switch leaves the player where they were. Moving the client's world across is not implemented yet, so
-world packets from the new backend are held back for now.
+Managed players can be moved between backends with `Proxy.requestTransfer` or from a plugin. Bifrost logs in to the
+target while the player stays on the old backend, and only switches once the target has started the game. Anything
+that fails before the switch leaves the player where they were. The switch clears what the old backend left on the
+client and moves it across with a dimension change, so the new world arrives without stale chunks.
 
 `[transfer] content = "initial"` keeps the packs the player accepted from their first backend for the whole session;
 Bifrost answers each target's pack negotiation itself. `"match"` also refuses targets whose packs differ.
@@ -39,8 +39,25 @@ module instead. [`examples/maintenance.zig`](examples/maintenance.zig) is built 
 off any backend named `maintenance`.
 
 Plugins get lifecycle and transfer events, can cancel or redirect a transfer before it starts, and can request
-transfers themselves. Callbacks run on worker threads and must not block. Player handles stop working once the player
-leaves.
+transfers themselves. In managed mode they can also hook individual packets (pass, cancel or replace), register
+commands, send players chat messages and run slow work on task threads. Callbacks run on worker threads and must not
+block; callbacks slower than `[limits] slow_plugin_callback_ms` are logged. Player handles stop working once the
+player leaves.
+
+## Development
+
+```sh
+zig build test                        # unit and integration tests
+zig build test -Doptimize=ReleaseSafe
+```
+
+| path | contents |
+|---|---|
+| `src/` | the proxy, one folder per subsystem |
+| `include/`, `examples/` | the plugin C header and an example plugin |
+| `tests/integration/` | end-to-end tests against real RakNet peers |
+| `tests/support/` | fake players, backends and fixtures shared by tests and benchmarks |
+| `tests/bench/` | the benchmark suite and its baseline |
 
 ## Benchmarks
 
@@ -51,7 +68,7 @@ zig build bench -Doptimize=ReleaseFast -Dscheduling=pinned      # proxy without 
 zig build bench -Doptimize=ReleaseFast -- managed               # passthrough vs managed sessions
 ```
 
-[`bench/baseline.md`](bench/baseline.md) records the numbers later changes are compared against.
+[`tests/bench/baseline.md`](tests/bench/baseline.md) records the numbers later changes are compared against.
 
 The suite starts the real proxy (`Workers` on the same runtime as `bifrost`) as a child process, and drives it with
 RakNet clients and echo backends from the parent. Scenarios: `relay`, `managed`, `handshake`, `connections`, `workers`,

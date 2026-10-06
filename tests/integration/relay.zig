@@ -1,6 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
-const fixtures = @import("support/fixtures.zig");
+const fixtures = @import("../support/fixtures.zig");
 
 const Backend = fixtures.Backend;
 const Running = fixtures.Running;

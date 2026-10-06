@@ -2,16 +2,16 @@ const std = @import("std");
 const bifrost = @import("bifrost");
 
 test {
-    _ = @import("relay.zig");
-    _ = @import("lifecycle.zig");
-    _ = @import("handshake.zig");
-    _ = @import("backends.zig");
-    _ = @import("workers.zig");
-    _ = @import("managed.zig");
-    _ = @import("transfer.zig");
-    _ = @import("content.zig");
-    _ = @import("handoff.zig");
-    _ = @import("plugins.zig");
+    _ = @import("integration/relay.zig");
+    _ = @import("integration/lifecycle.zig");
+    _ = @import("integration/handshake.zig");
+    _ = @import("integration/backends.zig");
+    _ = @import("integration/workers.zig");
+    _ = @import("integration/managed.zig");
+    _ = @import("integration/transfer.zig");
+    _ = @import("integration/content.zig");
+    _ = @import("integration/handoff.zig");
+    _ = @import("integration/plugins.zig");
 }
 
 test "the shipped config parses" {

@@ -1,7 +1,7 @@
 const std = @import("std");
 const bifrost = @import("bifrost");
-const fixtures = @import("support/fixtures.zig");
-const bedrock = @import("support/bedrock.zig");
+const fixtures = @import("../support/fixtures.zig");
+const bedrock = @import("../support/bedrock.zig");
 
 const Backend = fixtures.Backend;
 const Running = fixtures.Running;

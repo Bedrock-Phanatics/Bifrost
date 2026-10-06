@@ -1,9 +1,9 @@
 const std = @import("std");
 const bifrost = @import("bifrost");
-const fixtures = @import("support/fixtures.zig");
-const managed = @import("support/managed.zig");
-const bedrock = @import("support/bedrock.zig");
-const FailOnce = @import("support/FailOnce.zig");
+const fixtures = @import("../support/fixtures.zig");
+const managed = @import("../support/managed.zig");
+const bedrock = @import("../support/bedrock.zig");
+const FailOnce = @import("../support/FailOnce.zig");
 
 const Running = fixtures.Running;
 const gpa = std.testing.allocator;

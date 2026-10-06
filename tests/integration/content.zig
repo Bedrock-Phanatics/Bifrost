@@ -1,8 +1,8 @@
 const std = @import("std");
 const bifrost = @import("bifrost");
-const fixtures = @import("support/fixtures.zig");
-const sample = @import("support/sample.zig");
-const Rig = @import("support/rig.zig").Rig;
+const fixtures = @import("../support/fixtures.zig");
+const sample = @import("../support/sample.zig");
+const Rig = @import("../support/rig.zig").Rig;
 
 const io = std.testing.io;
 const Policy = @FieldType(bifrost.Config, "content_policy");

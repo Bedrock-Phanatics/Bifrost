@@ -26,6 +26,8 @@
         "build.zig.zon",
         "src",
         "config",
+        "include",
+        "examples",
         "README.md",
         "LICENSE",
         "NOTICE",

@@ -1,11 +1,11 @@
 const std = @import("std");
 const bifrost = @import("bifrost");
-const fixtures = @import("support/fixtures.zig");
-const managed = @import("support/managed.zig");
-const FailOnce = @import("support/FailOnce.zig");
+const fixtures = @import("../support/fixtures.zig");
+const managed = @import("../support/managed.zig");
+const FailOnce = @import("../support/FailOnce.zig");
 
 const Running = fixtures.Running;
-const Rig = @import("support/rig.zig").Rig;
+const Rig = @import("../support/rig.zig").Rig;
 const Player = managed.Player;
 const gpa = std.testing.allocator;
 const io = std.testing.io;

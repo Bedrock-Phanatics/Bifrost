@@ -1,10 +1,10 @@
 const std = @import("std");
 const bedwire = @import("bedwire");
 const test_options = @import("test_options");
-const fixtures = @import("support/fixtures.zig");
-const managed = @import("support/managed.zig");
-const FailOnce = @import("support/FailOnce.zig");
-const Rig = @import("support/rig.zig").Rig;
+const fixtures = @import("../support/fixtures.zig");
+const managed = @import("../support/managed.zig");
+const FailOnce = @import("../support/FailOnce.zig");
+const Rig = @import("../support/rig.zig").Rig;
 
 const Player = managed.Player;
 const Vec3f = bedwire.protocol.Vec3f;
