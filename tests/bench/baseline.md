@@ -62,6 +62,33 @@ Joins: 1.9 ms per player passthrough, 15.1 ms managed (token check, proxy login,
 Below the compression threshold managed costs about 5%. Above it, re-compressing every batch makes the proxy
 CPU-bound at roughly a quarter to a third of passthrough; that is the first thing to optimise in managed mode.
 
+## Stability baselines
+
+Recorded 2026-10-06 on WSL2 Ubuntu, 12 logical CPUs, ReleaseFast, 1 worker, loopback, 512 B echoes.
+`zig build bench -Doptimize=ReleaseFast -- relay managed plugins connections` and
+`zig build test -Doptimize=ReleaseFast -Dtransfer-report=true`.
+
+| setup | load | round trips/s | p50 / p95 / p99 us | proxy CPU | memory per player |
+|---|---|---|---|---|---|
+| passthrough | 1x1 | 9215 | 84 / 157 / 198 | 95% | 218.5 KiB RSS, 266.5 KiB heap |
+| passthrough | 8x32 | 44700 | 5057 / 9021 / 11544 | 104% | |
+| managed | 1x1 | 2613 | 350 / 428 / 593 | 77% | 252.5 KiB heap |
+| managed | 8x32 | 11048 | 20382 / 34393 / 45700 | 102% | |
+| managed, 10 plugins without packet hooks | 1x1 | 2962 | 323 / 361 / 399 | 77% | 252.5 KiB heap |
+| managed, 10 plugins without packet hooks | 8x32 | 10862 | 20813 / 36041 / 49083 | 101% | |
+| managed, 1 packet subscriber | 1x1 | 2849 | 329 / 385 / 457 | 75% | 276.5 KiB heap |
+| managed, 1 packet subscriber | 8x32 | 10886 | 20763 / 34992 / 46146 | 104% | |
+
+Managed rows already have transfers available: an idle transfer costs nothing per packet, so there is no separate
+row for it. The packet-subscriber heap includes one ~190 KiB rewrite buffer per worker, spread over 8 players.
+
+| transfers | p50 / p95 / p99 ms | live heap |
+|---|---|---|
+| one player, A↔B 200 times | 33.6 / - / 36.9 | identical after 20 and 200 |
+| 8 players at once, 50 rounds, time for the whole batch | 80.5 / 88.0 / 90.8 | identical after 5 and 50 |
+
+Joins take 1.4 ms passthrough and 14.3 ms managed per player. RSS for managed players is not measured separately.
+
 ## Plugin dispatch
 
 `zig build bench -Doptimize=ReleaseFast -- plugins`. The first table times what a managed relay does per packet for

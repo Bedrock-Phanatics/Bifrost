@@ -617,17 +617,17 @@ fn managedScenario(env: *Env) !void {
         \\re-batches every batch, then compresses and encrypts it again, in both directions. Joins are sequential and
         \\include the full managed login (Microsoft token check, proxy login to the backend, two key exchanges).
         \\
-        \\| payload | load | mode | round trips/s | MiB/s | p50 us | p99 us | proxy CPU |
-        \\|---|---|---|---|---|---|---|---|
+        \\| payload | load | mode | round trips/s | MiB/s | p50 us | p95 us | p99 us | proxy CPU |
+        \\|---|---|---|---|---|---|---|---|---|
         \\
     , .{});
     for (managed_sizes, 0..) |size, s| for (0..2) |loaded| for (std.enums.values(Mode), 0..) |mode, m| {
         const result = results[m][s][loaded];
-        try env.out.print("| {Bi} | {s}{d} | {t} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} | {d:.0} | {d:.0} | {d:.0}% |\n", .{
+        try env.out.print("| {Bi} | {s}{d} | {t} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} | {d:.0} | {d:.0} | {d:.0} | {d:.0}% |\n", .{
             size,                   if (loaded == 1) "8x" else "1x", if (loaded == 1) windowFor(size) else 1,
             mode,                   result.round_trips.median,       result.round_trips.min,
             result.round_trips.max, result.mib_s.median,             result.latency.p50,
-            result.latency.p99,     result.cpu_pct,
+            result.latency.p95,     result.latency.p99,              result.cpu_pct,
         });
     };
     try env.out.print("\nJoin time per player: {d:.1} ms passthrough, {d:.1} ms managed.\n", .{ join_ms[0], join_ms[1] });
@@ -689,16 +689,17 @@ fn pluginsScenario(env: *Env) !void {
         \\
         \\Managed echo relay, 512 B, 1 worker, with the same setups. Here the hot packet is the relayed payload itself.
         \\
-        \\| setup | load | round trips/s | p50 us | p99 us | proxy CPU |
-        \\|---|---|---|---|---|---|
+        \\| setup | load | round trips/s | p50 us | p95 us | p99 us | proxy CPU |
+        \\|---|---|---|---|---|---|---|
         \\
     , .{});
     for (plugin_relays, results) |setup, pair| for (pair, 0..) |result, loaded| {
-        try env.out.print("| {s} | {s} | {d:.0} [{d:.0}-{d:.0}] | {d:.0} | {d:.0} | {d:.0}% |\n", .{
+        try env.out.print("| {s} | {s} | {d:.0} [{d:.0}-{d:.0}] | {d:.0} | {d:.0} | {d:.0} | {d:.0}% |\n", .{
             setup.describe(),          if (loaded == 1) "8x32" else "1x1",
             result.round_trips.median, result.round_trips.min,
             result.round_trips.max,    result.latency.p50,
-            result.latency.p99,        result.cpu_pct,
+            result.latency.p95,        result.latency.p99,
+            result.cpu_pct,
         });
     };
     try env.out.print(

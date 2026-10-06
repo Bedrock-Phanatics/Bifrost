@@ -243,3 +243,58 @@ test "hundreds of round trips keep transfer time and memory flat" {
 fn millis(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
 }
+
+test "eight players moving at once keep transfer time and memory flat" {
+    const rounds = 50;
+    const warm_up = 5;
+    var counting: FailOnce = .{ .child = std.testing.allocator, .fail_at = std.math.maxInt(usize), .armed = .init(false) };
+    var rig: Rig = undefined;
+    try rig.start(.{ .allocator = counting.allocator() });
+    defer rig.deinit();
+    var players: [8]*Player = undefined;
+    players[0] = rig.player;
+    var joined: usize = 1;
+    defer for (players[1..joined]) |player| player.destroy();
+    for (players[1..], 3..) |*player, seed| {
+        player.* = try Player.connect(io, rig.running.address(), @intCast(seed));
+        joined += 1;
+        try player.*.login("Alex", "2535400000000002");
+        try player.*.spawn();
+        // RakNet here never pings, so idle players would hit its 10 s timeout during slow Debug joins
+        for (players[0..joined]) |active| try active.echo("keepalive");
+    }
+    for (players) |player| player.timeout_ms = 2;
+
+    var durations: [rounds]u64 = undefined;
+    var settled: usize = 0;
+    for (1..rounds + 1) |round| {
+        const started = std.Io.Clock.awake.now(io);
+        // Joins alternate between backends, so player n started on backend (n - 1) % 2
+        for (1..players.len + 1) |id| try rig.running.proxy.requestTransfer(id, .of((id - 1 + round) % 2));
+        const target = round * players.len;
+        for (0..5_000) |_| {
+            if (rig.stats().transfers_committed >= target) break;
+            for (players) |player| player.pump() catch |err| if (err != error.NoMessage) return err;
+        } else return error.WaitTimedOut;
+        durations[round - 1] = @intCast(started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+        if (round == warm_up) settled = counting.liveBytes();
+    }
+    const stats = rig.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.transfers_failed_before_commit + stats.transfers_failed_after_commit + stats.transfers_timed_out + stats.transfers_rejected);
+    for (players) |player| player.timeout_ms = 5_000;
+    for (players) |player| try player.echo("still here");
+    const live = counting.liveBytes();
+
+    std.mem.sort(u64, &durations, {}, std.sort.asc(u64));
+    if (test_options.report) std.debug.print("\n{d} rounds of 8 concurrent transfers: p50 {d:.2} ms, p95 {d:.2} ms, p99 {d:.2} ms, live bytes {d} after {d} rounds, {d} after {d}\n", .{
+        rounds,
+        millis(durations[rounds / 2]),
+        millis(durations[rounds * 95 / 100]),
+        millis(durations[rounds * 99 / 100]),
+        settled,
+        warm_up,
+        live,
+        rounds,
+    });
+    try std.testing.expect(live <= settled + 64 * 1024);
+}
