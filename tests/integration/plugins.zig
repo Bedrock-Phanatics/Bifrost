@@ -487,3 +487,31 @@ test "a task still running at shutdown is finished before the plugin unloads" {
     try std.testing.expectEqual(@as(u32, 1), Commander.done_count.load(.acquire));
     try std.testing.expectEqual(@as(i32, @backingInt(abi.Status.stale_handle)), Commander.done_status.load(.acquire));
 }
+
+const Slow = struct {
+    fn init(host_api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("slow");
+        plugin.plugin_version = .of("1.0.0");
+        plugin.capabilities = .{ .packets = true };
+        return host_api.subscribe_packet(host_api.context, .from_player, managed.game_packet_id, .any, .{}, onPacket, null);
+    }
+
+    fn onPacket(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
+        const started = std.Io.Clock.awake.now(io);
+        while (started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3) std.atomic.spinLoopHint();
+        return .pass;
+    }
+};
+
+test "a slow packet callback is measured and the packet still goes through" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{ .slow_callback_ns = std.time.ns_per_ms });
+    defer plugins.deinit();
+    try plugins.add(Slow.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    try rig.expectOn(&rig.a);
+    const totals = plugins.totals(0);
+    try std.testing.expect(totals.max_ns >= 3 * std.time.ns_per_ms);
+    try std.testing.expect(totals.calls >= 2);
+}

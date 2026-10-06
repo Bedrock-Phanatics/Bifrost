@@ -383,7 +383,9 @@ fn hostSubscribe(context: *anyopaque, kind: abi.EventKind, callback: ?abi.EventF
     const owner = loaded.owner;
     if (owner.initializing.load(.acquire) != loaded) return .too_late;
     if (@backingInt(kind) >= abi.EventKind.count) return .invalid_argument;
-    owner.pending.append(owner.gpa, .{ .kind = kind, .subscriber = .{ .callback = callback orelse return .invalid_argument, .user = user } }) catch return .failed;
+    const subscriber: Subscriber = .{ .callback = callback orelse return .invalid_argument, .user = user };
+    for (owner.pending.items) |item| if (item.kind == kind and std.meta.eql(item.subscriber, subscriber)) return .invalid_argument;
+    owner.pending.append(owner.gpa, .{ .kind = kind, .subscriber = subscriber }) catch return .failed;
     return .ok;
 }
 
@@ -393,8 +395,12 @@ fn hostSubscribePacket(context: *anyopaque, direction: abi.Direction, id: u32, p
     if (owner.initializing.load(.acquire) != loaded) return .too_late;
     if (!owner.options.packets) return .unsupported;
     if (@backingInt(direction) > 1 or id >= Packets.id_count or @backingInt(phase) > 2) return .invalid_argument;
+    const packet_callback = callback orelse return .invalid_argument;
+    for (owner.pending_packets.items) |item| {
+        if (item.direction == direction and item.id == id and item.subscriber.callback == packet_callback and item.subscriber.user == user) return .invalid_argument;
+    }
     owner.pending_packets.append(owner.gpa, .{ .direction = direction, .id = @intCast(id), .subscriber = .{
-        .callback = callback orelse return .invalid_argument,
+        .callback = packet_callback,
         .user = user,
         .phase = phase,
         .validated = flags.validated,
@@ -545,6 +551,25 @@ const Probe = struct {
         return host.subscribe(host.context, .player_connected, onEvent, null);
     }
 
+    fn doubled(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        describe(plugin, 6);
+        seen_host = host.*;
+        if (host.subscribe(host.context, .player_connected, onEvent, null) != .ok) return .failed;
+        if (host.subscribe(host.context, .player_connected, onEvent, null) != .invalid_argument) return .failed;
+        if (host.subscribe_packet(host.context, .from_player, 7, .any, .{}, onPacket, null) != .ok) return .failed;
+        if (host.subscribe_packet(host.context, .from_player, 7, .in_game, .{}, onPacket, null) != .invalid_argument) return .failed;
+        if (host.register_command(host.context, .of("probe"), onCommand, null) != .ok) return .failed;
+        return .ok;
+    }
+
+    fn onPacket(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
+        return .pass;
+    }
+
+    fn onCommand(_: ?*anyopaque, _: *const abi.Command) callconv(.c) void {
+        events += 1;
+    }
+
     fn second(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
         describe(plugin, 2);
         return host.subscribe(host.context, .player_connected, onEvent, null);
@@ -630,4 +655,35 @@ test "host calls check handles and backends" {
     plugins.handles.release(player);
     try testing.expectEqual(abi.Status.stale_handle, host.transfer(host.context, player, 0));
     try testing.expectEqual(abi.Status.stale_handle, host.player_name(host.context, player, &name, name.len, &len));
+}
+
+test "duplicate subscriptions are refused and random host input only gets a status back" {
+    Probe.reset();
+    const backends = [_]Backend{try .init("lobby", .{ .ip4 = .loopback(19133) })};
+    var plugins: Plugins = try .init(testing.allocator, &backends, .{});
+    defer plugins.deinit();
+    try plugins.add(Probe.doubled, null);
+    const host = Probe.seen_host.?;
+    try testing.expectEqual(@as(usize, 1), plugins.subscribers[@backingInt(abi.EventKind.player_connected)].items.len);
+
+    var prng: std.Random.DefaultPrng = .init(0xab1);
+    var line: [48]u8 = undefined;
+    var name: [8]u8 = undefined;
+    var name_len: usize = 0;
+    for (0..20_000) |_| {
+        const random = prng.random();
+        const text = line[0..random.uintAtMost(usize, line.len)];
+        for (text) |*char| char.* = "/ probePROBE\x00\xff"[random.uintLessThan(usize, 14)];
+        _ = plugins.runCommand(0, testing.io, .{ .id = random.int(u64) }, text);
+        const player: abi.Player = .{ .id = random.int(u64) };
+        try testing.expectEqual(abi.Status.stale_handle, host.player_name(host.context, player, &name, name.len, &name_len));
+        const status = host.transfer(host.context, player, random.int(u32));
+        try testing.expect(status == .stale_handle or status == .invalid_argument);
+        try testing.expect(host.send_message(host.context, player, .of(text)) != .ok);
+        try testing.expectEqual(abi.Status.unsupported, host.spawn_task(host.context, player, null, null, null));
+    }
+    const before = Probe.events;
+    try testing.expect(plugins.runCommand(0, testing.io, .{}, "  /PROBE  now "));
+    try testing.expectEqual(before + 1, Probe.events);
+    try testing.expect(!plugins.runCommand(0, testing.io, .{}, "/probes"));
 }

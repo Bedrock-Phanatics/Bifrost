@@ -116,3 +116,20 @@ test "malformed documents are rejected" {
     deep[deep.len - 2 ..][0..2].* = .{ 1, 0 };
     try std.testing.expectError(error.NbtTooDeep, hash(&deep));
 }
+
+test "arbitrary and deeply nested input is rejected without crashing" {
+    var prng: std.Random.DefaultPrng = .init(0x4e42);
+    var bytes: [256]u8 = undefined;
+    for (0..50_000) |_| {
+        const random = prng.random();
+        const input = bytes[0..random.uintAtMost(usize, bytes.len)];
+        random.bytes(input);
+        if (input.len != 0 and random.boolean()) input[0] = 10;
+        _ = hash(input) catch {};
+    }
+    const levels = 200;
+    var nested: [3 * levels]u8 = undefined;
+    for (0..levels) |i| nested[i * 2 ..][0..2].* = .{ 10, 0 };
+    @memset(nested[2 * levels ..], 0);
+    try std.testing.expectError(error.NbtTooDeep, hash(&nested));
+}

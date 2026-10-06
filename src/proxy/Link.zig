@@ -46,6 +46,7 @@ env: *const Env,
 session: ?*raknet.Session,
 backend: ?*raknet.Client = null,
 backend_closing: bool = false,
+backend_error: ?anyerror = null,
 dial: Dial = .{},
 backend_id: Backend.Id = .of(0),
 dial_task: ?std.Io.Future(void) = null,
@@ -182,6 +183,10 @@ pub fn service(self: *Link) error{Canceled}!void {
             else => return if (self.backend_closing) self.dropBackend() else self.fail(err),
         };
     }
+    if (self.backend_error) |err| {
+        self.backend_error = null;
+        return self.fail(err);
+    }
     if (client.isClosed()) return if (self.backend_closing) self.dropBackend() else self.fail(error.ConnectionClosed);
     if (self.transfer) |transfer| if (self.session) |session| transfer.syncClient(self.transferHost(session)) catch |err| return self.fail(err);
     self.watch.arm(self.env.io, client, Scheduler.linkNotify(self)) catch |err| return self.fail(err);
@@ -283,15 +288,23 @@ fn ends(self: *Link, session: *raknet.Session) Managed.Ends {
     return .{ .io = self.env.io, .stats = self.env.stats, .player = session, .backend = if (self.backend_closing) null else self.backend };
 }
 
+// Errors wait for the poll to end; returning one would drop the backend without telling it
 fn onBackendMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
     const self: *Link = @ptrCast(@alignCast(context));
-    const session = self.session orelse return error.ApplicationFailure;
+    if (self.backend_error != null) return;
+    const session = self.session orelse return;
     if (self.managed) |managed| return managed.fromBackend(self.ends(session), payload.bytes) catch |err| {
         log.debug("managed session failed: {t}", .{err});
-        return error.ApplicationFailure;
+        self.backend_error = err;
     };
-    if (self.observer.watching and self.observe(.server_to_client, payload.bytes).rejects()) return error.ApplicationFailure;
-    session.send(payload.bytes, .reliable_ordered, 0) catch return error.ApplicationFailure;
+    if (self.observer.watching and self.observe(.server_to_client, payload.bytes).rejects()) {
+        self.backend_error = error.LoginRejected;
+        return;
+    }
+    session.send(payload.bytes, .reliable_ordered, 0) catch |err| {
+        self.backend_error = err;
+        return;
+    };
     self.env.stats.bump(.bytes_to_player, payload.bytes.len);
 }
 

@@ -251,3 +251,55 @@ test "subscribers for a packet run in order, chain replacements and stop at a ca
     try testing.expectEqual(Result.pass, run(&table, call, &.{ 0x06, 0x00 }, scratch, AllValid{}));
     try testing.expectEqual(Result.pass, run(&table, call, &.{0x85}, scratch, AllValid{}));
 }
+
+const Chaos = struct {
+    var prng: std.Random.DefaultPrng = .init(0);
+
+    fn act(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const random = prng.random();
+        switch (random.uintLessThan(u8, 4)) {
+            0 => return .pass,
+            1 => return .cancel,
+            2 => {
+                packet.replacement_len = random.uintAtMost(usize, packet.replacement_capacity + 16);
+                random.bytes(packet.replacement.?[0..@min(packet.replacement_len, packet.replacement_capacity)]);
+                return .replace;
+            },
+            else => return @fromBackingInt(@intCast(random.int(u32))),
+        }
+    }
+};
+
+const Coin = struct {
+    fn valid(_: Coin, bytes: []const u8) bool {
+        return bytes.len % 3 != 0;
+    }
+};
+
+test "dispatch survives arbitrary packets and plugin answers" {
+    const gpa = testing.allocator;
+    var metrics: [1]Metrics = .{.{}};
+    var registrations: [8]Registration = undefined;
+    for (&registrations, 0..) |*item, i| item.* = .{ .direction = .from_player, .id = @intCast(i % 3), .subscriber = testSubscriber(Chaos.act, 0, &metrics) };
+    var table: Table = try .build(gpa, .from_player, &registrations);
+    defer table.deinit(gpa);
+    const scratch = try gpa.alloc(u8, scratch_bytes);
+    defer gpa.free(scratch);
+    const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    var bytes: [300]u8 = undefined;
+    for (0..20_000) |_| {
+        const random = prng.random();
+        const packet = bytes[0..random.uintAtMost(usize, bytes.len)];
+        random.bytes(packet);
+        if (packet.len != 0 and random.boolean()) packet[0] = random.uintLessThan(u8, 3);
+        switch (run(&table, call, packet, scratch, Coin{})) {
+            .pass, .cancel => {},
+            .replace => |replacement| {
+                try testing.expect(replacement.len <= max_replacement and replacement.len != 0);
+                try testing.expect(replacement.ptr == scratch.ptr);
+            },
+        }
+    }
+}

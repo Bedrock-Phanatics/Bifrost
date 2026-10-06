@@ -192,12 +192,13 @@ fn incompatibility(self: *const Transfer, managed: *const Managed) ?content.Mism
     };
 }
 
+// Returning an error would make RakNet drop the target without telling it
 fn onTargetMessage(opaque_self: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
     const self: *Transfer = @ptrCast(@alignCast(opaque_self));
+    if (self.seen.failed) return;
     self.receive(self.host.?, payload.bytes) catch |err| {
         log.info("transfer {d}: target failed: {t}", .{ self.state.epoch, err });
         self.seen.failed = true;
-        return error.ApplicationFailure;
     };
 }
 

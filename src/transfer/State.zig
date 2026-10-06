@@ -213,3 +213,29 @@ test "each phase gets its own deadline under the overall one" {
     _ = state.apply(.dialed, 50 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u64, 200 * std.time.ns_per_ms), state.nextDeadline());
 }
+
+test "random event streams never move backwards or report an outcome for the wrong side of the commit" {
+    var prng: std.Random.DefaultPrng = .init(0x7a5f);
+    const events = std.enums.values(Event);
+    for (0..20_000) |_| {
+        const random = prng.random();
+        var state: State = .init(1, .{ .dial_ms = 10, .phase_ms = 10, .total_ms = 100 }, 0);
+        for (0..32) |_| {
+            const before = state.phase;
+            const step = state.apply(events[random.uintLessThan(usize, events.len)], random.uintAtMost(u64, 200 * std.time.ns_per_ms));
+            try std.testing.expect(@backingInt(state.phase) >= @backingInt(before));
+            if (step.outcome) |outcome| switch (outcome) {
+                .committed, .failed_after_commit => try std.testing.expect(before.committed()),
+                .failed_before_commit => try std.testing.expect(!before.committed()),
+                .timed_out => {},
+            };
+            switch (step.action) {
+                .roll_back => try std.testing.expect(!before.committed()),
+                .finish, .disconnect, .abandon => {},
+                else => continue,
+            }
+            try std.testing.expect(step.outcome != null);
+            break;
+        }
+    }
+}

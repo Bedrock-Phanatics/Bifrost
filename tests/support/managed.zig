@@ -294,7 +294,7 @@ pub const Backend = struct {
         carrier: *raknet.Session,
     };
 
-    pub const Mode = enum { normal, silent_login, kick_login, silent_stack, kick_packs, welcome, flood, chatter, spawn_first };
+    pub const Mode = enum { normal, silent_login, kick_login, silent_stack, kick_packs, welcome, flood, chatter, spawn_first, early_start, double_stack };
     pub const scene_entities = 200;
 
     io: std.Io,
@@ -499,6 +499,11 @@ pub const Backend = struct {
                 try sendScene(connection);
                 continue;
             }
+            if (std.mem.endsWith(u8, packet.bytes, "late")) {
+                var items: [256]u8 = undefined;
+                try sendFrame(session, carrier, &.{try sample.itemRegistry(&items, .{ .custom_item = "custom:late" })});
+                continue;
+            }
             _ = self.echoes.fetchAdd(1, .release);
             try sendFrame(session, carrier, &.{packet.bytes});
             continue;
@@ -544,7 +549,16 @@ pub const Backend = struct {
                 const status = try typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } });
                 if (self.mode == .silent_stack) return sendFrame(session, carrier, &.{status});
                 var stack: [128]u8 = undefined;
-                try sendFrame(session, carrier, &.{ status, try sample.packStack(&stack, self.content) });
+                const packs = try sample.packStack(&stack, self.content);
+                switch (self.mode) {
+                    .early_start => {
+                        try session.advance(.waiting_for_start_game);
+                        var start_buffer: [1024]u8 = undefined;
+                        return sendFrame(session, carrier, &.{ status, try sample.startGame(&start_buffer, self.content) });
+                    },
+                    .double_stack => return sendFrame(session, carrier, &.{ status, packs, packs }),
+                    else => try sendFrame(session, carrier, &.{ status, packs }),
+                }
             },
             .resource_pack_client_response => {
                 if (self.mode == .kick_packs) return carrier.close();

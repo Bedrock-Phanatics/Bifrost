@@ -71,3 +71,21 @@ test "ids swap both ways and other packets are left alone" {
     try std.testing.expectEqual(@as(?[]const u8, null), try swap.apply(&.{ 0x13, 0x05 }, &out));
     try std.testing.expectError(error.MalformedPacket, swap.apply(&.{ 0x13, 0x80 }, &out));
 }
+
+test "arbitrary packets are either swapped, left alone or rejected" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var prng: std.Random.DefaultPrng = .init(0x51d);
+    var bytes: [64]u8 = undefined;
+    for (0..50_000) |_| {
+        const random = prng.random();
+        const packet = bytes[0..random.uintAtMost(usize, bytes.len)];
+        random.bytes(packet);
+        out.clearRetainingCapacity();
+        try out.ensureTotalCapacity(gpa, packet.len + max_growth);
+        const swap: Swap = .{ .a = random.uintAtMost(u64, 300), .b = random.int(u64) };
+        const swapped = swap.apply(packet, &out) catch continue;
+        if (swapped) |result| try std.testing.expect(result.len <= packet.len + max_growth);
+    }
+}

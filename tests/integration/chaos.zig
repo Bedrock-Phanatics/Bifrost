@@ -110,3 +110,28 @@ test "stopping the proxy while the client syncs frees both backends" {
     try fixtures.waitFor(io, &rig.a.disconnects, 1);
     try fixtures.waitFor(io, &rig.b.disconnects, 1);
 }
+
+test "a target that breaks the join order is rolled back" {
+    for ([_]managed.Backend.Mode{ .early_start, .double_stack }) |mode| {
+        var rig: Rig = undefined;
+        try rig.start(.{ .b = mode });
+        defer rig.deinit();
+        try rig.transfer(1);
+        try rig.waitFor(.transfers_failed_before_commit, 1);
+        try rig.expectOn(&rig.a);
+        try fixtures.waitFor(io, &rig.b.disconnects, 1);
+    }
+}
+
+test "a backend whose packets break the session is told at once" {
+    var rig: Rig = undefined;
+    try rig.start(.{});
+    defer rig.deinit();
+    try rig.transfer(1);
+    try rig.waitFor(.transfers_committed, 1);
+
+    var buffer: [16]u8 = undefined;
+    try rig.player.send(&.{try managed.rawPacket(&buffer, managed.game_packet_id, "late")});
+    try rig.player.awaitClosed();
+    try fixtures.waitFor(io, &rig.b.disconnects, 1);
+}

@@ -125,3 +125,27 @@ test "a released handle goes stale even after its slot is reused" {
     try std.testing.expectEqual(@as(?Route, null), handles.route(.{}));
     try std.testing.expectEqual(@as(?Route, null), handles.route(.{ .id = 99 }));
 }
+
+test "random acquire and release never resolve a released handle" {
+    const gpa = std.testing.allocator;
+    var handles: Handles = .{};
+    defer handles.deinit(gpa);
+    var context: u8 = 0;
+    var live: std.ArrayList(abi.Player) = .empty;
+    defer live.deinit(gpa);
+    var dead: std.ArrayList(abi.Player) = .empty;
+    defer dead.deinit(gpa);
+    var prng: std.Random.DefaultPrng = .init(0x4a4d);
+    for (0..20_000) |step| {
+        const random = prng.random();
+        if (live.items.len != 0 and random.boolean()) {
+            const player = live.swapRemove(random.uintLessThan(usize, live.items.len));
+            handles.release(player);
+            try dead.append(gpa, player);
+        } else {
+            try live.append(gpa, try handles.acquire(gpa, .{ .context = &context, .link = step, .transfer = noTransfer }));
+        }
+    }
+    for (live.items) |player| try std.testing.expect(handles.route(player) != null);
+    for (dead.items) |player| try std.testing.expectEqual(@as(?Route, null), handles.route(player));
+}
