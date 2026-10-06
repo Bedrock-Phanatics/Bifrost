@@ -177,6 +177,7 @@ pub const Proxy = struct {
         connect_timeout_ms: u32 = 1_000,
         health_interval_ms: u32 = 1_000,
         managed: bool = false,
+        plugins: []const u8 = "none",
         backends: []const u16,
     };
 
@@ -190,7 +191,7 @@ pub const Proxy = struct {
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.workers}));
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.connect_timeout_ms}));
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.health_interval_ms}));
-        try argv.append(gpa, try gpa.dupe(u8, if (options.managed) "managed" else "passthrough"));
+        try argv.append(gpa, if (options.managed) try std.fmt.allocPrint(gpa, "managed+{s}", .{options.plugins}) else try gpa.dupe(u8, "passthrough"));
         for (options.backends) |port| try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{port}));
 
         self.io = io;

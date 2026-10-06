@@ -72,7 +72,7 @@ zig build bench -Doptimize=ReleaseFast -- managed               # passthrough vs
 
 The suite starts the real proxy (`Workers` on the same runtime as `bifrost`) as a child process, and drives it with
 RakNet clients and echo backends from the parent. Scenarios: `relay`, `managed`, `handshake`, `connections`, `workers`,
-`backends`.
+`backends`, `plugins`.
 RSS, CPU and kernel drop counts need Linux; elsewhere only the single-worker numbers are meaningful.
 
 Representative results from one run: WSL2 Ubuntu on 12 logical CPUs, ReleaseFast, loopback, with the clients and

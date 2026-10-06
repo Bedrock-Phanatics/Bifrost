@@ -62,6 +62,26 @@ Joins: 1.9 ms per player passthrough, 15.1 ms managed (token check, proxy login,
 Below the compression threshold managed costs about 5%. Above it, re-compressing every batch makes the proxy
 CPU-bound at roughly a quarter to a third of passthrough; that is the first thing to optimise in managed mode.
 
+## Plugin dispatch
+
+`zig build bench -Doptimize=ReleaseFast -- plugins`. The first table times what a managed relay does per packet for
+plugins, in-process, over a stream that alternates the hot packet with another one. Callbacks do nothing, so a
+callback's cost is the table lookup, its two clock reads and its metrics. The bench prints `OVER` when a setup exceeds
+its budget.
+
+| setup | ns per callback, Windows / WSL2 | budget |
+|---|---|---|
+| 0 plugins | 0 (0.5 ns per packet total) | 2 ns |
+| 10 plugins, no packet subscriptions | 0 | 2 ns |
+| 1 raw subscriber on the hot packet | 49 / 52 | 100 ns |
+| 1 decoded subscriber on the hot packet | 86 / 88 | 200 ns |
+| 10 subscribers on different packet ids | 49 / 55 | 100 ns |
+| 10 subscribers on the same hot packet | 52 / 54 | 100 ns |
+
+End to end (managed echo, 512 B, WSL2) every setup stays within run-to-run noise of 0 plugins: 2.6k to 2.8k round
+trips/s at 1x1 with p99 423 to 454 us, and 9.7k to 10.8k round trips/s at 8x32. Managed re-compression costs
+microseconds per batch, so a few callbacks per packet don't show. Windows end-to-end runs vary more than the setups do.
+
 ## Transfers
 
 `zig build test -Doptimize=ReleaseFast -Dtransfer-report=true`. The stress test moves one player A↔B 200 times and

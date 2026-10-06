@@ -6,6 +6,7 @@ const bench_options = @import("bench_options");
 const sample = @import("sample");
 const harness = @import("harness.zig");
 const managed = @import("managed.zig");
+const bench_plugins = @import("plugins.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -21,11 +22,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|managed|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|managed|plugins|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "managed", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "managed", "plugins", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -100,6 +101,7 @@ pub fn main(init: std.process.Init) !void {
     for (selected.items) |name| {
         if (std.mem.eql(u8, name, "relay")) try relayScenario(&env);
         if (std.mem.eql(u8, name, "managed")) try managedScenario(&env);
+        if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
         if (std.mem.eql(u8, name, "connections")) try connectionsScenario(&env);
         if (std.mem.eql(u8, name, "workers")) try workersScenario(&env);
@@ -149,7 +151,7 @@ const Memory = struct {
     churn_heap: [3]u64 = @splat(0),
 };
 
-/// args: workers connect_timeout_ms health_interval_ms passthrough|managed backend_port...
+/// args: workers connect_timeout_ms health_interval_ms passthrough|managed+<plugin setup> backend_port...
 fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len < 5) return error.InvalidArguments;
     var config: bifrost.Config = .{ .bind = harness.loopback(0), .max_players = 16_384 };
@@ -161,9 +163,13 @@ fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
     var keys = try sample.keySet(init.gpa);
     defer keys.deinit();
     var options: bifrost.Workers.Options = .{};
-    if (std.mem.eql(u8, args[3], "managed")) {
+    var plugins: bifrost.Plugins = try .init(init.gpa, config.backends(), .{ .workers = config.workers });
+    defer plugins.deinit();
+    if (std.mem.startsWith(u8, args[3], "managed+")) {
         config.session_mode = .managed;
-        options = .{ .auth = .{ .verify = &keys }, .proxy_key = managed.proxyKey() };
+        options = .{ .auth = .{ .verify = &keys }, .proxy_key = managed.proxyKey(), .plugins = &plugins };
+        const setup = bench_plugins.parse(args[3]["managed+".len..]) orelse return error.InvalidArguments;
+        try bench_plugins.load(&plugins, setup, bench_plugins.relay_packet_id);
     }
 
     // Same runtime setup as the real binary
@@ -560,6 +566,73 @@ fn managedScenario(env: *Env) !void {
         });
     };
     try env.out.print("\nJoin time per player: {d:.1} ms passthrough, {d:.1} ms managed.\n", .{ join_ms[0], join_ms[1] });
+}
+
+const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot };
+
+fn pluginsScenario(env: *Env) !void {
+    const dispatch = try bench_plugins.dispatch(env.gpa, env.io, env.quick);
+    try env.out.print(
+        \\
+        \\## Plugin packet dispatch
+        \\
+        \\Per-packet work a managed relay adds for plugins, in-process: the table check, and the callbacks when someone
+        \\subscribed. The stream alternates a text packet (the hot packet here) and a 64 B raw packet. Callbacks do
+        \\nothing, so the cost is dispatch, timing and metrics. Decoded subscribers get the packet only after a full decode.
+        \\
+        \\| setup | ns per packet | added ns | ns per callback | budget |
+        \\|---|---|---|---|---|
+        \\
+    , .{});
+    for (dispatch) |result| {
+        const callbacks = result.setup.callbacksPerPacket();
+        const cost = if (callbacks == 0) result.extra_ns else result.extra_ns / callbacks;
+        const budget = result.setup.budgetNs();
+        try env.out.print("| {s} | {d:.1} | {d:.1} | {d:.1} | {s} {d:.0} ns |\n", .{
+            result.setup.describe(),              result.ns_per_packet,
+            result.extra_ns,                      cost,
+            if (cost <= budget) "ok" else "OVER", budget,
+        });
+    }
+
+    var results: [plugin_relays.len][2]RelayResult = undefined;
+    for (plugin_relays, &results) |setup, *result| {
+        var echo: managed.Backend = undefined;
+        try echo.start(env.gpa, env.io);
+        defer echo.deinit();
+        var proxy: Proxy = undefined;
+        try env.startProxy(&proxy, .{ .backends = &.{echo.port()}, .managed = true, .plugins = @tagName(setup) });
+        defer proxy.stop();
+        const players = try env.gpa.alloc(Player, 8);
+        var joined: usize = 0;
+        defer {
+            for (players[0..joined]) |*player| player.deinit();
+            env.gpa.free(players);
+        }
+        for (players, 0..) |*player, i| {
+            try player.connect(env.gpa, env.io, proxy.address());
+            joined += 1;
+            try managed.join(env.gpa, env.io, player, @intCast(i + 2));
+        }
+        result[0] = try relay(env, &proxy, players[0..1], 512, 1);
+        result[1] = try relay(env, &proxy, players, 512, windowFor(512));
+    }
+    try env.out.print(
+        \\
+        \\Managed echo relay, 512 B, 1 worker, with the same setups. Here the hot packet is the relayed payload itself.
+        \\
+        \\| setup | load | round trips/s | p50 us | p99 us | proxy CPU |
+        \\|---|---|---|---|---|---|
+        \\
+    , .{});
+    for (plugin_relays, results) |setup, pair| for (pair, 0..) |result, loaded| {
+        try env.out.print("| {s} | {s} | {d:.0} [{d:.0}-{d:.0}] | {d:.0} | {d:.0} | {d:.0}% |\n", .{
+            setup.describe(),          if (loaded == 1) "8x32" else "1x1",
+            result.round_trips.median, result.round_trips.min,
+            result.round_trips.max,    result.latency.p50,
+            result.latency.p99,        result.cpu_pct,
+        });
+    };
 }
 
 /// Proxy CPU while connected players send nothing; should be close to zero
