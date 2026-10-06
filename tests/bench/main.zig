@@ -22,11 +22,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|managed|plugins|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|plugins|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "managed", "plugins", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "plugins", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -100,6 +100,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (selected.items) |name| {
         if (std.mem.eql(u8, name, "relay")) try relayScenario(&env);
+        if (std.mem.eql(u8, name, "fairness")) try fairnessScenario(&env);
         if (std.mem.eql(u8, name, "managed")) try managedScenario(&env);
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
@@ -445,6 +446,70 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
     };
 }
 
+const Mixed = struct { light: Percentiles, hot: ?Percentiles };
+
+fn mixedRelay(env: *Env, players: []Player, light_count: usize) !Mixed {
+    const gpa = env.gpa;
+    const io = env.io;
+    const jobs = try gpa.alloc(RelayJob, players.len);
+    defer gpa.free(jobs);
+    for (jobs, players, 0..) |*job, *player, i| {
+        const light = i < light_count;
+        const payload = try gpa.alloc(u8, if (light) 64 else 512);
+        @memset(payload, 0x5a);
+        payload[0] = 0xfe;
+        job.* = .{ .io = io, .player = player, .payload = payload, .window = if (light) 1 else 32, .until_ns = 0 };
+        job.recorder.latencies_ns = try .initCapacity(gpa, 1 << 18);
+    }
+    defer for (jobs) |*job| {
+        gpa.free(job.payload);
+        job.recorder.deinit(gpa);
+    };
+    var light: std.ArrayList(u64) = .empty;
+    defer light.deinit(gpa);
+    var hot: std.ArrayList(u64) = .empty;
+    defer hot.deinit(gpa);
+    for (0..env.iterations() + 1) |iteration| {
+        const started = nowNs(io);
+        const duration_ms = if (iteration == 0) env.warmupMs() else env.iterationMs();
+        for (jobs) |*job| {
+            job.until_ns = started + duration_ms * std.time.ns_per_ms;
+            job.recorder.latencies_ns.clearRetainingCapacity();
+        }
+        var group: std.Io.Group = .init;
+        for (jobs) |*job| group.concurrent(io, RelayJob.run, .{job}) catch RelayJob.run(job);
+        try group.await(io);
+        if (iteration == 0) continue;
+        for (jobs, 0..) |*job, i| try (if (i < light_count) &light else &hot).appendSlice(gpa, job.recorder.latencies_ns.items);
+    }
+    return .{ .light = .of(light.items), .hot = if (hot.items.len == 0) null else .of(hot.items) };
+}
+
+fn fairnessScenario(env: *Env) !void {
+    var backends: Backends = try .start(env, 1);
+    defer backends.deinit(env);
+    var proxy: Proxy = undefined;
+    try env.startProxy(&proxy, .{ .backends = backends.ports[0..1] });
+    defer proxy.stop();
+    const players = try joinedPlayers(env, proxy.address(), 8);
+    defer leave(env, players);
+
+    const alone = try mixedRelay(env, players[0..4], 4);
+    const loaded = try mixedRelay(env, players, 4);
+    try env.out.print(
+        \\
+        \\## Fairness
+        \\
+        \\4 light players (64 B, 1 in flight) alone, then next to 4 hot players (512 B, 32 in flight), 1 worker, passthrough.
+        \\
+        \\| run | light p50 us | light p99 us | hot p50 us | hot p99 us |
+        \\|---|---|---|---|---|
+        \\| alone | {d:.0} | {d:.0} | - | - |
+        \\| with hot players | {d:.0} | {d:.0} | {d:.0} | {d:.0} |
+        \\
+    , .{ alone.light.p50, alone.light.p99, loaded.light.p50, loaded.light.p99, loaded.hot.?.p50, loaded.hot.?.p99 });
+}
+
 fn windowFor(size: usize) usize {
     return std.math.clamp(256 * 1024 / size, 1, 32);
 }
@@ -596,13 +661,15 @@ fn pluginsScenario(env: *Env) !void {
     }
 
     var results: [plugin_relays.len][2]RelayResult = undefined;
-    for (plugin_relays, &results) |setup, *result| {
+    var heaps: [plugin_relays.len][2]u64 = undefined;
+    for (plugin_relays, &results, &heaps) |setup, *result, *heap| {
         var echo: managed.Backend = undefined;
         try echo.start(env.gpa, env.io);
         defer echo.deinit();
         var proxy: Proxy = undefined;
         try env.startProxy(&proxy, .{ .backends = &.{echo.port()}, .managed = true, .plugins = @tagName(setup) });
         defer proxy.stop();
+        heap[0] = (try proxy.stats()).heap_bytes;
         const players = try env.gpa.alloc(Player, 8);
         var joined: usize = 0;
         defer {
@@ -614,6 +681,7 @@ fn pluginsScenario(env: *Env) !void {
             joined += 1;
             try managed.join(env.gpa, env.io, player, @intCast(i + 2));
         }
+        heap[1] = ((try proxy.stats()).heap_bytes - heap[0]) / players.len;
         result[0] = try relay(env, &proxy, players[0..1], 512, 1);
         result[1] = try relay(env, &proxy, players, 512, windowFor(512));
     }
@@ -633,6 +701,13 @@ fn pluginsScenario(env: *Env) !void {
             result.latency.p99,        result.cpu_pct,
         });
     };
+    try env.out.print(
+        \\
+        \\| setup | heap of a fresh managed proxy | heap per managed player |
+        \\|---|---|---|
+        \\
+    , .{});
+    for (plugin_relays, heaps) |setup, heap| try env.out.print("| {s} | {Bi:.1} | {Bi:.1} |\n", .{ setup.describe(), heap[0], heap[1] });
 }
 
 /// Proxy CPU while connected players send nothing; should be close to zero

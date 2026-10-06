@@ -82,6 +82,25 @@ End to end (managed echo, 512 B, WSL2) every setup stays within run-to-run noise
 trips/s at 1x1 with p99 423 to 454 us, and 9.7k to 10.8k round trips/s at 8x32. Managed re-compression costs
 microseconds per batch, so a few callbacks per packet don't show. Windows end-to-end runs vary more than the setups do.
 
+Heap of a managed proxy (WSL2): 16.6 MiB fresh, 252 KiB per managed player. Idle plugins add nothing; packet
+subscribers add one ~190 KiB rewrite buffer per worker.
+
+## Load audit
+
+Recorded 2026-10-05 on WSL2, ReleaseFast. Nothing here needed a change.
+
+Fairness (`-- fairness`): 4 light players (64 B, 1 in flight) next to 4 hot ones (512 B, 32 in flight) on 1 worker see
+the same latency as the hot players, p50 3.3 ms and p99 4.3 ms, against 0.35 / 0.70 ms alone. Every packet waits
+behind the same listener socket and saturated worker, so reordering the ready list cannot help.
+
+Scheduling (`-- workers managed --quick`, both `-Dscheduling` values): pinned loses at every worker count above one,
+17k against 63k round trips/s at 2 workers and 92k against 147k at 8, with p99 8.8 ms against 3.7 ms at 8. Managed
+single-worker numbers are the same either way. Work stealing stays the default.
+
+Queues: every queue has a packet and a byte limit. Copying each packet into its own allocation costs 0.7 us per
+64 x 512 B burst against 27 us for one growing buffer when the queue is new, as it is for the initial-dial queue, so
+`PacketQueue` stays as it is.
+
 ## Transfers
 
 `zig build test -Doptimize=ReleaseFast -Dtransfer-report=true`. The stress test moves one player A↔B 200 times and
