@@ -22,11 +22,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|fairness|managed|plugins|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "plugins", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -102,6 +102,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "relay")) try relayScenario(&env);
         if (std.mem.eql(u8, name, "fairness")) try fairnessScenario(&env);
         if (std.mem.eql(u8, name, "managed")) try managedScenario(&env);
+        if (std.mem.eql(u8, name, "deflate")) try deflateScenario(&env);
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
         if (std.mem.eql(u8, name, "connections")) try connectionsScenario(&env);
@@ -215,6 +216,8 @@ fn snapshot(io: std.Io, workers: *bifrost.Workers, heap: *const harness.Counting
         .handshakes = totals.handshakes_observed,
         .gave_up = totals.observer_gave_up,
         .heap_bytes = heap.live.load(.monotonic),
+        .relayed = totals.managed_relayed_batches,
+        .decoded = totals.managed_decoded_batches,
         .workers = workers.proxies.len,
     };
     for (workers.proxies, 0..) |proxy, i| {
@@ -563,28 +566,47 @@ fn relayScenario(env: *Env) !void {
     });
 }
 
-const Mode = enum { passthrough, managed };
-const managed_sizes = [_]usize{ 64, 512, 8 * 1024 };
+const ManagedSetup = struct {
+    name: []const u8,
+    managed: bool = true,
+    plugins: []const u8 = "none",
+    backends: usize = 1,
+};
+const managed_setups = [_]ManagedSetup{
+    .{ .name = "passthrough", .managed = false },
+    .{ .name = "managed, transfers possible", .backends = 2 },
+    .{ .name = "managed, relayed", .backends = 1 },
+    .{ .name = "managed, relayed, 10 idle plugins", .plugins = "idle_10" },
+    .{ .name = "managed, 1 decoded subscriber", .plugins = "one_decoded" },
+};
+const managed_sizes = [_]usize{ 256, 1024, 8 * 1024, 20 * 1024 };
+
+const ManagedRow = struct { result: RelayResult, relayed_pct: f64 };
 
 fn managedScenario(env: *Env) !void {
-    var results: [2][managed_sizes.len][2]RelayResult = undefined;
-    var join_ms: [2]f64 = undefined;
-    for (std.enums.values(Mode), 0..) |mode, m| {
-        var echo: managed.Backend = undefined;
-        var backends: ?Backends = null;
-        const port = switch (mode) {
-            .passthrough => port: {
-                backends = try .start(env, 1);
-                break :port backends.?.ports[0];
-            },
-            .managed => port: {
+    var rows: [managed_setups.len][managed_sizes.len][2]ManagedRow = undefined;
+    var join_ms: [managed_setups.len]f64 = undefined;
+    for (managed_setups, &rows, &join_ms) |setup, *setup_rows, *join| {
+        var echoes: [2]managed.Backend = undefined;
+        var started_echoes: usize = 0;
+        var passthrough: ?Backends = null;
+        defer {
+            for (echoes[0..started_echoes]) |*echo| echo.deinit();
+            if (passthrough) |b| b.deinit(env);
+        }
+        var ports: [2]u16 = undefined;
+        if (setup.managed) {
+            for (echoes[0..setup.backends], ports[0..setup.backends]) |*echo, *port| {
                 try echo.start(env.gpa, env.io);
-                break :port echo.port();
-            },
-        };
-        defer if (backends) |b| b.deinit(env) else echo.deinit();
+                started_echoes += 1;
+                port.* = echo.port();
+            }
+        } else {
+            passthrough = try .start(env, 1);
+            ports[0] = passthrough.?.ports[0];
+        }
         var proxy: Proxy = undefined;
-        try env.startProxy(&proxy, .{ .backends = &.{port}, .managed = mode == .managed });
+        try env.startProxy(&proxy, .{ .backends = ports[0..setup.backends], .managed = setup.managed, .plugins = setup.plugins });
         defer proxy.stop();
 
         const players = try env.gpa.alloc(Player, 8);
@@ -597,40 +619,99 @@ fn managedScenario(env: *Env) !void {
         for (players, 0..) |*player, i| {
             try player.connect(env.gpa, env.io, proxy.address());
             joined += 1;
-            switch (mode) {
-                .passthrough => try player.handshake(env.frames),
-                .managed => try managed.join(env.gpa, env.io, player, @intCast(i + 2)),
-            }
+            if (setup.managed) try managed.join(env.gpa, env.io, player, @intCast(i + 2)) else try player.handshake(env.frames);
         }
-        join_ms[m] = elapsedS(env.io, started) * 1000 / @as(f64, @floatFromInt(players.len));
-        for (managed_sizes, 0..) |size, s| {
-            results[m][s][0] = try relay(env, &proxy, players[0..1], size, 1);
-            results[m][s][1] = try relay(env, &proxy, players, size, windowFor(size));
-        }
+        join.* = elapsedS(env.io, started) * 1000 / @as(f64, @floatFromInt(players.len));
+        for (managed_sizes, setup_rows) |size, *pair| for (pair, 0..) |*row, loaded| {
+            const before = try proxy.stats();
+            const result = try relay(env, &proxy, if (loaded == 1) players else players[0..1], size, if (loaded == 1) windowFor(size) else 1);
+            const after = try proxy.stats();
+            const relayed: f64 = @floatFromInt(after.relayed - before.relayed);
+            const decoded: f64 = @floatFromInt(after.decoded - before.decoded);
+            row.* = .{ .result = result, .relayed_pct = if (relayed + decoded == 0) 0 else relayed * 100 / (relayed + decoded) };
+        };
     }
 
     try env.out.print(
         \\
         \\## Passthrough vs managed
         \\
-        \\Same echo workload as the raw relay, 1 worker, nothing subscribed to packets. Managed decrypts, decompresses and
-        \\re-batches every batch, then compresses and encrypts it again, in both directions. Joins are sequential and
-        \\include the full managed login (Microsoft token check, proxy login to the backend, two key exchanges).
+        \\Same echo workload as the raw relay, 1 worker, random payloads, deflate over 256 B on both legs. Decoded batches
+        \\are decrypted, decompressed, re-batched, compressed and encrypted again. Relayed batches are only re-encrypted.
+        \\Two backends make transfers possible, so every batch is decoded for client state tracking; active transfers and
+        \\runtime ID mapping always take that path. The decoded subscriber listens to player packets only.
         \\
-        \\| payload | load | mode | round trips/s | MiB/s | p50 us | p95 us | p99 us | proxy CPU |
-        \\|---|---|---|---|---|---|---|---|---|
+        \\| payload | load | setup | round trips/s | MiB/s | p50 us | p95 us | p99 us | proxy CPU | relayed |
+        \\|---|---|---|---|---|---|---|---|---|---|
         \\
     , .{});
-    for (managed_sizes, 0..) |size, s| for (0..2) |loaded| for (std.enums.values(Mode), 0..) |mode, m| {
-        const result = results[m][s][loaded];
-        try env.out.print("| {Bi} | {s}{d} | {t} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} | {d:.0} | {d:.0} | {d:.0} | {d:.0}% |\n", .{
+    for (managed_sizes, 0..) |size, s| for (0..2) |loaded| for (managed_setups, rows) |setup, setup_rows| {
+        const row = setup_rows[s][loaded];
+        const result = row.result;
+        try env.out.print("| {Bi} | {s}{d} | {s} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} | {d:.0} | {d:.0} | {d:.0} | {d:.0}% | {d:.0}% |\n", .{
             size,                   if (loaded == 1) "8x" else "1x", if (loaded == 1) windowFor(size) else 1,
-            mode,                   result.round_trips.median,       result.round_trips.min,
+            setup.name,             result.round_trips.median,       result.round_trips.min,
             result.round_trips.max, result.mib_s.median,             result.latency.p50,
             result.latency.p95,     result.latency.p99,              result.cpu_pct,
+            row.relayed_pct,
         });
     };
-    try env.out.print("\nJoin time per player: {d:.1} ms passthrough, {d:.1} ms managed.\n", .{ join_ms[0], join_ms[1] });
+    try env.out.print("\nJoin time per player:", .{});
+    for (managed_setups, join_ms) |setup, ms| try env.out.print(" {d:.1} ms {s};", .{ ms, setup.name });
+    try env.out.print("\n", .{});
+}
+
+const deflate_levels = [_]struct { name: []const u8, options: std.compress.flate.Compress.Options }{
+    .{ .name = "1", .options = .level_1 },
+    .{ .name = "4", .options = .level_4 },
+    .{ .name = "6 (used)", .options = .level_6 },
+    .{ .name = "9", .options = .level_9 },
+};
+
+fn deflateScenario(env: *Env) !void {
+    try env.out.print(
+        \\
+        \\## Deflate levels
+        \\
+        \\In-process raw deflate of one batch, for comparison only; Bedwire compresses at level 6. "Game" repeats a
+        \\structured 64 B record with a few changing bytes, "noise" is random.
+        \\
+        \\| data | size | level | us per batch | MiB/s | output |
+        \\|---|---|---|---|---|---|
+        \\
+    , .{});
+    const input = try env.gpa.alloc(u8, 64 * 1024);
+    defer env.gpa.free(input);
+    const output = try env.gpa.alloc(u8, 128 * 1024);
+    defer env.gpa.free(output);
+    const history = try env.gpa.create([std.compress.flate.max_window_len]u8);
+    defer env.gpa.destroy(history);
+    var prng: std.Random.DefaultPrng = .init(0xdef1a7e);
+    for ([_]bool{ true, false }) |game| {
+        if (game) {
+            for (input, 0..) |*byte, i| byte.* = @truncate(i % 64 *% 31 +% 7);
+            var i: usize = 0;
+            while (i < input.len) : (i += 64) prng.random().bytes(input[i..][0..4]);
+        } else prng.random().bytes(input);
+        for ([_]usize{ 1024, 8 * 1024, 64 * 1024 }) |size| for (deflate_levels) |level| {
+            const mib_per_level: usize = if (env.quick) 4 else 16;
+            const rounds = @max(4, mib_per_level * 1024 * 1024 / size);
+            var len: usize = 0;
+            const started = nowNs(env.io);
+            for (0..rounds) |_| {
+                var writer: std.Io.Writer = .fixed(output);
+                var compressor: std.compress.flate.Compress = try .init(&writer, history, .raw, level.options);
+                try compressor.writer.writeAll(input[0..size]);
+                try compressor.finish();
+                len = writer.end;
+            }
+            const ns = @as(f64, @floatFromInt(nowNs(env.io) - started)) / @as(f64, @floatFromInt(rounds));
+            try env.out.print("| {s} | {Bi} | {s} | {d:.1} | {d:.0} | {d:.1}% |\n", .{
+                if (game) "game" else "noise",                 size,                                                               level.name, ns / 1000,
+                mib(@as(f64, @floatFromInt(size))) * 1e9 / ns, @as(f64, @floatFromInt(len)) * 100 / @as(f64, @floatFromInt(size)),
+            });
+        };
+    }
 }
 
 const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot };

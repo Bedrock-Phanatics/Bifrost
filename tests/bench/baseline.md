@@ -62,6 +62,30 @@ Joins: 1.9 ms per player passthrough, 15.1 ms managed (token check, proxy login,
 Below the compression threshold managed costs about 5%. Above it, re-compressing every batch makes the proxy
 CPU-bound at roughly a quarter to a third of passthrough; that is the first thing to optimise in managed mode.
 
+## Managed relay fast path
+
+Recorded 2026-10-07 on Windows 11, ReleaseFast, `-- managed deflate --quick`, 1 worker, random payloads. Round trips/s;
+"decoded" has two backends configured, so transfers are possible and every batch is decoded.
+
+| payload | load | passthrough | decoded | relayed | relayed, 10 idle plugins | 1 decoded subscriber |
+|---|---|---|---|---|---|---|
+| 256 B | 1x1 | 7210 | 3504 | 4026 | 3994 | 3682 |
+| 256 B | 8x32 | 21836 | 9924 | 12462 | 12800 | 12704 |
+| 1 KiB | 1x1 | 4892 | 2420 | 2946 | 3174 | 2804 |
+| 1 KiB | 8x32 | 15520 | 5554 | 9772 | 10068 | 8784 |
+| 8 KiB | 1x1 | 1346 | 750 | 944 | 974 | 886 |
+| 8 KiB | 8x32 | 2818 | 1364 | 2054 | 1982 | 1860 |
+| 20 KiB | 1x1 | 676 | 304 | 370 | 392 | 346 |
+| 20 KiB | 8x12 | 1376 | 546 | 834 | 826 | 786 |
+
+Relaying skips the proxy's two deflate passes per batch: 1.6x to 1.8x the decoded throughput under load. The rest of
+the gap to passthrough is the two AES/SHA legs and the bench client and backend compressing on the same machine. The
+decoded subscriber only hooks player packets, so backend batches still relay (50% relayed).
+
+Deflate level, in-process, one batch: on game-like data level 1 is 0% to 13% faster than level 6 with the same
+output size; random data costs the same at every level. Not worth changing the default now that unchanged batches
+skip compression.
+
 ## Stability baselines
 
 Recorded 2026-10-06 on WSL2 Ubuntu, 12 logical CPUs, ReleaseFast, 1 worker, loopback, 512 B echoes.
