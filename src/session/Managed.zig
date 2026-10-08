@@ -59,6 +59,7 @@ pub const Shared = struct {
     batch: [][]const u8,
     rewrites: std.ArrayList(u8) = .empty,
     hooks: ?Hooks = null,
+    transfers: bool = true,
 
     pub fn init(gpa: std.mem.Allocator, key: Ecdsa.KeyPair, keys: *const bedwire.auth.KeySet) !Shared {
         var pool: bedwire.BufferPool = try .init(gpa, limits, .{ .rx_slots = 1, .tx_slots = 1 });
@@ -302,7 +303,38 @@ pub fn backendConnected(self: *Managed, ends: Ends) !void {
     try self.upstream.connected(self.upstreamContext(ends, ends.backend.?));
 }
 
+// ClientState and the chunk radius have to see every batch while a transfer is possible
+fn relayable(self: *const Managed, direction: abi.Direction) bool {
+    if (self.shared.transfers or !self.inGame()) return false;
+    const hooks = self.shared.hooks orelse return true;
+    return hooks.plugins.packetTable(direction) == null and (direction == .from_backend or !hooks.plugins.hasCommands());
+}
+
+fn relay(source: anytype, dest: anytype, sink: anytype, stats: *Stats, comptime counter: std.meta.FieldEnum(Stats), payload: []const u8) !bool {
+    const frame = source.relayTo(dest, payload) catch |err| switch (err) {
+        error.IncompatibleRelay => {
+            stats.bump(.managed_relay_incompatible, 1);
+            return false;
+        },
+        else => return err,
+    };
+    defer frame.release();
+    sink.send(frame.bytes, .reliable_ordered, 0) catch |err| {
+        dest.close();
+        return err;
+    };
+    stats.bump(counter, frame.bytes.len);
+    stats.bump(.managed_relayed_batches, 1);
+    stats.bump(.managed_relayed_bytes, payload.len);
+    return true;
+}
+
 pub fn fromPlayer(self: *Managed, ends: Ends, payload: []const u8) !void {
+    if (self.relayable(.from_player)) if (ends.backend) |client| {
+        if (try relay(&self.player, &self.upstream.session, client, ends.stats, .bytes_to_backend, payload)) return;
+    };
+    ends.stats.bump(.managed_decoded_batches, 1);
+    ends.stats.bump(.managed_decoded_bytes, payload.len);
     var packets = try self.player.ingest(payload);
     defer packets.deinit();
     if (self.player_phase == .ready) return self.relayFromPlayer(ends, &packets);
@@ -322,6 +354,11 @@ pub fn fromPlayer(self: *Managed, ends: Ends, payload: []const u8) !void {
 }
 
 pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
+    if (self.relayable(.from_backend)) {
+        if (try relay(&self.upstream.session, &self.player, ends.player, ends.stats, .bytes_to_player, payload)) return;
+    }
+    ends.stats.bump(.managed_decoded_batches, 1);
+    ends.stats.bump(.managed_decoded_bytes, payload.len);
     var packets = try self.upstream.session.ingest(payload);
     defer packets.deinit();
     if (self.upstream.phase == .ready) return self.relayFromBackend(ends, &packets);

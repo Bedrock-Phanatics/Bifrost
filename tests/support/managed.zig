@@ -318,6 +318,7 @@ pub const Backend = struct {
     drop_all: std.atomic.Value(bool) = .init(false),
     held: ?*Connection = null,
     refuse: bool = false,
+    deflate: bool = false,
     mode: Mode = .normal,
     content: sample.Content = .{},
     chattered_ns: u64 = 0,
@@ -511,12 +512,12 @@ pub const Backend = struct {
             .request_network_settings => {
                 try sendFrame(session, carrier, &.{try typedPacket(&buffer, .{ .network_settings = .{
                     .compression_threshold = 0,
-                    .compression_algorithm = .snappy,
+                    .compression_algorithm = if (self.deflate) .zlib else .snappy,
                     .client_throttle_enabled = false,
                     .client_throttle_threshold = 0,
                     .client_throttle_scalar = 0,
                 } })});
-                try session.negotiateCompression(.snappy, 0);
+                try session.negotiateCompression(if (self.deflate) .deflate else .snappy, 0);
             },
             .login => {
                 var identity = session.authenticateLoginPacket(gpa, packet, .{ .certificate_chain = .{

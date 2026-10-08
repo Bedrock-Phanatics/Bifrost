@@ -9,8 +9,8 @@
             .hash = "zig_raknet-0.3.3-1HPoU6DrCgDbXA68GKRvuTsvSU7O22WObsMqUksBHoaX",
         },
         .bedwire = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#0781fd690a01baeb4cee39b8264d338ab8b3b6a5",
-            .hash = "bedwire-0.2.3-6vrYrZJMBgAcEinPNCufQhD2A8-MqTxgAGfkCifx1fuu",
+            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#ad877464302b9d3ec61840263c06e7807f302ebe",
+            .hash = "bedwire-0.2.3-6vrYrT2nBgBRFtpCX9kH2aFs2EQ3sf0L00Csm02Vc22v",
         },
         .zio = .{
             .url = "git+https://github.com/EuroZig/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",

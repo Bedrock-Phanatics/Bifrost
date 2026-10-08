@@ -62,6 +62,53 @@ test "a managed player logs in to a backend as the proxy and relays game packets
     try std.testing.expectEqual(@as(u64, 1), stats.logins_verified);
     try std.testing.expectEqual(@as(u64, 1), stats.proxy_logins);
     try std.testing.expectEqual(@as(u64, 0), stats.handshakes_observed);
+    // Snappy on the backend, deflate to the player
+    try std.testing.expectEqual(@as(u64, 0), stats.managed_relayed_batches);
+    try std.testing.expect(stats.managed_relay_incompatible != 0);
+}
+
+test "matching compression relays in-game batches without decoding them" {
+    var setup: Setup = undefined;
+    try setup.start(try trusted());
+    defer setup.deinit();
+    setup.backend.deflate = true;
+
+    const player = try managed.Player.connect(io, setup.running.address(), 2);
+    defer player.destroy();
+    try player.login("Steve", "2535400000000001");
+    try player.spawn();
+    try player.echo("hello");
+    try player.echo(&@as([3000]u8, @splat('x')));
+    try player.echo(&@as([64 * 1024]u8, @splat('y')));
+
+    setup.running.stop();
+    try std.testing.expectEqual(@as(u64, 6), setup.running.stats().managed_relayed_batches);
+}
+
+test "with somewhere to transfer to, managed traffic is decoded" {
+    const proxy_key = try managed.proxyKey(1);
+    var keys = try managed.keySet();
+    defer keys.deinit();
+    var backends: [2]managed.Backend = undefined;
+    try backends[0].start(io, proxy_key.public_key);
+    defer backends[0].deinit();
+    try backends[1].start(io, proxy_key.public_key);
+    defer backends[1].deinit();
+    backends[0].deflate = true;
+    backends[1].deflate = true;
+    var running: Running = undefined;
+    try running.start(io, try managed.config(&.{ backends[0].address(), backends[1].address() }), .{ .auth = .{ .verify = &keys }, .proxy_key = proxy_key });
+    defer running.deinit();
+
+    const player = try managed.Player.connect(io, running.address(), 2);
+    defer player.destroy();
+    try player.login("Steve", "2535400000000001");
+    try player.spawn();
+    try player.echo(&@as([3000]u8, @splat('x')));
+
+    running.stop();
+    try std.testing.expectEqual(@as(u64, 0), running.stats().managed_relayed_batches);
+    try std.testing.expect(running.stats().managed_decoded_batches != 0);
 }
 
 test "a forged login never reaches the backend" {

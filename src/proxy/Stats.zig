@@ -29,6 +29,11 @@ incompatible_items: u64 = 0,
 incompatible_biomes: u64 = 0,
 incompatible_dimensions: u64 = 0,
 incompatible_actors: u64 = 0,
+managed_relayed_batches: u64 = 0,
+managed_relayed_bytes: u64 = 0,
+managed_decoded_batches: u64 = 0,
+managed_decoded_bytes: u64 = 0,
+managed_relay_incompatible: u64 = 0,
 
 // Only the worker writes these, so a plain atomic store is enough
 pub fn bump(self: *Stats, comptime field: std.meta.FieldEnum(Stats), amount: u64) void {

@@ -92,6 +92,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         ),
     };
     errdefer if (managed) |*shared| shared.deinit(gpa);
+    if (managed) |*shared| shared.transfers = config.backend_count > 1;
 
     self.* = .{
         .gpa = gpa,
