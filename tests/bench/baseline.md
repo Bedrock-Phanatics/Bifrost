@@ -136,6 +136,25 @@ microseconds per batch, so a few callbacks per packet don't show. Windows end-to
 Heap of a managed proxy (WSL2): 16.6 MiB fresh, 252 KiB per managed player. Idle plugins add nothing; packet
 subscribers add one ~190 KiB rewrite buffer per worker.
 
+## Player id translation
+
+`zig build bench -Doptimize=ReleaseFast -- ids`, recorded 2026-10-08, three runs each. After a transfer the proxy swaps
+the client's first actor ids with the current backend's. The stream is half MovePlayer and SetActorMotion, half text
+and raw packets, which are never decoded.
+
+| case | added ns per packet, Windows / WSL2 |
+|---|---|
+| no transfer yet, or the same ids | 0 (0.5 ns per packet total) |
+| swap active, actor packets name other actors | 25 to 27 / 22 to 29 |
+| swap active, actor packets name the player | 65 to 70 / 65 to 104 |
+
+Per packet that can hold an actor id that is about 50 ns to decode and check, and 130 to 200 ns when it has to be
+re-encoded, against microseconds per batch for managed re-compression.
+
+Transfers, A/B on Windows against cace0fc (the commit before translation), two alternating runs each, ReleaseFast:
+200 A↔B transfers p50 30.9 to 31.2 ms before and 31.3 to 31.5 ms after, p99 45 to 51 ms both; 8 concurrent
+transfers p50 127 to 139 ms either way. The live heap stays flat and is 48 B larger.
+
 ## Load audit
 
 Recorded 2026-10-05 on WSL2, ReleaseFast. Nothing here needed a change.

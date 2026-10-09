@@ -54,6 +54,7 @@ pub const Player = struct {
     game_packets: std.ArrayList([]u8) = .empty,
     kinds: std.ArrayList(bedwire.PacketKind) = .empty,
     changes: std.ArrayList(protocol.packets.change_dimension.Packet) = .empty,
+    actor_packets: std.ArrayList([]u8) = .empty,
     hold_acks: bool = false,
     held_acks: usize = 0,
 
@@ -86,6 +87,8 @@ pub const Player = struct {
         self.game_packets.deinit(gpa);
         self.kinds.deinit(gpa);
         self.changes.deinit(gpa);
+        for (self.actor_packets.items) |packet| gpa.free(packet);
+        self.actor_packets.deinit(gpa);
         gpa.destroy(self);
     }
 
@@ -197,6 +200,10 @@ pub const Player = struct {
                     continue;
                 };
                 try self.kinds.append(gpa, kind);
+                if (protocol.actor_refs.packets.contains(kind)) {
+                    try self.actor_packets.ensureUnusedCapacity(gpa, 1);
+                    self.actor_packets.appendAssumeCapacity(try gpa.dupe(u8, packet.bytes));
+                }
                 if (kind == .change_dimension) {
                     try self.changes.append(gpa, (try self.session.decodePacket(packet)).value.typed.change_dimension);
                     acks += 1;
@@ -223,6 +230,31 @@ pub const Player = struct {
             .result_pos = .{ .x = 0, .y = 0, .z = 0 },
             .face = 0,
         } })});
+    }
+
+    pub fn last(self: *const Player, comptime kind: bedwire.PacketKind) !@FieldType(protocol.typed.Packet, @tagName(kind)) {
+        var i = self.actor_packets.items.len;
+        while (i > 0) {
+            i -= 1;
+            const envelope = try protocol.typed.decode(self.actor_packets.items[i], .{});
+            if (envelope.packet == kind) return @field(envelope.packet, @tagName(kind));
+        }
+        return error.NotReceived;
+    }
+
+    // Has the backend send these packets back, and waits until they arrive
+    pub fn relay(self: *Player, packets: []const []const u8) !void {
+        var buffer: [8192]u8 = undefined;
+        var writer = protocol.Writer.init(&buffer);
+        try writer.writeVarU32(game_packet_id);
+        try writer.writeRaw("relay");
+        for (packets) |packet| {
+            try writer.writeRaw(&std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(packet.len))));
+            try writer.writeRaw(packet);
+        }
+        try self.send(&.{writer.written()});
+        var marker: [256]u8 = undefined;
+        while (!std.mem.eql(u8, try self.nextGamePacket(&marker), "relayed")) {}
     }
 
     pub fn received(self: *const Player, kind: bedwire.PacketKind) usize {
@@ -326,6 +358,77 @@ pub const Backend = struct {
     identity_name_len: usize = 0,
     identity_xuid_len: usize = 0,
     identity_online: bool = true,
+    // Nonzero values replace the content's ids for the next login
+    runtime_id: std.atomic.Value(u64) = .init(0),
+    unique_id: std.atomic.Value(i64) = .init(0),
+    seen_runtime: Seen = .{},
+    seen_unique: Seen = .{},
+
+    // Every actor id the player has sent, most recent 64
+    pub const Seen = struct {
+        ids: [64]std.atomic.Value(u64) = @splat(.init(0)),
+        len: std.atomic.Value(usize) = .init(0),
+
+        fn add(self: *Seen, id: u64) void {
+            const i = self.len.fetchAdd(1, .acq_rel);
+            self.ids[i % self.ids.len].store(id, .release);
+        }
+
+        pub fn clear(self: *Seen) void {
+            self.len.store(0, .release);
+        }
+
+        pub fn contains(self: *const Seen, id: u64) bool {
+            const len = @min(self.len.load(.acquire), self.ids.len);
+            for (self.ids[0..len]) |*seen| if (seen.load(.acquire) == id) return true;
+            return false;
+        }
+    };
+
+    const Recorder = struct {
+        backend: *Backend,
+
+        pub fn runtime(self: Recorder, id: u64) u64 {
+            self.backend.seen_runtime.add(id);
+            return id;
+        }
+
+        pub fn unique(self: Recorder, id: i64) i64 {
+            self.backend.seen_unique.add(@bitCast(id));
+            return id;
+        }
+    };
+
+    fn loginContent(self: *const Backend) sample.Content {
+        var content = self.content;
+        const runtime_id = self.runtime_id.load(.acquire);
+        const unique_id = self.unique_id.load(.acquire);
+        if (runtime_id != 0) content.runtime_id = runtime_id;
+        if (unique_id != 0) content.unique_id = unique_id;
+        return content;
+    }
+
+    fn record(self: *Backend, packet: []const u8) !void {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var envelope = try protocol.typed.decode(packet, .{});
+        _ = try protocol.actor_refs.rewrite(arena.allocator(), &envelope.packet, Recorder{ .backend = self });
+    }
+
+    // Sends back the length-prefixed packets the player asked for, then a marker
+    fn relay(session: *Session, carrier: *raknet.Session, list: []const u8) !void {
+        var packets: [32][]const u8 = undefined;
+        var count: usize = 0;
+        var rest = list;
+        while (rest.len != 0) : (count += 1) {
+            const len = std.mem.readInt(u16, rest[0..2], .little);
+            packets[count] = rest[2..][0..len];
+            rest = rest[2 + len ..];
+        }
+        var marker: [16]u8 = undefined;
+        packets[count] = try rawPacket(&marker, game_packet_id, "relayed");
+        try sendFrame(session, carrier, packets[0 .. count + 1]);
+    }
 
     pub fn start(self: *Backend, io: std.Io, trusted: Ecdsa.PublicKey) !void {
         const pool = try gpa.create(bedwire.BufferPool);
@@ -495,6 +598,10 @@ pub const Backend = struct {
         defer packets.deinit();
         var buffer: [512]u8 = undefined;
         while (packets.next()) |packet| switch (packet.kind orelse {
+            if (std.mem.startsWith(u8, packet.bytes[2..], "relay")) {
+                try relay(session, carrier, packet.bytes[2 + "relay".len ..]);
+                continue;
+            }
             if (std.mem.endsWith(u8, packet.bytes, "kick")) return carrier.close();
             if (std.mem.endsWith(u8, packet.bytes, "scene")) {
                 try sendScene(connection);
@@ -509,6 +616,10 @@ pub const Backend = struct {
             try sendFrame(session, carrier, &.{packet.bytes});
             continue;
         }) {
+            .player_action, .animate, .emote, .interact, .actor_pick_request, .command_request, .move_player => |kind| {
+                try self.record(packet.bytes);
+                if (kind == .command_request) _ = self.commands.fetchAdd(1, .release);
+            },
             .request_network_settings => {
                 try sendFrame(session, carrier, &.{try typedPacket(&buffer, .{ .network_settings = .{
                     .compression_threshold = 0,
@@ -567,7 +678,7 @@ pub const Backend = struct {
                 var start_buffer: [1024]u8 = undefined;
                 var items_buffer: [256]u8 = undefined;
                 var batch: [303][]const u8 = undefined;
-                batch[0] = try sample.startGame(&start_buffer, self.content);
+                batch[0] = try sample.startGame(&start_buffer, self.loginContent());
                 batch[1] = try sample.itemRegistry(&items_buffer, self.content);
                 batch[2] = &sample.biome_definitions;
                 var extra: [16]u8 = undefined;
@@ -598,7 +709,6 @@ pub const Backend = struct {
                 _ = self.cache_reports.fetchAdd(1, .release);
             },
             .sub_chunk_request => _ = self.sub_chunk_requests.fetchAdd(1, .release),
-            .command_request => _ = self.commands.fetchAdd(1, .release),
             .set_local_player_as_initialised => {
                 if (session.state == .spawn_ready) try session.advance(.in_game);
                 _ = self.spawns.fetchAdd(1, .release);

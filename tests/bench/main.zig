@@ -7,6 +7,7 @@ const sample = @import("sample");
 const harness = @import("harness.zig");
 const managed = @import("managed.zig");
 const bench_plugins = @import("plugins.zig");
+const bench_ids = @import("runtime_ids.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -22,11 +23,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|ids|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "ids", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -104,6 +105,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "managed")) try managedScenario(&env);
         if (std.mem.eql(u8, name, "deflate")) try deflateScenario(&env);
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
+        if (std.mem.eql(u8, name, "ids")) try idsScenario(&env);
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
         if (std.mem.eql(u8, name, "connections")) try connectionsScenario(&env);
         if (std.mem.eql(u8, name, "workers")) try workersScenario(&env);
@@ -712,6 +714,23 @@ fn deflateScenario(env: *Env) !void {
             });
         };
     }
+}
+
+fn idsScenario(env: *Env) !void {
+    const results = try bench_ids.run(env.gpa, env.io, env.quick);
+    try env.out.print(
+        \\
+        \\## Player id translation
+        \\
+        \\Per-packet work a managed relay adds after a transfer to keep the client's own actor ids, in-process. Half the
+        \\stream is MovePlayer and SetActorMotion, the rest text and raw packets that are never decoded. Packets naming
+        \\the player are decoded, rewritten and re-encoded.
+        \\
+        \\| case | ns per packet | added ns |
+        \\|---|---|---|
+        \\
+    , .{});
+    for (results) |result| try env.out.print("| {s} | {d:.1} | {d:.1} |\n", .{ result.case.describe(), result.ns_per_packet, result.extra_ns });
 }
 
 const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot };

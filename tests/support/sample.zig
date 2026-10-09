@@ -86,6 +86,8 @@ pub const Content = struct {
     authoritative_block_breaking: ?bool = null,
     dimension: ?i32 = null,
     position: ?protocol.Vec3f = null,
+    runtime_id: ?u64 = null,
+    unique_id: ?i64 = null,
 };
 
 pub fn runtimeId() u64 {
@@ -102,6 +104,8 @@ pub fn startGame(buffer: []u8, content: Content) ![]const u8 {
     if (content.authoritative_block_breaking) |enabled| value.movement_settings.server_authoritative_block_breaking = enabled;
     value.settings.spawn_settings.dimension = content.dimension orelse 0;
     if (content.position) |position| value.position = position;
+    if (content.runtime_id) |id| value.runtime_id = id;
+    if (content.unique_id) |id| value.entity_id = id;
     envelope.value = .{ .typed = .{ .start_game = value } };
     return encodeEnvelope(buffer, envelope);
 }

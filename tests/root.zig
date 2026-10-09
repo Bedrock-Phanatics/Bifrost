@@ -13,6 +13,7 @@ test {
     _ = @import("integration/handoff.zig");
     _ = @import("integration/plugins.zig");
     _ = @import("integration/chaos.zig");
+    _ = @import("integration/runtime_ids.zig");
 }
 
 test "the shipped config parses" {
