@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
         .workers = config.workers,
         .packets = config.session_mode == .managed,
         .slow_callback_ns = @as(u64, config.slow_plugin_callback_ms) * std.time.ns_per_ms,
+        .task_threads = config.plugin_task_threads,
     });
     defer plugins.deinit();
     for (0..config.plugin_count) |i| plugins.open(config.pluginPath(i)) catch |err| {

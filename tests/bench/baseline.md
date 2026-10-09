@@ -155,6 +155,19 @@ Transfers, A/B on Windows against cace0fc (the commit before translation), two a
 200 A↔B transfers p50 30.9 to 31.2 ms before and 31.3 to 31.5 ms after, p99 45 to 51 ms both; 8 concurrent
 transfers p50 127 to 139 ms either way. The live heap stays flat and is 48 B larger.
 
+## Plugin tasks
+
+`zig build bench -Doptimize=ReleaseFast -- tasks`, recorded 2026-10-09, three runs each. Empty tasks from one plugin
+(32 in flight), `done` drained on the submitting thread. Before is `std.Io.Threaded` with up to 128 threads, after is
+the fixed pool with 4 threads.
+
+| | tasks/s, Windows / WSL2 | submit to done p50 | p99 |
+|---|---|---|---|
+| before | 140k to 197k / 43k to 47k | 6.0 to 6.8 / 32.5 to 34.2 us | 9.5 to 11.1 / 72.6 to 76.1 us |
+| after | 2.8M to 3.3M / 61k to 65k | 2.8 to 4.4 / 14.8 to 18.8 us | 7.7 to 14.8 / 33.5 to 117 us |
+
+On WSL2 each submit wakes a sleeping thread through a futex, which is most of the cost; fine for blocking work.
+
 ## Load audit
 
 Recorded 2026-10-05 on WSL2, ReleaseFast. Nothing here needed a change.

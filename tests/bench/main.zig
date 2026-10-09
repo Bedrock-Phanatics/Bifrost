@@ -8,6 +8,7 @@ const harness = @import("harness.zig");
 const managed = @import("managed.zig");
 const bench_plugins = @import("plugins.zig");
 const bench_ids = @import("runtime_ids.zig");
+const bench_tasks = @import("tasks.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -23,11 +24,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|ids|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|ids|tasks|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "ids", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "ids", "tasks", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -106,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "deflate")) try deflateScenario(&env);
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
         if (std.mem.eql(u8, name, "ids")) try idsScenario(&env);
+        if (std.mem.eql(u8, name, "tasks")) try tasksScenario(&env);
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
         if (std.mem.eql(u8, name, "connections")) try connectionsScenario(&env);
         if (std.mem.eql(u8, name, "workers")) try workersScenario(&env);
@@ -731,6 +733,21 @@ fn idsScenario(env: *Env) !void {
         \\
     , .{});
     for (results) |result| try env.out.print("| {s} | {d:.1} | {d:.1} |\n", .{ result.case.describe(), result.ns_per_packet, result.extra_ns });
+}
+
+fn tasksScenario(env: *Env) !void {
+    const result = try bench_tasks.measure(env.gpa, env.io, env.quick);
+    try env.out.print(
+        \\
+        \\## Plugin tasks
+        \\
+        \\Empty tasks from one plugin and player, in-process, with `done` drained on the submitting thread.
+        \\
+        \\| tasks/s, up to the limit in flight | submit to done p50 | p99 |
+        \\|---|---|---|
+        \\| {d:.0} | {d:.1} us | {d:.1} us |
+        \\
+    , .{ result.tasks_per_s, result.p50_us, result.p99_us });
 }
 
 const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot };

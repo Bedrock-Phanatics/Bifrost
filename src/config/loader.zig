@@ -177,6 +177,8 @@ fn readLimits(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
             config.pending_bytes = try integer(u32, diag, key, value, 1, 64 * 1024 * 1024);
         } else if (eql(key.name.?, "slow_plugin_callback_ms")) {
             config.slow_plugin_callback_ms = try integer(u32, diag, key, value, 1, 60_000);
+        } else if (eql(key.name.?, "plugin_task_threads")) {
+            config.plugin_task_threads = try integer(u8, diag, key, value, 1, 64);
         } else return fail(diag, key, "unknown key", .{});
     }
 }
@@ -330,6 +332,7 @@ test "full config reads every key" {
         \\pending_packets = 8
         \\pending_bytes = 4096
         \\slow_plugin_callback_ms = 20
+        \\plugin_task_threads = 2
         \\
         \\[[backend]]
         \\name = "lobby"
@@ -346,6 +349,7 @@ test "full config reads every key" {
     try std.testing.expectEqual(@as(u32, 8), config.pending_packets);
     try std.testing.expectEqual(@as(u32, 4096), config.pending_bytes);
     try std.testing.expectEqual(@as(u32, 20), config.slow_plugin_callback_ms);
+    try std.testing.expectEqual(@as(u8, 2), config.plugin_task_threads);
     try std.testing.expectEqual(@as(u16, 2000), config.backends()[0].address.getPort());
     try std.testing.expectEqualStrings("lobby", config.backends()[0].name());
     try std.testing.expectEqual(@as(u16, 3000), config.backends()[1].address.getPort());
@@ -367,6 +371,7 @@ test "invalid values name the offending key" {
     try expectInvalid("[server]\nbind = \"localhost:1\"\n" ++ backend, "server.bind: expected \"ip:port\", got \"localhost:1\"");
     try expectInvalid("[server]\nbind = 19132\n" ++ backend, "server.bind: expected a string");
     try expectInvalid("[server]\nworkers = 0\n" ++ backend, "server.workers: must be between 1 and 64");
+    try expectInvalid("[limits]\nplugin_task_threads = 65\n" ++ backend, "limits.plugin_task_threads: must be between 1 and 64");
     if (!Config.multi_worker_supported) try expectInvalid("[server]\nworkers = 2\n" ++ backend, "server.workers: more than 1 needs Linux (SO_REUSEPORT)");
     try expectInvalid("[server]\nmax_players = 2\nmax_players_per_ip = 3\n" ++ backend, "server.max_players_per_ip: can't be more than max_players");
     try expectInvalid("[server]\nmax_players = 0\n" ++ backend, "server.max_players: must be between 1 and 100000");

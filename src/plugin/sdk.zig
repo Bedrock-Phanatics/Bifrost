@@ -12,7 +12,7 @@ pub const Command = abi.Command;
 pub const CommandHandler = fn (command: *const Command) void;
 pub const TaskResult = abi.TaskResult;
 
-pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy, WrongThread };
+pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy, WrongThread, Canceled };
 
 pub const Host = struct {
     raw: *const abi.Host,
@@ -132,6 +132,7 @@ fn check(status: abi.Status) Error!void {
         .too_late => error.TooLate,
         .busy => error.Busy,
         .wrong_thread => error.WrongThread,
+        .canceled => error.Canceled,
         else => error.Failed,
     };
 }

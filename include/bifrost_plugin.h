@@ -33,6 +33,7 @@ enum {
     BIFROST_STATUS_TOO_LATE = -6,
     BIFROST_STATUS_BUSY = -7,
     BIFROST_STATUS_WRONG_THREAD = -8,
+    BIFROST_STATUS_CANCELED = -9,
 };
 
 /* Only valid until the call returns */
@@ -179,10 +180,11 @@ typedef struct bifrost_host {
     uint32_t (*worker_count)(void *context);
     bifrost_status (*subscribe_packet)(void *context, bifrost_direction direction, uint32_t id, bifrost_packet_phase phase, uint32_t flags, bifrost_packet_fn callback, void *user);
     bifrost_status (*register_command)(void *context, bifrost_str name, bifrost_command_fn callback, void *user);
-    /* run gets its own thread; done runs once, on the player's worker, or with STALE_HANDLE after they leave */
+    /* run shares a few threads with every plugin. done runs once on the player's worker,
+       with STALE_HANDLE if they left or CANCELED if run never started */
     bifrost_status (*spawn_task)(void *context, bifrost_player player, bifrost_task_fn run, bifrost_task_done_fn done, void *user);
     bifrost_status (*send_message)(void *context, bifrost_player player, bifrost_str text);
-    /* Same done rules as spawn_task, so a plugin thread can get back onto the player's worker */
+    /* Runs done on the player's worker, same rules as spawn_task */
     bifrost_status (*post)(void *context, bifrost_player player, bifrost_task_done_fn done, void *user);
 } bifrost_host;
 

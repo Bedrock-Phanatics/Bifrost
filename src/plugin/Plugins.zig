@@ -4,6 +4,7 @@ const Backend = @import("../backend/Backend.zig");
 const Library = @import("Library.zig").Library;
 pub const Handles = @import("Handles.zig");
 pub const Packets = @import("Packets.zig");
+const Pool = @import("Pool.zig");
 const Work = @import("Work.zig");
 const Notify = @import("../net/Notify.zig");
 
@@ -18,7 +19,7 @@ pub const Options = struct {
     workers: u32 = 1,
     packets: bool = true,
     slow_callback_ns: u64 = 5 * std.time.ns_per_ms,
-    // ponytail: one thread per running task; a fixed pool with a backlog if plugins need far more
+    task_threads: u32 = 4,
     max_tasks: u32 = 128,
     max_tasks_per_plugin: u32 = 32,
     max_messages: u32 = 1024,
@@ -85,13 +86,12 @@ stopping: std.atomic.Value(bool) = .init(false),
 commands: std.StringHashMapUnmanaged(Command) = .empty,
 pending_commands: std.ArrayList(PendingCommand) = .empty,
 queues: []Work.Queue,
-pool: ?*std.Io.Threaded = null,
-group: std.Io.Group = .init,
-group_lock: std.atomic.Value(bool) = .init(false),
+pool: ?*Pool = null,
 outstanding: std.atomic.Value(u32) = .init(0),
 messages: std.atomic.Value(u32) = .init(0),
 
 pub fn init(gpa: std.mem.Allocator, backends: []const Backend, options: Options) !Plugins {
+    if (options.task_threads == 0 or options.task_threads > Pool.max_threads) return error.InvalidOptions;
     const queues = try gpa.alloc(Work.Queue, options.workers);
     var ready: usize = 0;
     errdefer {
@@ -184,7 +184,12 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
 pub fn unload(self: *Plugins) void {
     const outer = Work.enter();
     defer Work.hosted = outer;
-    if (self.pool) |pool| self.group.await(pool.io()) catch {};
+    if (self.pool) |pool| {
+        pool.stop();
+        while (pool.take()) |task| self.finish(task, .canceled, null);
+        pool.destroy();
+        self.pool = null;
+    }
     for (self.queues) |*queue| {
         queue.close();
         for (queue.take()) |item| self.settle(item, null, null);
@@ -200,11 +205,6 @@ pub fn unload(self: *Plugins) void {
         if (loaded.library) |*library| library.close();
         self.gpa.free(loaded.metrics);
         self.gpa.destroy(loaded);
-    }
-    if (self.pool) |pool| {
-        pool.deinit();
-        self.gpa.destroy(pool);
-        self.pool = null;
     }
 }
 
@@ -301,12 +301,11 @@ fn timed(self: *const Plugins, loaded: *Loaded, worker: u32, io: std.Io, started
 }
 
 fn startPool(self: *Plugins) !void {
-    const pool = try self.gpa.create(std.Io.Threaded);
-    pool.* = .init(self.gpa, .{ .async_limit = .nothing, .concurrent_limit = .limited(self.options.max_tasks) });
-    self.pool = pool;
+    self.pool = try .create(self.gpa, self.options.task_threads, self.options.max_tasks, self, runTask);
 }
 
-fn runTask(self: *Plugins, task: *Work.Task) void {
+fn runTask(context: *anyopaque, task: *Work.Task) void {
+    const self: *Plugins = @ptrCast(@alignCast(context));
     task.run(task.then.user);
     if (self.handles.route(task.then.player)) |route| {
         if (route.worker < self.queues.len and self.queues[route.worker].post(.{ .task = task })) return;
@@ -478,16 +477,11 @@ fn hostSpawnTask(context: *anyopaque, player: abi.Player, run: ?abi.TaskFn, done
         .outstanding = &loaded.outstanding,
         .then = .{ .done = done_fn, .user = user, .player = player, .name = loaded.label(), .metrics = loaded.metrics },
     };
-    while (owner.group_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-    const started = owner.group.concurrent(pool.io(), runTask, .{ owner, task });
-    owner.group_lock.store(false, .release);
-    started catch {
-        Work.release(&loaded.outstanding);
-        Work.release(&owner.outstanding);
-        owner.gpa.destroy(task);
-        return .busy;
-    };
-    return .ok;
+    if (pool.submit(task)) return .ok;
+    Work.release(&loaded.outstanding);
+    Work.release(&owner.outstanding);
+    owner.gpa.destroy(task);
+    return .busy;
 }
 
 fn hostSendMessage(context: *anyopaque, player: abi.Player, text: abi.Str) callconv(.c) abi.Status {
@@ -857,4 +851,173 @@ test "posts are bounded, go stale with the player and are settled once at unload
     plugins.deinit();
     try testing.expectEqual(@as(u32, 3), delivery.stale.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), delivery.ok.load(.monotonic));
+}
+
+const Tasker = struct {
+    var host: ?abi.Host = null;
+    var gate: std.atomic.Value(bool) = .init(true);
+    var started: std.atomic.Value(u32) = .init(0);
+    var results: [4]std.atomic.Value(u32) = @splat(.init(0));
+
+    fn reset() void {
+        gate.store(true, .release);
+        started.store(0, .release);
+        for (&results) |*counter| counter.store(0, .release);
+    }
+
+    fn init(api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("tasker");
+        plugin.plugin_version = .of("1.0.0");
+        plugin.capabilities = .{ .tasks = true };
+        host = api.*;
+        return .ok;
+    }
+
+    fn run(_: ?*anyopaque) callconv(.c) void {
+        _ = started.fetchAdd(1, .acq_rel);
+        while (!gate.load(.acquire)) std.Thread.yield() catch {};
+    }
+
+    fn slot(status: abi.Status) usize {
+        return switch (status) {
+            .ok => 0,
+            .stale_handle => 1,
+            .canceled => 2,
+            else => 3,
+        };
+    }
+
+    fn done(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        _ = results[slot(result.status)].fetchAdd(1, .acq_rel);
+    }
+
+    fn spawn(api: abi.Host, player: abi.Player) abi.Status {
+        return api.spawn_task(api.context, player, run, done, null);
+    }
+
+    fn count(status: abi.Status) u32 {
+        return results[slot(status)].load(.acquire);
+    }
+
+    fn settle(plugins: *Plugins, total: u32) void {
+        while (count(.ok) + count(.stale_handle) + count(.canceled) < total) {
+            plugins.drain(0, testing.io, null);
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+fn taskPlayer(plugins: *Plugins) !abi.Player {
+    return plugins.handles.acquire(testing.allocator, .{ .context = plugins, .link = 1, .transfer = routedTransfer });
+}
+
+test "tasks respect the per-plugin and global limits and finish on the player's worker" {
+    Tasker.reset();
+    Work.hosted = true;
+    defer Work.hosted = false;
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .task_threads = 1, .max_tasks = 4, .max_tasks_per_plugin = 3 });
+    defer plugins.deinit();
+    try plugins.add(Tasker.init, null);
+    const first = Tasker.host.?;
+    try plugins.add(Tasker.init, null);
+    const second = Tasker.host.?;
+    const player = try taskPlayer(&plugins);
+
+    Tasker.gate.store(false, .release);
+    for (0..3) |_| try testing.expectEqual(abi.Status.ok, Tasker.spawn(first, player));
+    try testing.expectEqual(abi.Status.busy, Tasker.spawn(first, player));
+    try testing.expectEqual(abi.Status.ok, Tasker.spawn(second, player));
+    try testing.expectEqual(abi.Status.busy, Tasker.spawn(second, player));
+    try testing.expectEqual(@as(u32, 3), plugins.totals(0).outstanding);
+
+    Tasker.gate.store(true, .release);
+    Tasker.settle(&plugins, 4);
+    try testing.expectEqual(@as(u32, 4), Tasker.count(.ok));
+    try testing.expectEqual(@as(u32, 0), plugins.outstanding.load(.acquire));
+    try testing.expectEqual(abi.Status.ok, Tasker.spawn(second, player));
+    Tasker.settle(&plugins, 5);
+}
+
+test "ten thousand tasks over four threads each finish once and leave nothing behind" {
+    Tasker.reset();
+    Work.hosted = true;
+    defer Work.hosted = false;
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .task_threads = 4, .max_tasks_per_plugin = 128 });
+    defer plugins.deinit();
+    try plugins.add(Tasker.init, null);
+    const api = Tasker.host.?;
+    const player = try taskPlayer(&plugins);
+
+    const total = 10_000;
+    var submitted: u32 = 0;
+    while (submitted < total) {
+        while (submitted < total and Tasker.spawn(api, player) == .ok) submitted += 1;
+        plugins.drain(0, testing.io, null);
+    }
+    Tasker.settle(&plugins, total);
+    try testing.expectEqual(@as(u32, total), Tasker.count(.ok));
+    try testing.expectEqual(@as(u32, total), Tasker.started.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), plugins.outstanding.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), plugins.pool.?.len);
+}
+
+test "a task whose player leaves reports a stale handle" {
+    Tasker.reset();
+    Work.hosted = true;
+    defer Work.hosted = false;
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .task_threads = 1 });
+    defer plugins.deinit();
+    try plugins.add(Tasker.init, null);
+    const player = try taskPlayer(&plugins);
+
+    Tasker.gate.store(false, .release);
+    try testing.expectEqual(abi.Status.ok, Tasker.spawn(Tasker.host.?, player));
+    plugins.handles.release(player);
+    Tasker.gate.store(true, .release);
+    Tasker.settle(&plugins, 1);
+    try testing.expectEqual(@as(u32, 1), Tasker.count(.stale_handle));
+}
+
+fn openAfterStop(pool: *Pool) void {
+    while (!pool.stopping.load(.acquire)) std.Thread.yield() catch {};
+    Tasker.gate.store(true, .release);
+}
+
+test "shutdown finishes running tasks, cancels queued ones and calls every done once" {
+    Tasker.reset();
+    Work.hosted = true;
+    defer Work.hosted = false;
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .task_threads = 1 });
+    try plugins.add(Tasker.init, null);
+    const player = try taskPlayer(&plugins);
+
+    Tasker.gate.store(false, .release);
+    for (0..3) |_| try testing.expectEqual(abi.Status.ok, Tasker.spawn(Tasker.host.?, player));
+    while (Tasker.started.load(.acquire) == 0) std.Thread.yield() catch {};
+    const opener = try std.Thread.spawn(.{}, openAfterStop, .{plugins.pool.?});
+    plugins.deinit();
+    opener.join();
+    try testing.expectEqual(@as(u32, 1), Tasker.started.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), Tasker.count(.stale_handle));
+    try testing.expectEqual(@as(u32, 2), Tasker.count(.canceled));
+    try testing.expectEqual(@as(u32, 0), Tasker.count(.ok));
+}
+
+test "a task that can't be allocated is refused and gives its reservations back" {
+    Tasker.reset();
+    Work.hosted = true;
+    defer Work.hosted = false;
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var plugins: Plugins = try .init(failing.allocator(), &.{}, .{ .task_threads = 1 });
+    defer plugins.deinit();
+    try plugins.add(Tasker.init, null);
+    const player = try plugins.handles.acquire(failing.allocator(), .{ .context = &plugins, .link = 1, .transfer = routedTransfer });
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectEqual(abi.Status.failed, Tasker.spawn(Tasker.host.?, player));
+    try testing.expectEqual(@as(u32, 0), plugins.outstanding.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), plugins.totals(0).outstanding);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(abi.Status.ok, Tasker.spawn(Tasker.host.?, player));
+    Tasker.settle(&plugins, 1);
 }
