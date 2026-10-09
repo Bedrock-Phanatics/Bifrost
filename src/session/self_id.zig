@@ -1,91 +1,80 @@
 const std = @import("std");
 const bedwire = @import("bedwire");
 
-// Packets that start with an actor runtime id; the client keeps the id its first backend gave it
-pub fn leadsWithRuntimeId(kind: ?bedwire.PacketKind) bool {
-    return switch (kind orelse return false) {
-        .move_player, .set_actor_data, .set_actor_motion, .update_attributes, .actor_event, .move_actor_absolute, .move_actor_delta, .mob_effect, .player_action, .set_local_player_as_initialised => true,
-        else => false,
-    };
-}
+const protocol = bedwire.protocol;
+const actor_refs = protocol.actor_refs;
 
+pub const Ids = struct {
+    runtime: u64 = 0,
+    unique: i64 = 0,
+};
+
+// The client keeps the ids its first backend gave it. Swapping both ways keeps
+// the mapping a bijection, so no other actor can end up looking like the player.
 pub const Swap = struct {
-    a: u64,
-    b: u64,
+    client: Ids,
+    backend: Ids,
 
     pub fn active(self: Swap) bool {
-        return self.a != self.b;
+        return self.client.runtime != self.backend.runtime or self.client.unique != self.backend.unique;
     }
 
-    pub fn apply(self: Swap, packet: []const u8, out: *std.ArrayList(u8)) !?[]const u8 {
-        const header_len = try varintLen(packet);
-        const id, const id_len = try varint(packet[header_len..]);
-        const replacement = if (id == self.a) self.b else if (id == self.b) self.a else return null;
-        var encoded: [10]u8 = undefined;
-        const encoded_len = writeVarint(&encoded, replacement);
-        const start = out.items.len;
-        out.appendSliceAssumeCapacity(packet[0..header_len]);
-        out.appendSliceAssumeCapacity(encoded[0..encoded_len]);
-        out.appendSliceAssumeCapacity(packet[header_len + id_len ..]);
-        return out.items[start..];
+    pub fn runtime(self: Swap, id: u64) u64 {
+        return swapped(u64, id, self.client.runtime, self.backend.runtime);
+    }
+
+    pub fn unique(self: Swap, id: i64) i64 {
+        return swapped(i64, id, self.client.unique, self.backend.unique);
+    }
+
+    /// Null when the packet holds neither id; otherwise the re-encoded packet, allocated in `arena`.
+    pub fn apply(self: Swap, arena: std.mem.Allocator, kind: ?bedwire.PacketKind, packet: []const u8, limits: protocol.DecodeLimits) !?[]const u8 {
+        if (!actor_refs.packets.contains(kind orelse return null)) return null;
+        var envelope = try protocol.typed.decode(packet, limits);
+        if (!try actor_refs.rewrite(arena, &envelope.packet, self)) return null;
+        const out = try arena.alloc(u8, try protocol.typed.encodedSize(envelope));
+        var writer: protocol.Writer = .init(out);
+        try protocol.typed.encode(&writer, envelope);
+        return out;
     }
 };
 
-pub const max_growth = 10;
-
-fn varintLen(bytes: []const u8) !usize {
-    return (try varint(bytes))[1];
+fn swapped(comptime T: type, id: T, a: T, b: T) T {
+    return if (id == a) b else if (id == b) a else id;
 }
 
-fn varint(bytes: []const u8) !struct { u64, usize } {
-    var value: u64 = 0;
-    for (bytes[0..@min(bytes.len, 10)], 0..) |byte, i| {
-        value |= @as(u64, byte & 0x7f) << @intCast(7 * i);
-        if (byte & 0x80 == 0) return .{ value, i + 1 };
-    }
-    return error.MalformedPacket;
+fn encode(buffer: []u8, packet: protocol.typed.Packet) ![]const u8 {
+    var writer: protocol.Writer = .init(buffer);
+    try protocol.typed.encode(&writer, .{ .header = .{ .packet_id = protocol.registry.packetId(protocol.typed.packetKind(packet)).?, .sender_subclient = 1 }, .packet = packet });
+    return writer.written();
 }
 
-fn writeVarint(out: *[10]u8, value: u64) usize {
-    var rest = value;
-    var i: usize = 0;
-    while (rest >= 0x80) : (i += 1) {
-        out[i] = @as(u8, @truncate(rest)) | 0x80;
-        rest >>= 7;
-    }
-    out[i] = @truncate(rest);
-    return i + 1;
+fn swapPacket(arena: std.mem.Allocator, swap: Swap, packet: []const u8) !?protocol.typed.Envelope {
+    const header = try protocol.packet.decode(packet, .{});
+    const swapped_packet = try swap.apply(arena, protocol.registry.packetKind(header.header.packet_id), packet, .{}) orelse return null;
+    return try protocol.typed.decode(swapped_packet, .{});
 }
 
-test "ids swap both ways and other packets are left alone" {
-    const gpa = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    try out.ensureTotalCapacity(gpa, 64);
-    const swap: Swap = .{ .a = 1, .b = 300 };
+test "the player's ids swap both ways and other actors are left alone" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const swap: Swap = .{ .client = .{ .runtime = 1, .unique = -1 }, .backend = .{ .runtime = 300, .unique = 4000 } };
+    var buffer: [128]u8 = undefined;
 
-    const to_b = (try swap.apply(&.{ 0x13, 0x01, 0xaa }, &out)).?;
-    try std.testing.expectEqualSlices(u8, &.{ 0x13, 0xac, 0x02, 0xaa }, to_b);
-    const to_a = (try swap.apply(&.{ 0x13, 0xac, 0x02, 0xbb }, &out)).?;
-    try std.testing.expectEqualSlices(u8, &.{ 0x13, 0x01, 0xbb }, to_a);
-    try std.testing.expectEqual(@as(?[]const u8, null), try swap.apply(&.{ 0x13, 0x05 }, &out));
-    try std.testing.expectError(error.MalformedPacket, swap.apply(&.{ 0x13, 0x80 }, &out));
-}
+    const action: protocol.typed.Packet = .{ .player_action = .{ .player_runtime_id = 1, .action = .startdestroyblock, .block_position = .{ .x = 0, .y = 0, .z = 0 }, .result_pos = .{ .x = 0, .y = 0, .z = 0 }, .face = 0 } };
+    const to_backend = (try swapPacket(gpa, swap, try encode(&buffer, action))).?;
+    try std.testing.expectEqual(@as(u64, 300), to_backend.packet.player_action.player_runtime_id);
+    try std.testing.expectEqual(@as(u2, 1), to_backend.header.sender_subclient);
+    const back = (try swapPacket(gpa, swap, try encode(&buffer, to_backend.packet))).?;
+    try std.testing.expectEqual(@as(u64, 1), back.packet.player_action.player_runtime_id);
 
-test "arbitrary packets are either swapped, left alone or rejected" {
-    const gpa = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    var prng: std.Random.DefaultPrng = .init(0x51d);
-    var bytes: [64]u8 = undefined;
-    for (0..50_000) |_| {
-        const random = prng.random();
-        const packet = bytes[0..random.uintAtMost(usize, bytes.len)];
-        random.bytes(packet);
-        out.clearRetainingCapacity();
-        try out.ensureTotalCapacity(gpa, packet.len + max_growth);
-        const swap: Swap = .{ .a = random.uintAtMost(u64, 300), .b = random.int(u64) };
-        const swapped = swap.apply(packet, &out) catch continue;
-        if (swapped) |result| try std.testing.expect(result.len <= packet.len + max_growth);
-    }
+    const other: protocol.typed.Packet = .{ .remove_actor = .{ .target_actor_id = 77 } };
+    try std.testing.expectEqual(null, try swapPacket(gpa, swap, try encode(&buffer, other)));
+    const unique: protocol.typed.Packet = .{ .remove_actor = .{ .target_actor_id = 4000 } };
+    try std.testing.expectEqual(@as(i64, -1), (try swapPacket(gpa, swap, try encode(&buffer, unique))).?.packet.remove_actor.target_actor_id);
+
+    const text = [_]u8{ 9, 0, 0 };
+    try std.testing.expectEqual(null, try swap.apply(gpa, .text, &text, .{}));
+    try std.testing.expectError(error.EndOfStream, swap.apply(gpa, .remove_actor, &.{14}, .{}));
 }

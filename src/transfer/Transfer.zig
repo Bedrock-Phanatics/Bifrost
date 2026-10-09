@@ -8,6 +8,7 @@ const Watch = @import("../net/watch.zig").Watch;
 const no_wait = @import("../net/watch.zig").no_wait;
 const Managed = @import("../session/Managed.zig");
 const Upstream = Managed.Upstream;
+const self_id = @import("../session/self_id.zig");
 const Stats = @import("../proxy/Stats.zig");
 const content = @import("../content/policy.zig");
 const packs = @import("../content/packs.zig");
@@ -72,7 +73,7 @@ content_policy: content.Policy,
 target_packs: packs.Fingerprint = .{},
 target_registries: registries.Fingerprint = .{},
 target_spawn: ?Handoff.Target = null,
-target_runtime_id: u64 = 0,
+target_ids: self_id.Ids = .{},
 handoff: ?Handoff = null,
 managed: *Managed,
 mismatch: ?content.Mismatch = null,
@@ -225,7 +226,7 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
             if (packet.kind == .start_game) {
                 const start = try Managed.typed(decoded, .start_game);
                 self.target_spawn = .{ .dimension = start.settings.spawn_settings.dimension, .position = finite(start.position) };
-                self.target_runtime_id = start.runtime_id;
+                self.target_ids = .{ .runtime = start.runtime_id, .unique = start.entity_id };
                 self.seen.started = true;
             }
             continue;
@@ -314,7 +315,7 @@ fn commit(self: *Transfer, host: Host) !void {
     managed.syncing = true;
     managed.dimension_acks = 0;
     managed.target_spawned = self.seen.spawned;
-    managed.backend_runtime_id = self.target_runtime_id;
+    managed.backend_ids = self.target_ids;
     try managed.sendOutbox(host.ends(), &outbox);
     if (self.handoff.?.waitingForTarget()) {
         managed.hold = &self.queue;

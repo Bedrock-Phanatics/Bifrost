@@ -58,16 +58,18 @@ pub const Shared = struct {
     keys: *const bedwire.auth.KeySet,
     batch: [][]const u8,
     rewrites: std.ArrayList(u8) = .empty,
+    translated: std.heap.ArenaAllocator,
     hooks: ?Hooks = null,
     transfers: bool = true,
 
     pub fn init(gpa: std.mem.Allocator, key: Ecdsa.KeyPair, keys: *const bedwire.auth.KeySet) !Shared {
         var pool: bedwire.BufferPool = try .init(gpa, limits, .{ .rx_slots = 1, .tx_slots = 1 });
         errdefer pool.deinit();
-        return .{ .pool = pool, .key = key, .keys = keys, .batch = try gpa.alloc([]const u8, limits.max_packets_per_batch) };
+        return .{ .pool = pool, .key = key, .keys = keys, .batch = try gpa.alloc([]const u8, limits.max_packets_per_batch), .translated = .init(gpa) };
     }
 
     pub fn deinit(self: *Shared, gpa: std.mem.Allocator) void {
+        self.translated.deinit();
         self.rewrites.deinit(gpa);
         gpa.free(self.batch);
         self.pool.deinit();
@@ -105,7 +107,8 @@ hold: ?*Queue = null,
 syncing: bool = false,
 dimension_acks: u32 = 0,
 target_spawned: bool = false,
-backend_runtime_id: u64 = 0,
+client_ids: self_id.Ids = .{},
+backend_ids: self_id.Ids = .{},
 chunk_radius: ?struct { radius: i32, max: u8 } = null,
 cache_supported: ?bool = null,
 plugin_player: abi.Player = .{},
@@ -169,7 +172,6 @@ pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
             skipped += 1;
             continue;
         }
-        if (ClientState.tracks(kind)) self.observeClient(packet);
         try batch.add(kind, packet);
     }
     try batch.flush();
@@ -178,12 +180,12 @@ pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
 
 pub fn spawnTarget(self: *Managed, ends: Ends) !void {
     var buffer: [16]u8 = undefined;
-    try self.upstream.send(self.upstreamContext(ends, ends.backend orelse return error.BackendClosed), &.{try encodeTyped(&buffer, .{ .set_local_player_as_initialised = .{ .player_id = self.backend_runtime_id } })});
+    try self.upstream.send(self.upstreamContext(ends, ends.backend orelse return error.BackendClosed), &.{try encodeTyped(&buffer, .{ .set_local_player_as_initialised = .{ .player_id = self.backend_ids.runtime } })});
     if (self.upstream.session.state == .spawn_ready) try self.upstream.session.advance(.in_game);
 }
 
-fn swap(self: *const Managed) ?self_id.Swap {
-    const ids: self_id.Swap = .{ .a = self.client_state.own_runtime_id, .b = self.backend_runtime_id };
+fn idSwap(self: *const Managed) ?self_id.Swap {
+    const ids: self_id.Swap = .{ .client = self.client_ids, .backend = self.backend_ids };
     return if (self.transferred and ids.active()) ids else null;
 }
 
@@ -204,8 +206,14 @@ const Batch = struct {
         var kind = original_kind;
         var packet = bytes;
         if (self.count == shared.batch.len) try self.flush();
+        if (self.table != null) try self.reserve(Packets.scratch_bytes);
+        // Plugins and ClientState see the client's ids in both directions
+        const ids = self.managed.idSwap();
+        if (self.to_player) {
+            if (ids) |swap| packet = try swap.apply(shared.translated.allocator(), kind, packet, protocolLimits()) orelse packet;
+            if (ClientState.tracks(kind)) self.managed.observeClient(packet);
+        }
         if (self.table) |table| {
-            try self.reserve(Packets.scratch_bytes + self_id.max_growth);
             const hooks = shared.hooks.?;
             const call: Packets.Call = .{
                 .io = self.ends.io,
@@ -215,7 +223,7 @@ const Batch = struct {
                 .in_game = self.managed.player.state == .in_game,
                 .slow_ns = hooks.plugins.options.slow_callback_ns,
             };
-            switch (Packets.run(table, call, bytes, shared.rewrites.unusedCapacitySlice(), Checker{ .managed = self.managed, .to_player = self.to_player })) {
+            switch (Packets.run(table, call, packet, shared.rewrites.unusedCapacitySlice(), Checker{ .managed = self.managed, .to_player = self.to_player })) {
                 .pass => {},
                 .cancel => return,
                 .replace => |replacement| {
@@ -225,15 +233,14 @@ const Batch = struct {
                 },
             }
         }
-        if (self.managed.swap()) |ids| if (self_id.leadsWithRuntimeId(kind)) {
-            try self.reserve(packet.len + self_id.max_growth);
-            packet = try ids.apply(packet, &shared.rewrites) orelse packet;
+        if (!self.to_player) if (ids) |swap| {
+            packet = try swap.apply(shared.translated.allocator(), kind, packet, protocolLimits()) orelse packet;
         };
         shared.batch[self.count] = packet;
         self.count += 1;
     }
 
-    // Flushing clears rewrites, so it must happen before this packet points into them
+    // Flushing frees rewrites and translations, so it must happen before this packet points into them
     fn reserve(self: *Batch, bytes: usize) !void {
         const rewrites = &self.managed.shared.rewrites;
         if (rewrites.unusedCapacitySlice().len >= bytes) return;
@@ -242,7 +249,10 @@ const Batch = struct {
     }
 
     fn flush(self: *Batch) !void {
-        defer self.managed.shared.rewrites.clearRetainingCapacity();
+        defer {
+            self.managed.shared.rewrites.clearRetainingCapacity();
+            _ = self.managed.shared.translated.reset(.{ .retain_with_limit = 256 * 1024 });
+        }
         if (self.count == 0) return;
         const packets = self.managed.shared.batch[0..self.count];
         self.count = 0;
@@ -475,12 +485,14 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
                 const decoded = try self.upstream.session.decodePacket(packet);
                 try self.initial_registries.record(decoded);
                 if (decoded.value == .typed and decoded.value.typed == .start_game) {
-                    self.client_state.own_runtime_id = decoded.value.typed.start_game.runtime_id;
-                    self.client_dimension = decoded.value.typed.start_game.settings.spawn_settings.dimension;
+                    const start = decoded.value.typed.start_game;
+                    self.client_ids = .{ .runtime = start.runtime_id, .unique = start.entity_id };
+                    self.backend_ids = self.client_ids;
+                    self.client_state.own_runtime_id = start.runtime_id;
+                    self.client_dimension = start.settings.spawn_settings.dimension;
                 }
             }
         }
-        if (ClientState.tracks(packet.kind)) self.observeClient(packet.bytes);
         if (packet.kind == .change_dimension) {
             const decoded = try typed(try self.upstream.session.decodePacket(packet), .change_dimension);
             self.client_dimension = decoded.dimension_id;
