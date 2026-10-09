@@ -9,6 +9,7 @@ const managed = @import("managed.zig");
 const bench_plugins = @import("plugins.zig");
 const bench_ids = @import("runtime_ids.zig");
 const bench_tasks = @import("tasks.zig");
+const bench_handles = @import("handles.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -24,11 +25,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|ids|tasks|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|ids|tasks|handles|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "ids", "tasks", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "ids", "tasks", "handles", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -108,6 +109,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
         if (std.mem.eql(u8, name, "ids")) try idsScenario(&env);
         if (std.mem.eql(u8, name, "tasks")) try tasksScenario(&env);
+        if (std.mem.eql(u8, name, "handles")) try handlesScenario(&env);
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
         if (std.mem.eql(u8, name, "connections")) try connectionsScenario(&env);
         if (std.mem.eql(u8, name, "workers")) try workersScenario(&env);
@@ -748,6 +750,24 @@ fn tasksScenario(env: *Env) !void {
         \\| {d:.0} | {d:.1} us | {d:.1} us |
         \\
     , .{ result.tasks_per_s, result.p50_us, result.p99_us });
+}
+
+fn handlesScenario(env: *Env) !void {
+    const results = try bench_handles.run(env.gpa, env.io, env.quick);
+    try env.out.print(
+        \\
+        \\## Plugin handle table
+        \\
+        \\Threads resolving random handles among 1024 live players as fast as they can, optionally while another
+        \\thread joins and leaves players nonstop.
+        \\
+        \\| lookup threads | join/leave churn | ns per lookup | lookups/s |
+        \\|---|---|---|---|
+        \\
+    , .{});
+    for (results) |result| try env.out.print("| {d} | {s} | {d:.1} | {d:.1}M |\n", .{
+        result.threads, if (result.churn) "yes" else "no", result.ns_per_lookup, result.lookups_per_s / 1e6,
+    });
 }
 
 const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot };

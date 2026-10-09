@@ -168,6 +168,22 @@ the fixed pool with 4 threads.
 
 On WSL2 each submit wakes a sleeping thread through a futex, which is most of the cost; fine for blocking work.
 
+## Plugin handle table
+
+`zig build bench -Doptimize=ReleaseFast -- handles`, recorded 2026-10-09, two runs each, 12 CPUs. Threads resolve
+random handles among 1024 live players nonstop, with and without another thread joining and leaving players nonstop.
+
+| lookup threads | ns per lookup, Windows / WSL2 | with churn | total lookups/s, worst |
+|---|---|---|---|
+| 1 | 4.8 / - | 33 / 50 to 115 | 30M / 9M |
+| 2 | 45 to 64 / 41 to 42 | 94 / 167 to 177 | 21M / 11M |
+| 4 | 175 to 191 / 143 to 158 | 264 to 291 / 230 to 262 | 14M / 15M |
+| 8 | 629 to 678 / 601 to 634 | 817 to 830 / 810 to 845 | 10M / 9.5M |
+
+The global spinlock does contend when every thread does nothing but lookups, but lookups only come from plugin host
+calls, joins, leaves and queue drains, never the relay itself. Even a host call per packet on 8 busy workers is around
+1M lookups/s against 10M/s fully contended, so the table stays as it is.
+
 ## Load audit
 
 Recorded 2026-10-05 on WSL2, ReleaseFast. Nothing here needed a change.
