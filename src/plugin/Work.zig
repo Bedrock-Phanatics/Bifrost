@@ -5,14 +5,27 @@ const Packets = @import("Packets.zig");
 
 pub const max_message_bytes = 1024;
 
-pub const Task = struct {
-    run: abi.TaskFn,
+// True while we're the ones calling into a plugin
+pub threadlocal var hosted: bool = false;
+
+pub fn enter() bool {
+    const outer = hosted;
+    hosted = true;
+    return outer;
+}
+
+pub const Done = struct {
     done: abi.TaskDoneFn,
     user: ?*anyopaque,
     player: abi.Player,
     name: []const u8,
     metrics: []Packets.Metrics,
+};
+
+pub const Task = struct {
+    run: abi.TaskFn,
     outstanding: *std.atomic.Value(u32),
+    then: Done,
 };
 
 pub const Message = struct {
@@ -24,6 +37,7 @@ pub const Message = struct {
 pub const Item = union(enum) {
     task: *Task,
     message: *Message,
+    post: *Done,
 };
 
 // Anyone can post, only the owning worker takes
@@ -31,6 +45,7 @@ pub const Queue = struct {
     lock: std.atomic.Value(bool) = .init(false),
     items: std.ArrayList(Item) = .empty,
     taken: std.ArrayList(Item) = .empty,
+    closed: bool = false,
     notify: ?Notify = null,
 
     pub fn init(gpa: std.mem.Allocator, capacity: usize) !Queue {
@@ -47,11 +62,19 @@ pub const Queue = struct {
     }
 
     // Callers bound the total, so this never grows
-    pub fn post(self: *Queue, item: Item) void {
+    pub fn post(self: *Queue, item: Item) bool {
         self.enter();
-        self.items.appendAssumeCapacity(item);
+        const open = !self.closed;
+        if (open) self.items.appendAssumeCapacity(item);
         self.leave();
-        if (self.notify) |notify| notify.send();
+        if (open) if (self.notify) |notify| notify.send();
+        return open;
+    }
+
+    pub fn close(self: *Queue) void {
+        self.enter();
+        self.closed = true;
+        self.leave();
     }
 
     pub fn take(self: *Queue) []const Item {
@@ -88,10 +111,12 @@ test "a queue hands everything posted so far to its worker" {
     var queue: Queue = try .init(gpa, 4);
     defer queue.deinit(gpa);
     var message: Message = undefined;
-    queue.post(.{ .message = &message });
-    queue.post(.{ .message = &message });
+    try std.testing.expect(queue.post(.{ .message = &message }));
+    try std.testing.expect(queue.post(.{ .message = &message }));
     try std.testing.expectEqual(@as(usize, 2), queue.take().len);
-    queue.post(.{ .message = &message });
+    try std.testing.expect(queue.post(.{ .message = &message }));
+    queue.close();
+    try std.testing.expect(!queue.post(.{ .message = &message }));
     try std.testing.expectEqual(@as(usize, 1), queue.take().len);
     try std.testing.expectEqual(@as(usize, 0), queue.take().len);
 

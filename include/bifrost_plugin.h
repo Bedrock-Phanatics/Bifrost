@@ -8,7 +8,9 @@
 extern "C" {
 #endif
 
-/* Callbacks can run on several worker threads at once, so never block in them */
+/* Plugins run in-process, so a crash takes the proxy down. Callbacks run on several workers at once; never block.
+   From your own threads only log, counts, names, send_message and post work, the rest return WRONG_THREAD.
+   Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns. */
 
 #define BIFROST_ABI_VERSION 1u
 #define BIFROST_NO_BACKEND UINT32_MAX
@@ -30,6 +32,7 @@ enum {
     BIFROST_STATUS_UNSUPPORTED = -5,
     BIFROST_STATUS_TOO_LATE = -6,
     BIFROST_STATUS_BUSY = -7,
+    BIFROST_STATUS_WRONG_THREAD = -8,
 };
 
 /* Only valid until the call returns */
@@ -179,6 +182,8 @@ typedef struct bifrost_host {
     /* run gets its own thread; done runs once, on the player's worker, or with STALE_HANDLE after they leave */
     bifrost_status (*spawn_task)(void *context, bifrost_player player, bifrost_task_fn run, bifrost_task_done_fn done, void *user);
     bifrost_status (*send_message)(void *context, bifrost_player player, bifrost_str text);
+    /* Same done rules as spawn_task, so a plugin thread can get back onto the player's worker */
+    bifrost_status (*post)(void *context, bifrost_player player, bifrost_task_done_fn done, void *user);
 } bifrost_host;
 
 typedef struct bifrost_plugin {

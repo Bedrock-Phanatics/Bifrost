@@ -1,4 +1,6 @@
-// Callbacks can run on several worker threads at once, so never block in them
+// Plugins run in-process, so a crash takes the proxy down. Callbacks run on several workers at once; never block.
+// From your own threads only log, counts, names, send_message and post work, the rest return wrong_thread.
+// Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns.
 
 const std = @import("std");
 
@@ -16,6 +18,7 @@ pub const Status = enum(i32) {
     unsupported = -5,
     too_late = -6,
     busy = -7,
+    wrong_thread = -8,
     _,
 };
 
@@ -159,6 +162,8 @@ pub const Host = extern struct {
     // `run` gets its own thread; `done` runs once, on the player's worker, or with stale_handle after they leave
     spawn_task: *const fn (context: *anyopaque, player: Player, run: ?TaskFn, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
     send_message: *const fn (context: *anyopaque, player: Player, text: Str) callconv(.c) Status,
+    // Same `done` rules as spawn_task, so a plugin thread can get back onto the player's worker
+    post: *const fn (context: *anyopaque, player: Player, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
 };
 
 pub const Plugin = extern struct {

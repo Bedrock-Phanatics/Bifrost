@@ -140,7 +140,9 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
     self.pending_packets.clearRetainingCapacity();
     self.pending_commands.clearRetainingCapacity();
     self.initializing.store(loaded, .release);
+    const outer = Work.enter();
     const status = entry(&loaded.host, &loaded.plugin);
+    Work.hosted = outer;
     self.initializing.store(null, .release);
     if (status != .ok) {
         log.warn("plugin init failed: {t}", .{status});
@@ -180,8 +182,13 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
 }
 
 pub fn unload(self: *Plugins) void {
+    const outer = Work.enter();
+    defer Work.hosted = outer;
     if (self.pool) |pool| self.group.await(pool.io()) catch {};
-    for (self.queues) |*queue| for (queue.take()) |item| self.settle(item, null, null);
+    for (self.queues) |*queue| {
+        queue.close();
+        for (queue.take()) |item| self.settle(item, null, null);
+    }
     var names = self.commands.keyIterator();
     while (names.next()) |name| self.gpa.free(name.*);
     self.commands.clearRetainingCapacity();
@@ -206,6 +213,8 @@ pub fn attachWorker(self: *Plugins, worker: u32, notify: Notify) void {
 }
 
 pub fn drain(self: *Plugins, worker: u32, io: std.Io, sink: anytype) void {
+    const outer = Work.enter();
+    defer Work.hosted = outer;
     for (self.queues[worker].take()) |item| self.settle(item, .{ .worker = worker, .io = io }, sink);
 }
 
@@ -228,7 +237,9 @@ pub fn runCommand(self: *const Plugins, worker: u32, io: std.Io, player: abi.Pla
         .args = .of(std.mem.trim(u8, text[end..], " ")),
     };
     const started = Packets.now(io);
+    const outer = Work.enter();
     command.callback(command.user, &request);
+    Work.hosted = outer;
     self.timed(command.loaded, worker, io, started, "on command {s}", .{lower});
     return true;
 }
@@ -249,25 +260,34 @@ fn settle(self: *Plugins, item: Work.Item, owner: ?Owner, sink: anytype) void {
             const route = self.handles.route(message.player) orelse return;
             sink.message(route.link, message.text[0..message.len]);
         },
-        .task => |task| {
-            const live = owner != null and self.handles.route(task.player) != null;
-            self.finish(task, &.{
-                .status = if (live) .ok else .stale_handle,
-                .worker = if (owner) |at| at.worker else abi.no_worker,
-                .player = task.player,
-            }, owner);
+        .task => |task| self.finish(task, self.liveStatus(task.then.player, owner), owner),
+        .post => |post| {
+            defer {
+                self.gpa.destroy(post);
+                Work.release(&self.messages);
+            }
+            self.complete(post, self.liveStatus(post.player, owner), owner);
         },
     }
 }
 
-fn finish(self: *Plugins, task: *Work.Task, result: *const abi.TaskResult, owner: ?Owner) void {
+fn liveStatus(self: *Plugins, player: abi.Player, owner: ?Owner) abi.Status {
+    return if (owner != null and self.handles.route(player) != null) .ok else .stale_handle;
+}
+
+fn complete(self: *Plugins, then: *const Work.Done, status: abi.Status, owner: ?Owner) void {
+    const result: abi.TaskResult = .{ .status = status, .worker = if (owner) |at| at.worker else abi.no_worker, .player = then.player };
     const started = if (owner) |at| Packets.now(at.io) else 0;
-    task.done(task.user, result);
+    then.done(then.user, &result);
     if (owner) |at| {
         const elapsed = Packets.now(at.io) -| started;
-        task.metrics[at.worker].timed(elapsed);
-        if (elapsed >= self.options.slow_callback_ns) Packets.warnSlow(&task.metrics[at.worker], task.name, elapsed, at.io, "finishing a task", .{});
+        then.metrics[at.worker].timed(elapsed);
+        if (elapsed >= self.options.slow_callback_ns) Packets.warnSlow(&then.metrics[at.worker], then.name, elapsed, at.io, "finishing a task", .{});
     }
+}
+
+fn finish(self: *Plugins, task: *Work.Task, status: abi.Status, owner: ?Owner) void {
+    self.complete(&task.then, status, owner);
     Work.release(task.outstanding);
     Work.release(&self.outstanding);
     self.gpa.destroy(task);
@@ -287,11 +307,11 @@ fn startPool(self: *Plugins) !void {
 }
 
 fn runTask(self: *Plugins, task: *Work.Task) void {
-    task.run(task.user);
-    if (self.handles.route(task.player)) |route| {
-        if (route.worker < self.queues.len) return self.queues[route.worker].post(.{ .task = task });
+    task.run(task.then.user);
+    if (self.handles.route(task.then.player)) |route| {
+        if (route.worker < self.queues.len and self.queues[route.worker].post(.{ .task = task })) return;
     }
-    self.finish(task, &.{ .status = if (task.player.id == 0) .ok else .stale_handle, .player = task.player }, null);
+    self.finish(task, if (task.then.player.id == 0) .ok else .stale_handle, null);
 }
 
 pub fn packetTable(self: *const Plugins, direction: abi.Direction) ?*const Packets.Table {
@@ -329,6 +349,8 @@ fn addPacketHooks(self: *Plugins, loaded: *Loaded) !void {
 }
 
 pub fn emit(self: *const Plugins, event: *const abi.Event, decision: ?*abi.TransferDecision) void {
+    const outer = Work.enter();
+    defer Work.hosted = outer;
     for (self.subscribers[@backingInt(event.kind)].items) |subscriber| subscriber.callback(subscriber.user, event, decision);
 }
 
@@ -360,6 +382,7 @@ fn hostFor(loaded: *Loaded) abi.Host {
         .register_command = hostRegisterCommand,
         .spawn_task = hostSpawnTask,
         .send_message = hostSendMessage,
+        .post = hostPost,
     };
 }
 
@@ -381,6 +404,7 @@ fn hostLog(context: *anyopaque, level: abi.LogLevel, message: abi.Str) callconv(
 fn hostSubscribe(context: *anyopaque, kind: abi.EventKind, callback: ?abi.EventFn, user: ?*anyopaque) callconv(.c) abi.Status {
     const loaded = from(context);
     const owner = loaded.owner;
+    if (!Work.hosted) return .wrong_thread;
     if (owner.initializing.load(.acquire) != loaded) return .too_late;
     if (@backingInt(kind) >= abi.EventKind.count) return .invalid_argument;
     const subscriber: Subscriber = .{ .callback = callback orelse return .invalid_argument, .user = user };
@@ -392,6 +416,7 @@ fn hostSubscribe(context: *anyopaque, kind: abi.EventKind, callback: ?abi.EventF
 fn hostSubscribePacket(context: *anyopaque, direction: abi.Direction, id: u32, phase: abi.PacketPhase, flags: abi.PacketFlags, callback: ?abi.PacketFn, user: ?*anyopaque) callconv(.c) abi.Status {
     const loaded = from(context);
     const owner = loaded.owner;
+    if (!Work.hosted) return .wrong_thread;
     if (owner.initializing.load(.acquire) != loaded) return .too_late;
     if (!owner.options.packets) return .unsupported;
     if (@backingInt(direction) > 1 or id >= Packets.id_count or @backingInt(phase) > 2) return .invalid_argument;
@@ -413,6 +438,7 @@ fn hostSubscribePacket(context: *anyopaque, direction: abi.Direction, id: u32, p
 fn hostRegisterCommand(context: *anyopaque, name: abi.Str, callback: ?abi.CommandFn, user: ?*anyopaque) callconv(.c) abi.Status {
     const loaded = from(context);
     const owner = loaded.owner;
+    if (!Work.hosted) return .wrong_thread;
     if (owner.initializing.load(.acquire) != loaded) return .too_late;
     if (!owner.options.packets) return .unsupported;
     const text = name.slice();
@@ -432,6 +458,7 @@ fn hostRegisterCommand(context: *anyopaque, name: abi.Str, callback: ?abi.Comman
 fn hostSpawnTask(context: *anyopaque, player: abi.Player, run: ?abi.TaskFn, done: ?abi.TaskDoneFn, user: ?*anyopaque) callconv(.c) abi.Status {
     const loaded = from(context);
     const owner = loaded.owner;
+    if (!Work.hosted) return .wrong_thread;
     if (!loaded.plugin.capabilities.tasks) return .unsupported;
     const pool = owner.pool orelse return .unsupported;
     const run_fn = run orelse return .invalid_argument;
@@ -448,12 +475,8 @@ fn hostSpawnTask(context: *anyopaque, player: abi.Player, run: ?abi.TaskFn, done
     };
     task.* = .{
         .run = run_fn,
-        .done = done_fn,
-        .user = user,
-        .player = player,
-        .name = loaded.label(),
-        .metrics = loaded.metrics,
         .outstanding = &loaded.outstanding,
+        .then = .{ .done = done_fn, .user = user, .player = player, .name = loaded.label(), .metrics = loaded.metrics },
     };
     while (owner.group_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
     const started = owner.group.concurrent(pool.io(), runTask, .{ owner, task });
@@ -481,8 +504,28 @@ fn hostSendMessage(context: *anyopaque, player: abi.Player, text: abi.Str) callc
     };
     message.* = .{ .player = player, .len = bytes.len, .text = undefined };
     @memcpy(message.text[0..bytes.len], bytes);
-    owner.queues[route.worker].post(.{ .message = message });
-    return .ok;
+    if (owner.queues[route.worker].post(.{ .message = message })) return .ok;
+    owner.gpa.destroy(message);
+    Work.release(&owner.messages);
+    return .unsupported;
+}
+
+fn hostPost(context: *anyopaque, player: abi.Player, callback: ?abi.TaskDoneFn, user: ?*anyopaque) callconv(.c) abi.Status {
+    const loaded = from(context);
+    const owner = loaded.owner;
+    const done = callback orelse return .invalid_argument;
+    const route = owner.handles.route(player) orelse return .stale_handle;
+    if (route.worker >= owner.queues.len) return .invalid_argument;
+    if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
+    const post = owner.gpa.create(Work.Done) catch {
+        Work.release(&owner.messages);
+        return .failed;
+    };
+    post.* = .{ .done = done, .user = user, .player = player, .name = loaded.label(), .metrics = loaded.metrics };
+    if (owner.queues[route.worker].post(.{ .post = post })) return .ok;
+    owner.gpa.destroy(post);
+    Work.release(&owner.messages);
+    return .unsupported;
 }
 
 fn hostWorkerCount(context: *anyopaque) callconv(.c) u32 {
@@ -509,6 +552,7 @@ fn hostPlayerName(context: *anyopaque, player: abi.Player, out: ?[*]u8, capacity
 
 fn hostTransfer(context: *anyopaque, player: abi.Player, backend: u32) callconv(.c) abi.Status {
     const owner = from(context).owner;
+    if (!Work.hosted) return .wrong_thread;
     if (backend >= owner.backends.len) return .invalid_argument;
     const route = owner.handles.route(player) orelse return .stale_handle;
     return route.transfer(route.context, route.link, backend);
@@ -624,6 +668,9 @@ test "plugins get events, can't subscribe late and shut down newest first" {
     try testing.expectEqual(@as(usize, 2), Probe.events);
 
     const host = Probe.seen_host.?;
+    try testing.expectEqual(abi.Status.wrong_thread, host.subscribe(host.context, .proxy_started, Probe.onEvent, null));
+    Work.hosted = true;
+    defer Work.hosted = false;
     try testing.expectEqual(abi.Status.too_late, host.subscribe(host.context, .proxy_started, Probe.onEvent, null));
     plugins.deinit();
     try testing.expectEqualSlices(u8, &.{ 2, 1 }, Probe.shutdowns[0..Probe.shutdown_count]);
@@ -631,6 +678,8 @@ test "plugins get events, can't subscribe late and shut down newest first" {
 
 test "host calls check handles and backends" {
     Probe.reset();
+    Work.hosted = true;
+    defer Work.hosted = false;
     const backends = [_]Backend{try .init("lobby", .{ .ip4 = .loopback(19133) })};
     var plugins: Plugins = try .init(testing.allocator, &backends, .{});
     defer plugins.deinit();
@@ -659,6 +708,8 @@ test "host calls check handles and backends" {
 
 test "duplicate subscriptions are refused and random host input only gets a status back" {
     Probe.reset();
+    Work.hosted = true;
+    defer Work.hosted = false;
     const backends = [_]Backend{try .init("lobby", .{ .ip4 = .loopback(19133) })};
     var plugins: Plugins = try .init(testing.allocator, &backends, .{});
     defer plugins.deinit();
@@ -680,10 +731,130 @@ test "duplicate subscriptions are refused and random host input only gets a stat
         const status = host.transfer(host.context, player, random.int(u32));
         try testing.expect(status == .stale_handle or status == .invalid_argument);
         try testing.expect(host.send_message(host.context, player, .of(text)) != .ok);
+        try testing.expect(host.post(host.context, player, Delivery.done, null) != .ok);
         try testing.expectEqual(abi.Status.unsupported, host.spawn_task(host.context, player, null, null, null));
     }
     const before = Probe.events;
     try testing.expect(plugins.runCommand(0, testing.io, .{}, "  /PROBE  now "));
     try testing.expectEqual(before + 1, Probe.events);
     try testing.expect(!plugins.runCommand(0, testing.io, .{}, "/probes"));
+}
+
+const Delivery = struct {
+    worker: u32,
+    ok: std.atomic.Value(u32) = .init(0),
+    stale: std.atomic.Value(u32) = .init(0),
+    misplaced: std.atomic.Value(u32) = .init(0),
+
+    fn done(user: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        const self: *Delivery = @ptrCast(@alignCast(user.?));
+        switch (result.status) {
+            .ok => _ = self.ok.fetchAdd(1, .monotonic),
+            .stale_handle => _ = self.stale.fetchAdd(1, .monotonic),
+            else => {},
+        }
+        if (result.status == .ok and (result.worker != self.worker or !Work.hosted)) _ = self.misplaced.fetchAdd(1, .monotonic);
+    }
+};
+
+fn callFromPluginThread(host: abi.Host, player: abi.Player, delivery: *Delivery, statuses: *[6]abi.Status) void {
+    statuses.* = .{
+        host.subscribe(host.context, .proxy_started, Probe.onEvent, null),
+        host.subscribe_packet(host.context, .from_player, 9, .any, .{}, Probe.onPacket, null),
+        host.register_command(host.context, .of("late"), Probe.onCommand, null),
+        host.transfer(host.context, player, 0),
+        host.spawn_task(host.context, player, null, null, null),
+        host.post(host.context, player, Delivery.done, delivery),
+    };
+}
+
+test "a plugin thread gets wrong_thread from callback-only calls and changes nothing" {
+    Probe.reset();
+    const backends = [_]Backend{try .init("lobby", .{ .ip4 = .loopback(19133) })};
+    var plugins: Plugins = try .init(testing.allocator, &backends, .{});
+    defer plugins.deinit();
+    try plugins.add(Probe.doubled, null);
+    const host = Probe.seen_host.?;
+    var seen: [2]u64 = .{ 0, 0 };
+    const player = try plugins.handles.acquire(testing.allocator, .{ .context = &seen, .link = 7, .transfer = routedTransfer });
+
+    var delivery: Delivery = .{ .worker = 0 };
+    var statuses: [6]abi.Status = undefined;
+    const thread = try std.Thread.spawn(.{}, callFromPluginThread, .{ host, player, &delivery, &statuses });
+    thread.join();
+    for (statuses[0..5]) |status| try testing.expectEqual(abi.Status.wrong_thread, status);
+    try testing.expectEqual(abi.Status.ok, statuses[5]);
+    try testing.expectEqual([2]u64{ 0, 0 }, seen);
+    try testing.expect(!plugins.subscribed(.proxy_started));
+    try testing.expectEqual(@as(usize, 1), plugins.commands.count());
+    try testing.expectEqual(@as(usize, 1), plugins.registrations.items.len);
+    plugins.drain(0, testing.io, null);
+    try testing.expectEqual(@as(u32, 1), delivery.ok.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), delivery.misplaced.load(.monotonic));
+}
+
+fn postMany(host: abi.Host, players: [2]abi.Player, deliveries: *[2]Delivery, count: usize) void {
+    for (0..count) |i| {
+        while (host.post(host.context, players[i % 2], Delivery.done, &deliveries[i % 2]) == .busy) std.Thread.yield() catch {};
+    }
+}
+
+test "posts from many threads run once each on the player's worker" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .workers = 2, .max_messages = 64 });
+    defer plugins.deinit();
+    try plugins.add(Probe.first, null);
+    const host = Probe.seen_host.?;
+    var context: u8 = 0;
+    const players: [2]abi.Player = .{
+        try plugins.handles.acquire(testing.allocator, .{ .context = &context, .worker = 0, .link = 1, .transfer = routedTransfer }),
+        try plugins.handles.acquire(testing.allocator, .{ .context = &context, .worker = 1, .link = 2, .transfer = routedTransfer }),
+    };
+    var deliveries: [2]Delivery = .{ .{ .worker = 0 }, .{ .worker = 1 } };
+
+    const per_thread = 500;
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, postMany, .{ host, players, &deliveries, per_thread });
+    const total = threads.len * per_thread;
+    while (deliveries[0].ok.load(.monotonic) + deliveries[1].ok.load(.monotonic) < total) {
+        plugins.drain(0, testing.io, null);
+        plugins.drain(1, testing.io, null);
+        std.Thread.yield() catch {};
+    }
+    for (threads) |thread| thread.join();
+    for (&deliveries) |*delivery| {
+        try testing.expectEqual(@as(u32, total / 2), delivery.ok.load(.monotonic));
+        try testing.expectEqual(@as(u32, 0), delivery.stale.load(.monotonic));
+        try testing.expectEqual(@as(u32, 0), delivery.misplaced.load(.monotonic));
+    }
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
+}
+
+test "posts are bounded, go stale with the player and are settled once at unload" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .max_messages = 2 });
+    try plugins.add(Probe.first, null);
+    const host = Probe.seen_host.?;
+    var context: u8 = 0;
+    const player = try plugins.handles.acquire(testing.allocator, .{ .context = &context, .link = 1, .transfer = routedTransfer });
+    var delivery: Delivery = .{ .worker = 0 };
+
+    try testing.expectEqual(abi.Status.invalid_argument, host.post(host.context, player, null, null));
+    try testing.expectEqual(abi.Status.ok, host.post(host.context, player, Delivery.done, &delivery));
+    try testing.expectEqual(abi.Status.ok, host.post(host.context, player, Delivery.done, &delivery));
+    try testing.expectEqual(abi.Status.busy, host.post(host.context, player, Delivery.done, &delivery));
+    try testing.expect(host.send_message(host.context, player, .of("hi")) == .busy);
+    plugins.handles.release(player);
+    plugins.drain(0, testing.io, null);
+    try testing.expectEqual(@as(u32, 2), delivery.stale.load(.monotonic));
+    try testing.expectEqual(abi.Status.stale_handle, host.post(host.context, player, Delivery.done, &delivery));
+
+    const other = try plugins.handles.acquire(testing.allocator, .{ .context = &context, .link = 2, .transfer = routedTransfer });
+    try testing.expectEqual(abi.Status.ok, host.post(host.context, other, Delivery.done, &delivery));
+    plugins.queues[0].close();
+    try testing.expectEqual(abi.Status.unsupported, host.post(host.context, other, Delivery.done, &delivery));
+    try testing.expectEqual(abi.Status.unsupported, host.send_message(host.context, other, .of("hi")));
+    plugins.deinit();
+    try testing.expectEqual(@as(u32, 3), delivery.stale.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), delivery.ok.load(.monotonic));
 }

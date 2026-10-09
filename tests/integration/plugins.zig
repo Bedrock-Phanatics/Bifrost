@@ -25,6 +25,7 @@ const Recorder = struct {
     fn reset() void {
         for (&counts) |*counter| counter.store(0, .release);
         player.store(0, .release);
+        posted.store(-1, .release);
         name_len.store(0, .release);
         action = .proceed;
         redirect_to = abi.no_backend;
@@ -63,6 +64,14 @@ const Recorder = struct {
             else => {},
         }
         _ = counts[@backingInt(event.kind)].fetchAdd(1, .acq_rel);
+    }
+
+    var posted: std.atomic.Value(i32) = .init(-1);
+
+    fn transferThere(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        const api = host.?;
+        const status = if (result.status == .ok) api.transfer(api.context, result.player, 1) else result.status;
+        posted.store(@backingInt(status), .release);
     }
 
     fn count(kind: abi.EventKind) u32 {
@@ -130,8 +139,10 @@ test "a managed player is named, followed across a transfer and goes stale on le
     try std.testing.expectEqual(abi.Status.ok, host.player_name(host.context, player, &name, name.len, &len));
     try std.testing.expectEqualStrings("Steve", name[0..len]);
 
-    try std.testing.expectEqual(abi.Status.ok, host.transfer(host.context, player, 1));
+    try std.testing.expectEqual(abi.Status.wrong_thread, host.transfer(host.context, player, 1));
+    try std.testing.expectEqual(abi.Status.ok, host.post(host.context, player, Recorder.transferThere, null));
     try rig.waitFor(.transfers_committed, 1);
+    try std.testing.expectEqual(@as(i32, 0), Recorder.posted.load(.acquire));
     try rig.expectOn(&rig.b);
     try Recorder.waitFor(.transfer_completed, 1);
     try std.testing.expectEqual(@as(u32, 0), Recorder.from.load(.acquire));
@@ -141,9 +152,8 @@ test "a managed player is named, followed across a transfer and goes stale on le
     rig.player.destroy();
     rig.player = try managed.Player.connect(io, rig.running.address(), 3);
     try Recorder.waitFor(.player_disconnected, 1);
-    try std.testing.expectEqual(abi.Status.stale_handle, host.transfer(host.context, player, 0));
+    try std.testing.expectEqual(abi.Status.stale_handle, host.post(host.context, player, Recorder.transferThere, null));
     try std.testing.expectEqual(abi.Status.stale_handle, host.player_name(host.context, player, &name, name.len, &len));
-    try std.testing.expectEqual(abi.Status.invalid_argument, host.transfer(host.context, player, 7));
 }
 
 test "a transfer request can be cancelled" {

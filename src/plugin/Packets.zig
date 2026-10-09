@@ -1,5 +1,6 @@
 const std = @import("std");
 const abi = @import("abi.zig");
+const Work = @import("Work.zig");
 
 const log = std.log.scoped(.plugin);
 
@@ -104,6 +105,8 @@ pub fn run(table: *const Table, call: Call, bytes: []const u8, scratch: []u8, ch
     const range = table.ranges[id];
     if (range.len == 0) return .pass;
     std.debug.assert(scratch.len >= scratch_bytes);
+    const outer = Work.enter();
+    defer Work.hosted = outer;
 
     var current = bytes;
     var valid: ?bool = null;

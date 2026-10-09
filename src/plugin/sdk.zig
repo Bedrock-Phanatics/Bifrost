@@ -12,7 +12,7 @@ pub const Command = abi.Command;
 pub const CommandHandler = fn (command: *const Command) void;
 pub const TaskResult = abi.TaskResult;
 
-pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy };
+pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy, WrongThread };
 
 pub const Host = struct {
     raw: *const abi.Host,
@@ -65,6 +65,15 @@ pub const Host = struct {
 
     pub fn message(self: Host, player: Player, text: []const u8) Error!void {
         try check(self.raw.send_message(self.raw.context, player, .of(text)));
+    }
+
+    pub fn post(self: Host, player: Player, comptime done: fn (user: ?*anyopaque, result: *const TaskResult) void, user: ?*anyopaque) Error!void {
+        const Trampoline = struct {
+            fn finish(state: ?*anyopaque, result: *const TaskResult) callconv(.c) void {
+                done(state, result);
+            }
+        };
+        try check(self.raw.post(self.raw.context, player, Trampoline.finish, user));
     }
 
     pub fn workerCount(self: Host) u32 {
@@ -122,6 +131,7 @@ fn check(status: abi.Status) Error!void {
         .unsupported => error.Unsupported,
         .too_late => error.TooLate,
         .busy => error.Busy,
+        .wrong_thread => error.WrongThread,
         else => error.Failed,
     };
 }
