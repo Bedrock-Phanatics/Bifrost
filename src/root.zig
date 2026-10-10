@@ -40,8 +40,10 @@ test {
     _ = @import("session/ClientState.zig");
     _ = @import("transfer/Handoff.zig");
     _ = @import("session/self_id.zig");
+    _ = @import("session/commands.zig");
     _ = @import("plugin/Plugins.zig");
     _ = @import("plugin/Handles.zig");
     _ = @import("plugin/Packets.zig");
     _ = @import("plugin/Work.zig");
+    _ = @import("plugin/sdk.zig");
 }

@@ -10,6 +10,10 @@ pub const Handler = fn (event: *const Event, decision: ?*TransferDecision) void;
 pub const PacketHandler = fn (packet: *Packet) abi.PacketAction;
 pub const Command = abi.Command;
 pub const CommandHandler = fn (command: *const Command) void;
+pub const CommandOptions = struct {
+    description: []const u8 = "",
+    permission: abi.CommandPermission = .any,
+};
 pub const TaskResult = abi.TaskResult;
 
 pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy, WrongThread, Canceled };
@@ -42,12 +46,21 @@ pub const Host = struct {
     }
 
     pub fn command(self: Host, name: []const u8, comptime handler: CommandHandler) Error!void {
+        try self.commandWith(name, .{}, handler);
+    }
+
+    pub fn commandWith(self: Host, name: []const u8, options: CommandOptions, comptime handler: CommandHandler) Error!void {
         const Trampoline = struct {
             fn call(_: ?*anyopaque, request: *const Command) callconv(.c) void {
                 handler(request);
             }
         };
-        try check(self.raw.register_command(self.raw.context, .of(name), Trampoline.call, null));
+        try check(self.raw.register_command_info(self.raw.context, &.{
+            .name = .of(name),
+            .description = .of(options.description),
+            .permission = options.permission,
+            .callback = Trampoline.call,
+        }));
     }
 
     pub fn spawn(self: Host, player: Player, comptime run: fn (user: ?*anyopaque) void, comptime done: fn (user: ?*anyopaque, result: *const TaskResult) void, user: ?*anyopaque) Error!void {
@@ -135,4 +148,16 @@ fn check(status: abi.Status) Error!void {
         .canceled => error.Canceled,
         else => error.Failed,
     };
+}
+
+test "the command helpers compile" {
+    const Probe = struct {
+        fn handle(_: *const Command) void {}
+
+        fn register(host: Host) Error!void {
+            try host.command("a", handle);
+            try host.commandWith("b", .{ .description = "B", .permission = .admin }, handle);
+        }
+    };
+    _ = &Probe.register;
 }

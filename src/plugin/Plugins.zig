@@ -33,10 +33,19 @@ pub const Totals = struct {
     outstanding: u32 = 0,
 };
 
-const Command = struct {
+pub const max_description_len = 256;
+
+pub const Command = struct {
     callback: abi.CommandFn,
     user: ?*anyopaque,
     loaded: *Loaded,
+    permission: abi.CommandPermission = .any,
+    description_buffer: [max_description_len]u8 = undefined,
+    description_len: u16 = 0,
+
+    pub fn description(self: *const Command) []const u8 {
+        return self.description_buffer[0..self.description_len];
+    }
 };
 
 const PendingCommand = struct {
@@ -382,6 +391,7 @@ fn hostFor(loaded: *Loaded) abi.Host {
         .spawn_task = hostSpawnTask,
         .send_message = hostSendMessage,
         .post = hostPost,
+        .register_command_info = hostRegisterCommandInfo,
     };
 }
 
@@ -435,14 +445,33 @@ fn hostSubscribePacket(context: *anyopaque, direction: abi.Direction, id: u32, p
 }
 
 fn hostRegisterCommand(context: *anyopaque, name: abi.Str, callback: ?abi.CommandFn, user: ?*anyopaque) callconv(.c) abi.Status {
-    const loaded = from(context);
+    return registerCommand(from(context), &.{ .name = name, .callback = callback, .user = user });
+}
+
+fn hostRegisterCommandInfo(context: *anyopaque, info: ?*const abi.CommandInfo) callconv(.c) abi.Status {
+    const command = info orelse return .invalid_argument;
+    if (command.struct_size < @sizeOf(abi.CommandInfo)) return .invalid_argument;
+    return registerCommand(from(context), command);
+}
+
+fn registerCommand(loaded: *Loaded, info: *const abi.CommandInfo) abi.Status {
     const owner = loaded.owner;
     if (!Work.hosted) return .wrong_thread;
     if (owner.initializing.load(.acquire) != loaded) return .too_late;
     if (!owner.options.packets) return .unsupported;
-    const text = name.slice();
+    const text = info.name.slice();
+    const description = info.description.slice();
     if (text.len == 0 or text.len > max_command_len) return .invalid_argument;
-    var item: PendingCommand = .{ .name = undefined, .len = text.len, .command = .{ .callback = callback orelse return .invalid_argument, .user = user, .loaded = loaded } };
+    if (description.len > max_description_len or !std.unicode.utf8ValidateSlice(description)) return .invalid_argument;
+    if (@backingInt(info.permission) > @backingInt(abi.CommandPermission.owner)) return .invalid_argument;
+    var item: PendingCommand = .{ .name = undefined, .len = text.len, .command = .{
+        .callback = info.callback orelse return .invalid_argument,
+        .user = info.user,
+        .loaded = loaded,
+        .permission = info.permission,
+        .description_len = @intCast(description.len),
+    } };
+    @memcpy(item.command.description_buffer[0..description.len], description);
     for (text, item.name[0..text.len]) |char, *out| {
         if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return .invalid_argument;
         out.* = std.ascii.toLower(char);
@@ -600,6 +629,22 @@ const Probe = struct {
         return .ok;
     }
 
+    fn described(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        describe(plugin, 7);
+        const long: [max_description_len + 1]u8 = @splat('a');
+        const refused = [_]abi.CommandInfo{
+            .{ .name = .of("long"), .description = .of(&long), .callback = onCommand },
+            .{ .name = .of("bytes"), .description = .of("\xff"), .callback = onCommand },
+            .{ .name = .of("rank"), .permission = @fromBackingInt(@intCast(5)), .callback = onCommand },
+            .{ .struct_size = 8, .name = .of("old"), .callback = onCommand },
+            .{ .name = .of("nobody"), .callback = null },
+        };
+        for (&refused) |*info| if (host.register_command_info(host.context, info) != .invalid_argument) return .failed;
+        if (host.register_command_info(host.context, null) != .invalid_argument) return .failed;
+        const warp: abi.CommandInfo = .{ .name = .of("Warp"), .description = .of("Go places"), .permission = .owner, .callback = onCommand };
+        return host.register_command_info(host.context, &warp);
+    }
+
     fn onPacket(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
         return .pass;
     }
@@ -698,6 +743,17 @@ test "host calls check handles and backends" {
     plugins.handles.release(player);
     try testing.expectEqual(abi.Status.stale_handle, host.transfer(host.context, player, 0));
     try testing.expectEqual(abi.Status.stale_handle, host.player_name(host.context, player, &name, name.len, &len));
+}
+
+test "commands keep their description and permission, and bad ones are refused" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(Probe.described, null);
+    try testing.expectEqual(@as(usize, 1), plugins.commands.count());
+    const warp = plugins.commands.getPtr("warp").?;
+    try testing.expectEqualStrings("Go places", warp.description());
+    try testing.expectEqual(abi.CommandPermission.owner, warp.permission);
 }
 
 test "duplicate subscriptions are refused and random host input only gets a status back" {

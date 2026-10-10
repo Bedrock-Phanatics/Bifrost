@@ -1,4 +1,5 @@
 const std = @import("std");
+const bedwire = @import("bedwire");
 const bifrost = @import("bifrost");
 const fixtures = @import("../support/fixtures.zig");
 const managed = @import("../support/managed.zig");
@@ -217,6 +218,7 @@ test "the C header matches the Zig ABI" {
         .{ abi.Packet, header.bifrost_packet },
         .{ abi.Command, header.bifrost_command },
         .{ abi.TaskResult, header.bifrost_task_result },
+        .{ abi.CommandInfo, header.bifrost_command_info },
     }) |pair| {
         try std.testing.expectEqual(@sizeOf(pair[0]), @sizeOf(pair[1]));
         inline for (comptime std.meta.fieldNames(pair[0])) |field| {
@@ -231,6 +233,7 @@ test "the C header matches the Zig ABI" {
     try expectConstants(abi.Direction, "BIFROST_DIRECTION_");
     try expectConstants(abi.PacketPhase, "BIFROST_PHASE_");
     try expectConstants(abi.PacketAction, "BIFROST_PACKET_");
+    try expectConstants(abi.CommandPermission, "BIFROST_PERMISSION_");
     try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .validated = true })), header.BIFROST_PACKET_VALIDATED);
     try std.testing.expectEqual(abi.version, header.BIFROST_ABI_VERSION);
     try std.testing.expectEqual(abi.no_backend, header.BIFROST_NO_BACKEND);
@@ -443,6 +446,88 @@ test "a plugin command runs on the player's worker and never reaches the backend
     try fixtures.waitFor(io, &rig.b.commands, 1);
     try std.testing.expectEqual(@as(u32, 0), rig.a.commands.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), Commander.commands.load(.acquire));
+}
+
+const wire = bedwire.protocol.packets.available_commands;
+
+fn commandList(buffer: []u8, names: []const []const u8) ![]const u8 {
+    var list: [4]wire.Command = undefined;
+    for (names, list[0..names.len]) |name, *command| command.* = .{
+        .name = name,
+        .description = "from the backend",
+        .flags = 0,
+        .permission_level = "any",
+        .alias_enum = -1,
+        .command_data_chained_subcommand_indexes = .empty,
+        .overloads = .empty,
+    };
+    return managed.typedPacket(buffer, .{ .available_commands = .{
+        .enum_values = .empty,
+        .chained_subcommand_values = .empty,
+        .post_fixes = .empty,
+        .enum_data = .empty,
+        .chained_subcommand_data = .empty,
+        .commands = .init(list[0..names.len]),
+        .soft_enums = .empty,
+        .constraints = .empty,
+    } });
+}
+
+fn expectCommands(player: *managed.Player, expected: []const []const u8) !void {
+    const decoded = try bedwire.protocol.typed.decode(player.commands orelse return error.NotReceived, .{});
+    var it = decoded.packet.available_commands.commands.iterator();
+    var count: usize = 0;
+    while (try it.next()) |command| : (count += 1) {
+        for (expected) |name| {
+            if (std.mem.eql(u8, name, command.name)) break;
+        } else return error.UnexpectedCommand;
+    }
+    try std.testing.expectEqual(expected.len, count);
+}
+
+const Advertised = struct {
+    fn arrived(player: *managed.Player) bool {
+        return player.received(.available_commands) >= 1;
+    }
+};
+
+test "plugin commands are advertised even when the backend lists none" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    Commander.reset();
+    try plugins.add(Commander.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+
+    try rig.pumpUntil(rig.player, Advertised.arrived);
+    try expectCommands(rig.player, &.{ "hub", "slow" });
+}
+
+test "a backend's command list gets plugin commands added, and again after a transfer" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    Commander.reset();
+    try plugins.add(Commander.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    plugins.backends = rig.running.proxy.config.backends();
+
+    var buffer: [512]u8 = undefined;
+    try rig.player.relay(&.{try commandList(&buffer, &.{ "gamemode", "hub" })});
+    try expectCommands(rig.player, &.{ "gamemode", "hub", "slow" });
+
+    try rig.transfer(1);
+    try rig.waitFor(.transfers_committed, 1);
+    try rig.expectOn(&rig.b);
+    try rig.player.relay(&.{try commandList(&buffer, &.{ "warp", "say" })});
+    try expectCommands(rig.player, &.{ "warp", "say", "hub", "slow" });
+
+    try Commander.send(&rig, "/hub");
+    try Commander.waitFor(&Commander.commands, 1);
+    try Commander.send(&rig, "/warp home");
+    try fixtures.waitFor(io, &rig.b.commands, 1);
 }
 
 test "slow plugin work finishes on the player's worker, or reports the player gone" {

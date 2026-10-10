@@ -134,6 +134,18 @@ pub const Command = extern struct {
 
 pub const CommandFn = *const fn (user: ?*anyopaque, command: *const Command) callconv(.c) void;
 
+// Permission only affects autocomplete. Replaces any backend command with the same name
+pub const CommandPermission = enum(u32) { any, game_directors, admin, host, owner, _ };
+
+pub const CommandInfo = extern struct {
+    struct_size: u32 = @sizeOf(CommandInfo),
+    permission: CommandPermission = .any,
+    name: Str,
+    description: Str = .{},
+    callback: ?CommandFn,
+    user: ?*anyopaque = null,
+};
+
 pub const TaskFn = *const fn (user: ?*anyopaque) callconv(.c) void;
 
 pub const TaskResult = extern struct {
@@ -166,6 +178,7 @@ pub const Host = extern struct {
     send_message: *const fn (context: *anyopaque, player: Player, text: Str) callconv(.c) Status,
     // Runs `done` on the player's worker, same rules as spawn_task
     post: *const fn (context: *anyopaque, player: Player, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
+    register_command_info: *const fn (context: *anyopaque, info: ?*const CommandInfo) callconv(.c) Status,
 };
 
 pub const Plugin = extern struct {

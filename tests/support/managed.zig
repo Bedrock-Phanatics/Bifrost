@@ -55,6 +55,7 @@ pub const Player = struct {
     kinds: std.ArrayList(bedwire.PacketKind) = .empty,
     changes: std.ArrayList(protocol.packets.change_dimension.Packet) = .empty,
     actor_packets: std.ArrayList([]u8) = .empty,
+    commands: ?[]u8 = null,
     hold_acks: bool = false,
     held_acks: usize = 0,
 
@@ -89,6 +90,7 @@ pub const Player = struct {
         self.changes.deinit(gpa);
         for (self.actor_packets.items) |packet| gpa.free(packet);
         self.actor_packets.deinit(gpa);
+        if (self.commands) |packet| gpa.free(packet);
         gpa.destroy(self);
     }
 
@@ -203,6 +205,11 @@ pub const Player = struct {
                 if (protocol.actor_refs.packets.contains(kind)) {
                     try self.actor_packets.ensureUnusedCapacity(gpa, 1);
                     self.actor_packets.appendAssumeCapacity(try gpa.dupe(u8, packet.bytes));
+                }
+                if (kind == .available_commands) {
+                    const copy = try gpa.dupe(u8, packet.bytes);
+                    if (self.commands) |old| gpa.free(old);
+                    self.commands = copy;
                 }
                 if (kind == .change_dimension) {
                     try self.changes.append(gpa, (try self.session.decodePacket(packet)).value.typed.change_dimension);

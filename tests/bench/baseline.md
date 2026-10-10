@@ -184,6 +184,22 @@ The global spinlock does contend when every thread does nothing but lookups, but
 calls, joins, leaves and queue drains, never the relay itself. Even a host call per packet on 8 busy workers is around
 1M lookups/s against 10M/s fully contended, so the table stays as it is.
 
+## Plugin command advertisement
+
+The decoded relay now checks each backend packet for `available_commands`. A/B on WSL2 against a76a533,
+`-- managed --quick`, "managed, transfers possible", three alternating runs each, round trips/s:
+
+| | before | after |
+|---|---|---|
+| 256 B 1x1 | 3200 to 3452 | 3288 to 3404 |
+| 256 B 8x32 | 12.6k to 13.9k | 14.2k to 14.7k |
+| 1 KiB 1x1 | 2472 to 2760 | 2536 to 2850 |
+| 8 KiB 8x32 | 1934 to 2010 | 1704 to 2204 |
+| 20 KiB 8x12 | 780 to 854 | 816 to 888 |
+
+All within run-to-run noise. A proxy with plugin commands no longer takes the opaque relay in either direction,
+so it costs what "transfers possible" costs instead of the relayed rows.
+
 ## Load audit
 
 Recorded 2026-10-05 on WSL2, ReleaseFast. Nothing here needed a change.

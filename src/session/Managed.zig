@@ -9,6 +9,7 @@ pub const Upstream = @import("Upstream.zig");
 const ClientState = @import("ClientState.zig");
 pub const Outbox = @import("Outbox.zig");
 pub const self_id = @import("self_id.zig");
+const commands = @import("commands.zig");
 const Queue = @import("../transfer/Queue.zig");
 const Handoff = @import("../transfer/Handoff.zig");
 const Plugins = @import("../plugin/Plugins.zig");
@@ -112,6 +113,7 @@ backend_ids: self_id.Ids = .{},
 chunk_radius: ?struct { radius: i32, max: u8 } = null,
 cache_supported: ?bool = null,
 plugin_player: abi.Player = .{},
+commands_sent: bool = false,
 // Player packets sent before the backend is ready
 early: PacketQueue,
 
@@ -313,11 +315,24 @@ pub fn backendConnected(self: *Managed, ends: Ends) !void {
     try self.upstream.connected(self.upstreamContext(ends, ends.backend.?));
 }
 
-// ClientState and the chunk radius have to see every batch while a transfer is possible
+// ClientState, the chunk radius and plugin commands have to see every batch
 fn relayable(self: *const Managed, direction: abi.Direction) bool {
     if (self.shared.transfers or !self.inGame()) return false;
     const hooks = self.shared.hooks orelse return true;
-    return hooks.plugins.packetTable(direction) == null and (direction == .from_backend or !hooks.plugins.hasCommands());
+    return hooks.plugins.packetTable(direction) == null and !hooks.plugins.hasCommands();
+}
+
+fn pluginCommands(self: *const Managed) ?*const Plugins {
+    const hooks = self.shared.hooks orelse return null;
+    return if (hooks.plugins.hasCommands()) hooks.plugins else null;
+}
+
+fn advertise(self: *Managed, arena: std.mem.Allocator, plugins: *const Plugins, backend: ?[]const u8) ?[]const u8 {
+    self.commands_sent = true;
+    return commands.merge(arena, plugins, backend, limits.max_packet_bytes, protocolLimits()) catch |err| {
+        log.info("plugin commands not advertised: {t}", .{err});
+        return null;
+    };
 }
 
 fn relay(source: anytype, dest: anytype, sink: anytype, stats: *Stats, comptime counter: std.meta.FieldEnum(Stats), payload: []const u8) !bool {
@@ -464,12 +479,23 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
     }
     try batch.flush();
     if (next_state) |state| try self.advance(state);
+    if (next_state == .in_game and !self.commands_sent) if (self.pluginCommands()) |plugins| {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        if (self.advertise(arena.allocator(), plugins, null)) |packet| try self.sendToPlayer(ends, &.{packet});
+    };
 }
 
 fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets) !void {
     var start_game = false;
     var batch = self.newBatch(ends, true);
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena.deinit();
     while (packets.next()) |packet| {
+        var bytes = packet.bytes;
+        if (packet.kind == .available_commands) if (self.pluginCommands()) |plugins| {
+            bytes = self.advertise(arena.allocator(), plugins, bytes) orelse bytes;
+        };
         if (self.syncing and packet.kind == .play_status) {
             if ((try typed(try self.upstream.session.decodePacket(packet), .play_status)).status == .playerspawn) {
                 self.target_spawned = true;
@@ -498,12 +524,12 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
             self.client_dimension = decoded.dimension_id;
         }
         if (self.hold) |hold| {
-            try hold.push(self.gpa, packet.bytes);
+            try hold.push(self.gpa, bytes);
             continue;
         }
         if (packet.kind == .start_game) start_game = true;
         if (self.player.state == .resource_packs) try self.capturePacks(packet);
-        try batch.add(packet.kind, packet.bytes);
+        try batch.add(packet.kind, bytes);
     }
     try batch.flush();
     if (start_game) try self.advance(.spawn_ready);

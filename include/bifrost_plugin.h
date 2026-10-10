@@ -154,6 +154,25 @@ typedef struct bifrost_command {
 
 typedef void (*bifrost_command_fn)(void *user, const bifrost_command *command);
 
+/* Permission only affects autocomplete. Replaces any backend command with the same name */
+typedef uint32_t bifrost_command_permission;
+enum {
+    BIFROST_PERMISSION_ANY = 0,
+    BIFROST_PERMISSION_GAME_DIRECTORS = 1,
+    BIFROST_PERMISSION_ADMIN = 2,
+    BIFROST_PERMISSION_HOST = 3,
+    BIFROST_PERMISSION_OWNER = 4,
+};
+
+typedef struct bifrost_command_info {
+    uint32_t struct_size;
+    bifrost_command_permission permission;
+    bifrost_str name;
+    bifrost_str description;
+    bifrost_command_fn callback;
+    void *user;
+} bifrost_command_info;
+
 typedef void (*bifrost_task_fn)(void *user);
 
 typedef struct bifrost_task_result {
@@ -186,6 +205,7 @@ typedef struct bifrost_host {
     bifrost_status (*send_message)(void *context, bifrost_player player, bifrost_str text);
     /* Runs done on the player's worker, same rules as spawn_task */
     bifrost_status (*post)(void *context, bifrost_player player, bifrost_task_done_fn done, void *user);
+    bifrost_status (*register_command_info)(void *context, const bifrost_command_info *info);
 } bifrost_host;
 
 typedef struct bifrost_plugin {
