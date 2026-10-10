@@ -14,7 +14,7 @@ pub const max_path_len = 1024;
 pub const max_plugins = 16;
 // raknet retries every 500 ms and rejects anything shorter
 pub const min_connect_timeout_ms = 500;
-pub const default_motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;";
+pub const default_motd = "MCPE;Bifrost;2193;1.26.51;0;100;0;Bifrost;Survival;1;19132;19133;";
 
 bind: IpAddress = .{ .ip4 = .unspecified(19132) },
 workers: u8 = 1,

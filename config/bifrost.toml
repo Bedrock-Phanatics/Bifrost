@@ -2,7 +2,7 @@
 bind = "0.0.0.0:19132"
 # Linux only above 1
 workers = 1
-motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;"
+motd = "MCPE;Bifrost;2193;1.26.51;0;100;0;Bifrost;Survival;1;19132;19133;"
 max_players = 4096
 # 0 turns it off
 max_players_per_ip = 0

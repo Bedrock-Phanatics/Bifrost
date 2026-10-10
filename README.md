@@ -7,13 +7,22 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/bifrost
 ```
 
-Settings live in [`config/bifrost.toml`](config/bifrost.toml).
+Settings live in [`config/bifrost.toml`](config/bifrost.toml). More than one `workers` needs Linux (`SO_REUSEPORT`).
+
+## Compatibility
+
+No backend has been checked with a real Bedrock client yet, so none are listed as supported. Backends go here once
+they pass that testing; until then the only evidence is the automated tests, which run against Bifrost's own fake
+RakNet players and backends.
 
 ## Session modes
 
-`passthrough` (the default) relays each player's own encrypted session byte for byte.
+`passthrough` (the default) relays each player's own encrypted session byte for byte. It works with any game version,
+but Bifrost can't see inside the session: there are no transfers, packet hooks, plugin commands or chat messages, and
+plugins only hear about connects, backend choices and disconnects.
 
-`managed` ends the player's session at Bifrost and opens a separate one to the backend:
+`managed` ends the player's session at Bifrost and opens a separate one to the backend. It only speaks Minecraft
+1.26.51 (protocol 2193), and players on any other version are turned away:
 
 - Players must pass Microsoft authentication (`[auth] mode = "verify"`) before Bifrost speaks for them.
 - Bifrost logs in to backends with a certificate chain signed by its proxy key (`proxy_key_file`, created on first
@@ -73,8 +82,8 @@ zig build bench -Doptimize=ReleaseFast -- managed               # passthrough vs
 [`tests/bench/baseline.md`](tests/bench/baseline.md) records the numbers later changes are compared against.
 
 The suite starts the real proxy (`Workers` on the same runtime as `bifrost`) as a child process, and drives it with
-RakNet clients and echo backends from the parent. Scenarios: `relay`, `managed`, `handshake`, `connections`, `workers`,
-`backends`, `plugins`, `fairness`.
+RakNet clients and echo backends from the parent. Scenarios: `relay`, `fairness`, `managed`, `deflate`, `plugins`,
+`ids`, `tasks`, `handles`, `handshake`, `connections`, `workers`, `backends`.
 RSS, CPU and kernel drop counts need Linux; elsewhere only the single-worker numbers are meaningful.
 
 Results from one run (2026-10-06): WSL2 Ubuntu on 12 logical CPUs, ReleaseFast, 1 worker, loopback, with the clients

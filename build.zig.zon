@@ -1,12 +1,12 @@
 .{
     .name = .bifrost,
-    .version = "0.3.0",
+    .version = "1.0.0-rc.1",
     .fingerprint = 0x690b25d757c41963,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zig_raknet = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig?ref=main#04315f4910ea59435f4a86ba653b042bb546423d",
-            .hash = "zig_raknet-0.3.3-1HPoU6DrCgDbXA68GKRvuTsvSU7O22WObsMqUksBHoaX",
+            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig?ref=prod-audit#38b1da97f77311a686cbb2c162b479c80f94e70a",
+            .hash = "zig_raknet-0.3.4-1HPoU_pMDADFUDbUNPXiwXnnKBj9bH1LHhgjFQFdd3KH",
         },
         .bedwire = .{
             .url = "git+https://github.com/Bedrock-Phanatics/bedwire#6b0057c51948ab3012e581bf5c94cbfc5031cfb7",

@@ -26,13 +26,17 @@ fn startWorkers(running: *RunningWorkers, backends: []const *Backend) !void {
 
 fn expectAdvertised(running: *RunningWorkers, players: u32) !void {
     var buffer: [1024]u8 = undefined;
-    for (0..400) |_| {
-        const pong = try raknet.ping(io, running.address(), &buffer, 500);
+    // The listener answers 20 pings a second per address, so stay under that
+    for (0..100) |_| {
+        const pong = raknet.ping(io, running.address(), &buffer, 500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
         var fields = std.mem.splitScalar(u8, pong.advertisement, ';');
         for (0..5) |_| _ = fields.next();
         try std.testing.expectEqualStrings("64", fields.next().?);
         if (bifrost.advertisedPlayers(pong.advertisement) == players) return;
-        try io.sleep(.fromMilliseconds(10), .awake);
+        try io.sleep(.fromMilliseconds(100), .awake);
     }
     return error.AdvertisementNeverUpdated;
 }
