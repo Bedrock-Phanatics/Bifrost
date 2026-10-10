@@ -444,7 +444,12 @@ pub const Backend = struct {
         errdefer pool.deinit();
         self.* = .{
             .io = io,
-            .listener = try raknet.Server.listen(gpa, io, fixtures.loopback, .{ .advertisement = "MCPE;backend" }),
+            // Every transfer dials from the same address, faster than RakNet's default per-address limit
+            .listener = try raknet.Server.listen(gpa, io, fixtures.loopback, .{
+                .advertisement = "MCPE;backend",
+                .offline_rate_per_second = 10_000,
+                .offline_burst = 10_000,
+            }),
             .pool = pool,
             .trusted = trusted,
         };
