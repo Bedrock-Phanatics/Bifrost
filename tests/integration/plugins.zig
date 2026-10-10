@@ -251,6 +251,39 @@ fn expectConstants(comptime Enum: type, comptime prefix: []const u8) !void {
     }
 }
 
+test "a C plugin built from the header loads, gets its event, shuts down and agrees on the layout" {
+    var library: bifrost.Plugins.Library = try .open(test_options.c_plugin);
+    defer library.close();
+    const events = library.lookup(*const fn () callconv(.c) u32, "bifrost_fixture_events").?;
+    const shutdowns = library.lookup(*const fn () callconv(.c) u32, "bifrost_fixture_shutdowns").?;
+    const layout = library.lookup(*const fn (out: [*]u64, capacity: usize) callconv(.c) usize, "bifrost_fixture_layout").?;
+    const events_before = events();
+    const shutdowns_before = shutdowns();
+
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    try plugins.open(test_options.c_plugin);
+    plugins.emit(&.{ .kind = .player_connected }, null);
+    plugins.emit(&.{ .kind = .proxy_started }, null);
+    try std.testing.expectEqual(events_before + 1, events());
+    plugins.deinit();
+    try std.testing.expectEqual(shutdowns_before + 1, shutdowns());
+
+    var expected: [128]u64 = undefined;
+    var len: usize = 0;
+    inline for (.{ abi.Str, abi.Player, abi.Event, abi.TransferDecision, abi.Packet, abi.Command, abi.CommandInfo, abi.TaskResult, abi.Host, abi.Plugin }) |T| {
+        expected[len] = @sizeOf(T);
+        len += 1;
+        inline for (comptime std.meta.fieldNames(T)) |field| {
+            expected[len] = @offsetOf(T, field);
+            len += 1;
+        }
+    }
+    expected[len] = abi.version;
+    len += 1;
+    var actual: [128]u64 = undefined;
+    try std.testing.expectEqualSlices(u64, expected[0..len], actual[0..layout(&actual, actual.len)]);
+}
+
 test "the example plugin loads from disk and keeps players off maintenance" {
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();

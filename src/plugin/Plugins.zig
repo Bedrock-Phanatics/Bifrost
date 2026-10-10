@@ -1,7 +1,7 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 const Backend = @import("../backend/Backend.zig");
-const Library = @import("Library.zig").Library;
+pub const Library = @import("Library.zig").Library;
 pub const Handles = @import("Handles.zig");
 pub const Packets = @import("Packets.zig");
 const Pool = @import("Pool.zig");
