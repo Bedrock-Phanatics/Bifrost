@@ -42,7 +42,9 @@ Plugins get lifecycle and transfer events, can cancel or redirect a transfer bef
 transfers themselves. In managed mode they can also hook individual packets (pass, cancel or replace), register
 commands, send players chat messages and run slow work on task threads. Callbacks run on worker threads and must not
 block; callbacks slower than `[limits] slow_plugin_callback_ms` are logged. Player handles stop working once the
-player leaves.
+player leaves. [`docs/plugin-abi.md`](docs/plugin-abi.md) has the full contract: threads, memory, every host
+function and its statuses, and how the frozen v1 ABI may grow. Plugins run in-process, so one that crashes takes
+the proxy down.
 
 ## Development
 

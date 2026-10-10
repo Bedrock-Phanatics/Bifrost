@@ -10,7 +10,8 @@ extern "C" {
 
 /* Plugins run in-process, so a crash takes the proxy down. Callbacks run on several workers at once; never block.
    From your own threads only log, counts, names, send_message and post work, the rest return WRONG_THREAD.
-   Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns. */
+   Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns.
+   The full contract is in docs/plugin-abi.md. */
 
 #define BIFROST_ABI_VERSION 1u
 #define BIFROST_NO_BACKEND UINT32_MAX
