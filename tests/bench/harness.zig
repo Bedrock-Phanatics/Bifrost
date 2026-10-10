@@ -335,7 +335,7 @@ pub const Backend = struct {
         config.listener.maximum_pending_handshakes = 16_384;
         self.* = .{
             .io = io,
-            .listener = try raknet.Server.listen(gpa, io, loopback(0), .{ .advertisement = "MCPE;bench", .config = config }),
+            .listener = try raknet.Server.listen(gpa, io, loopback(0), .{ .advertisement = "MCPE;bench", .config = config, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000 }),
             .frames = frames,
         };
         errdefer self.listener.destroy();

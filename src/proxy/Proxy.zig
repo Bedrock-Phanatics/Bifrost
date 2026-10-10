@@ -73,6 +73,8 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .advertisement = renderAdvertisement(&config, &ad_buffer, 0),
         .config = raknet_config,
         .reuse_port = config.workers > 1,
+        .offline_rate_per_second = config.handshake_rate_per_ip,
+        .offline_burst = 2 * config.handshake_rate_per_ip,
     });
     errdefer listener.destroy();
     var observer_pool = try Observer.initPool(gpa);

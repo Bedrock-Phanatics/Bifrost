@@ -86,23 +86,23 @@ RakNet clients and echo backends from the parent. Scenarios: `relay`, `fairness`
 `ids`, `tasks`, `handles`, `handshake`, `connections`, `workers`, `backends`.
 RSS, CPU and kernel drop counts need Linux; elsewhere only the single-worker numbers are meaningful.
 
-Results from one run (2026-10-06): WSL2 Ubuntu on 12 logical CPUs, ReleaseFast, 1 worker, loopback, with the clients
-and backends on the same machine as the proxy. Treat them as relative numbers, not capacity planning. The baseline
-file has the full tables, including plugin dispatch costs and the scheduling and fairness audit.
+Results from one run (2026-10-10, 1.0.0-rc.1): WSL2 Ubuntu on 12 logical CPUs, ReleaseFast, 1 worker, loopback, with
+the clients and backends on the same machine as the proxy. Treat them as relative numbers, not capacity planning. The
+baseline file has the full tables, including plugin dispatch costs and the scheduling and fairness audit.
 
 | workload | result |
 |---|---|
-| raw relay, 512 B, 1 message in flight | 9.2k round trips/s, p50 85 us, p99 194 us |
-| raw relay, 512 B, 8 players x 32 in flight | 47.7k round trips/s (23 MiB/s each way), proxy at one full core |
-| raw relay, 20 KiB fragmented, 8 players x 12 in flight | 3.2k round trips/s, 63 MiB/s each way |
-| managed relay, 512 B, 1 message in flight | 2.6k round trips/s, p50 350 us, p99 593 us |
-| managed relay, 512 B, 8 players x 32 in flight | 11.0k round trips/s |
-| joins | 1.4 ms per player passthrough, 14.3 ms managed |
-| transfer, one player | p50 33.6 ms, p99 36.9 ms; live heap flat over 200 transfers |
-| transfers, 8 players at once | whole batch in p50 80.5 ms, p99 90.8 ms; live heap flat over 50 rounds |
-| memory per connected player | 218.5 KiB RSS passthrough; 252.5 KiB heap managed |
-| reconnect churn, 32 clients | about 1,400 cycles/s; live heap identical after every round |
-| idle proxy | 4.0 MiB RSS, 0% CPU with connected but silent players |
+| raw relay, 512 B, 1 message in flight | 10.3k round trips/s, p50 80 us, p99 175 us |
+| raw relay, 512 B, 8 players x 32 in flight | 44.6k round trips/s (21.8 MiB/s each way), proxy at one full core |
+| raw relay, 20 KiB fragmented, 8 players x 12 in flight | 3.2k round trips/s, 62.5 MiB/s each way |
+| managed relay, 512 B, 1 message in flight | 3.5k round trips/s, p50 257 us, p99 425 us |
+| managed relay, 512 B, 8 players x 32 in flight | 26.1k round trips/s; 14.7k at 256 B when every batch is decoded |
+| joins | 1.4 ms per player passthrough, 13.0 ms managed |
+| transfer, one player | p50 33.1 ms, p99 33.8 ms; live heap flat over 200 transfers |
+| transfers, 8 players at once | whole batch in p50 77.2 ms, p99 87.5 ms; live heap flat over 50 rounds |
+| memory per connected player | 228.3 KiB RSS passthrough; 252.5 KiB heap managed |
+| reconnect churn, 32 clients | 600 to 1,600 cycles/s; live heap identical after every round |
+| idle proxy | 4.0 MiB RSS, 0.1% CPU with connected but silent players |
 
 On Linux, `net.core.rmem_max` (often 208 KiB) silently caps the 4 MiB receive buffer RakNet asks for. Bursts of joins
 or leaves then overflow it: the bench reports these drops, and they show up as about 500 ms RakNet retries on joins

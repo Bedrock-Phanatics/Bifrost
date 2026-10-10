@@ -61,7 +61,7 @@ pub const Backend = struct {
     pub fn start(self: *Backend, io: std.Io, options: Options) !void {
         self.* = .{
             .io = io,
-            .listener = try raknet.Server.listen(gpa, io, loopback, .{ .advertisement = options.advertisement }),
+            .listener = try raknet.Server.listen(gpa, io, loopback, .{ .advertisement = options.advertisement, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000 }),
             .greeting = options.greeting,
             .replies = options.replies,
         };

@@ -152,7 +152,7 @@ pub const Backend = struct {
         self.* = .{
             .gpa = gpa,
             .io = io,
-            .listener = try raknet.Server.listen(gpa, io, harness.loopback(0), .{ .advertisement = "MCPE;bench", .config = config }),
+            .listener = try raknet.Server.listen(gpa, io, harness.loopback(0), .{ .advertisement = "MCPE;bench", .config = config, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000 }),
             .pool = undefined,
             .trusted = proxyKey().public_key,
         };

@@ -14,6 +14,8 @@ pending_bytes = 1048576
 # Plugin callbacks slower than this get a warning, at most every 10 s per plugin
 slow_plugin_callback_ms = 5
 plugin_task_threads = 4
+# Handshake traffic per IP, in RakNet tokens a second (one per 64 bytes); lower it if floods are a concern
+handshake_rate_per_ip = 2000
 
 [health]
 interval_ms = 5000

@@ -240,3 +240,37 @@ observed handshake p50 9456 us, 400 joins/s at 500 players, churn 582 to 732 cyc
 
 Windows 11, same machine, ReleaseFast, Zig 0.17: relay 512 B 1x1 5076 round trips/s (p50 155 us, p99 303 us),
 1149 joins/s with 1 healthy backend, churn 307 to 836 cycles/s. RSS, CPU and multiple workers are Linux only.
+
+## 1.0.0-rc.1
+
+Recorded 2026-10-10 on WSL2 Ubuntu, 12 logical CPUs, ReleaseFast, full `zig build bench` plus
+`zig build test -Doptimize=ReleaseFast -Dtransfer-report=true`, with raknet `38b1da9`.
+
+That raknet limits handshake traffic per IP instead of per client port, at 20 tokens a second by default. With every
+bench client on 127.0.0.1 that capped joins at about 8 a second, both at the proxy and at the bench's own echo
+backends. Bifrost now sets the player listener from `[limits] handshake_rate_per_ip` (default 2000), and the bench
+and test backends lift the limit entirely.
+
+| metric | result | earlier baseline |
+|---|---|---|
+| raw relay 512 B 1x1 | 10266 round trips/s, p50 80 us, p99 175 us | 9215, 84 / 198 |
+| raw relay 512 B 8x32 | 44591 round trips/s, 21.8 MiB/s | 44700 |
+| raw relay 20 KiB 8x12 | 62.5 MiB/s one way | 54.0 |
+| managed 512 B 1x1, relayed | 3524 round trips/s, p50 257 us, p99 425 us | 2613 decoded |
+| managed 512 B 8x32, relayed | 26094 round trips/s | 11048 decoded |
+| managed 256 B 8x32, every batch decoded | 14676 round trips/s, p50 15.2 ms, p99 39.1 ms | |
+| workers 1 / 2 / 4 / 8 | 34.2k / 66.1k / 107.9k / 146.5k round trips/s | 23.2k / 55.8k / 83.0k / 83.0k |
+| joins/s, 2000 players, first wave | 800 to 872 | 1101 |
+| join p50 / p99, 2000 players, first wave | 27.6 to 47.9 / 552 to 565 ms | 27.5 / 550.3 |
+| joins/s, 1 healthy backend | 1617 | 1509 |
+| reconnect churn, cycles/s per round | 617 to 1643 | 1153 to 1555 |
+| RSS per held player, passthrough | 228.3 KiB | 217.9 KiB |
+| heap per managed player | 252.5 KiB, 276.5 KiB with a packet hook | 252.5 / 276.5 |
+| fresh proxy | 4096 KiB RSS, 0.1% CPU with 8 silent players | 3584 KiB |
+| one player A↔B 200 times | p50 33.1 ms, p99 33.8 ms, live heap identical after 20 and 200 | 33.6 / 36.9 |
+| 8 players at once, 50 rounds | p50 77.2 ms, p95 86.6 ms, p99 87.5 ms, live heap identical after 5 and 50 | 80.5 / 88.0 / 90.8 |
+
+Nothing regressed beyond run-to-run noise once the handshake limit was lifted. Joins in the first 2000-player wave
+are about a quarter below the old baseline and churn varies more between rounds; both runs logged thousands of
+kernel UDP drops (`net.core.rmem_max` is 208 KiB here), which likely explains the spread. Second waves of 500
+and 2000 players occasionally join nobody for the same reason.
