@@ -1,6 +1,6 @@
 .{
     .name = .bifrost,
-    .version = "1.0.0-rc.1",
+    .version = "1.1.1-rc.1",
     .fingerprint = 0x690b25d757c41963,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
