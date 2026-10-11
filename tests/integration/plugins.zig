@@ -661,3 +661,32 @@ test "a C plugin can be loaded and unloaded repeatedly" {
     }
     try std.testing.expectEqual(before + 20, shutdowns());
 }
+
+test "a C++23 plugin loads, keeps its exceptions to itself and shuts down" {
+    var library: bifrost.Plugins.Library = try .open(test_options.cpp_plugin);
+    defer library.close();
+    const counter = *const fn () callconv(.c) u32;
+    const events = library.lookup(counter, "bifrost_fixture_events").?;
+    const caught = library.lookup(counter, "bifrost_fixture_caught").?;
+    const shutdowns = library.lookup(counter, "bifrost_fixture_shutdowns").?;
+    const args = library.lookup(*const fn (out: [*]u8, capacity: usize) callconv(.c) usize, "bifrost_fixture_args").?;
+    const host_size = library.lookup(*const fn () callconv(.c) usize, "bifrost_fixture_host_size").?;
+    try std.testing.expectEqual(@as(usize, @sizeOf(abi.Host)), host_size());
+    const events_before = events();
+    const caught_before = caught();
+    const shutdowns_before = shutdowns();
+
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    try plugins.open(test_options.cpp_plugin);
+    try std.testing.expectEqualStrings("cpp-fixture", plugins.metadata(0).name());
+    try std.testing.expectEqualStrings("Built as C++23", plugins.metadata(0).description());
+    plugins.emit(&.{ .kind = .player_connected }, null);
+    try std.testing.expectEqual(events_before + 1, events());
+    try std.testing.expect(plugins.runCommand(0, io, .{}, "/echo"));
+    try std.testing.expectEqual(caught_before + 1, caught());
+    try std.testing.expect(plugins.runCommand(0, io, .{}, "/ECHO hello there"));
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("hello there", buffer[0..args(&buffer, buffer.len)]);
+    plugins.deinit();
+    try std.testing.expectEqual(shutdowns_before + 1, shutdowns());
+}

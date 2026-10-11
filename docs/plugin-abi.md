@@ -10,6 +10,10 @@ ways listed under [Versioning](#versioning).
 Plugins are native code loaded into the proxy's process. They are trusted completely: a crash, an infinite loop or
 memory corruption in a plugin takes the whole proxy down. There is no sandbox or process isolation.
 
+No exception may cross into Bifrost, from `bifrost_plugin_init` or any callback. With C++17 or newer the header
+makes the entry point and every callback type `noexcept`, so passing a function that might throw doesn't compile, and
+an exception that escapes anyway calls `std::terminate` instead of unwinding through Bifrost. Catch inside.
+
 ## Loading
 
 `bifrost_plugin_init(host, plugin)` is called once, on the main thread, before any player connects. Fill in
@@ -93,8 +97,14 @@ spawned with no player (`id` 0) finishes with `OK` on the task thread itself. Ta
   `replacement_len`. A replacement that doesn't decode is dropped and counted as an error. With
   `BIFROST_PACKET_VALIDATED` the hook only sees packets that decode.
 - **Commands** get the lowercase `name` and the trimmed `args`. A plugin command replaces a backend command with the
-  same name, both in autocomplete and when run. `permission` only changes what clients show; check who is allowed
-  in the callback.
+  same name, both in autocomplete and when run.
+
+### Command permissions
+
+`permission` only decides whether a client lists the command in autocomplete. Bifrost never enforces it: any
+client can send any command, whatever it shows, and Bifrost doesn't know which permission level the backend gave a
+player, so it has nothing authoritative to check against. A command that needs authorization has to check it in the
+callback against something the plugin trusts, such as a list of XUIDs it saw in `PLAYER_AUTHENTICATED`.
 
 ## Player handles
 

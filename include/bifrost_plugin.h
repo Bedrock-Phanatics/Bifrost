@@ -23,6 +23,13 @@ extern "C" {
 #define BIFROST_EXPORT __attribute__((visibility("default")))
 #endif
 
+/* An exception escaping into Bifrost terminates the proxy instead of unwinding through it */
+#if defined(__cplusplus) && __cplusplus >= 201703L
+#define BIFROST_NOEXCEPT noexcept
+#else
+#define BIFROST_NOEXCEPT
+#endif
+
 typedef int32_t bifrost_status;
 enum {
     BIFROST_STATUS_OK = 0,
@@ -143,7 +150,7 @@ typedef struct bifrost_packet {
     size_t replacement_len;
 } bifrost_packet;
 
-typedef bifrost_packet_action (*bifrost_packet_fn)(void *user, bifrost_packet *packet);
+typedef bifrost_packet_action (*bifrost_packet_fn)(void *user, bifrost_packet *packet) BIFROST_NOEXCEPT;
 
 typedef struct bifrost_command {
     uint32_t struct_size;
@@ -153,9 +160,9 @@ typedef struct bifrost_command {
     bifrost_str args;
 } bifrost_command;
 
-typedef void (*bifrost_command_fn)(void *user, const bifrost_command *command);
+typedef void (*bifrost_command_fn)(void *user, const bifrost_command *command) BIFROST_NOEXCEPT;
 
-/* Permission only affects autocomplete. Replaces any backend command with the same name */
+/* Permission only hides the command in autocomplete and is never enforced. Replaces any backend command with the same name */
 typedef uint32_t bifrost_command_permission;
 enum {
     BIFROST_PERMISSION_ANY = 0,
@@ -174,7 +181,7 @@ typedef struct bifrost_command_info {
     void *user;
 } bifrost_command_info;
 
-typedef void (*bifrost_task_fn)(void *user);
+typedef void (*bifrost_task_fn)(void *user) BIFROST_NOEXCEPT;
 
 typedef struct bifrost_task_result {
     uint32_t struct_size;
@@ -183,32 +190,32 @@ typedef struct bifrost_task_result {
     bifrost_player player;
 } bifrost_task_result;
 
-typedef void (*bifrost_task_done_fn)(void *user, const bifrost_task_result *result);
+typedef void (*bifrost_task_done_fn)(void *user, const bifrost_task_result *result) BIFROST_NOEXCEPT;
 
-typedef void (*bifrost_event_fn)(void *user, const bifrost_event *event, bifrost_transfer_decision *decision);
+typedef void (*bifrost_event_fn)(void *user, const bifrost_event *event, bifrost_transfer_decision *decision) BIFROST_NOEXCEPT;
 
 typedef struct bifrost_host {
     uint32_t struct_size;
     uint32_t abi_version;
     void *context;
-    void (*log)(void *context, bifrost_log_level level, bifrost_str message);
-    bifrost_status (*subscribe)(void *context, bifrost_event_kind kind, bifrost_event_fn callback, void *user);
-    uint32_t (*backend_count)(void *context);
-    bifrost_status (*backend_name)(void *context, uint32_t backend, bifrost_str *name);
-    bifrost_status (*player_name)(void *context, bifrost_player player, uint8_t *out, size_t capacity, size_t *len);
-    bifrost_status (*transfer)(void *context, bifrost_player player, uint32_t backend);
-    uint32_t (*worker_count)(void *context);
-    bifrost_status (*subscribe_packet)(void *context, bifrost_direction direction, uint32_t id, bifrost_packet_phase phase, uint32_t flags, bifrost_packet_fn callback, void *user);
-    bifrost_status (*register_command)(void *context, bifrost_str name, bifrost_command_fn callback, void *user);
+    void (*log)(void *context, bifrost_log_level level, bifrost_str message) BIFROST_NOEXCEPT;
+    bifrost_status (*subscribe)(void *context, bifrost_event_kind kind, bifrost_event_fn callback, void *user) BIFROST_NOEXCEPT;
+    uint32_t (*backend_count)(void *context) BIFROST_NOEXCEPT;
+    bifrost_status (*backend_name)(void *context, uint32_t backend, bifrost_str *name) BIFROST_NOEXCEPT;
+    bifrost_status (*player_name)(void *context, bifrost_player player, uint8_t *out, size_t capacity, size_t *len) BIFROST_NOEXCEPT;
+    bifrost_status (*transfer)(void *context, bifrost_player player, uint32_t backend) BIFROST_NOEXCEPT;
+    uint32_t (*worker_count)(void *context) BIFROST_NOEXCEPT;
+    bifrost_status (*subscribe_packet)(void *context, bifrost_direction direction, uint32_t id, bifrost_packet_phase phase, uint32_t flags, bifrost_packet_fn callback, void *user) BIFROST_NOEXCEPT;
+    bifrost_status (*register_command)(void *context, bifrost_str name, bifrost_command_fn callback, void *user) BIFROST_NOEXCEPT;
     /* run shares a few threads with every plugin. done runs once on the player's worker,
        with STALE_HANDLE if they left or CANCELED if run never started */
-    bifrost_status (*spawn_task)(void *context, bifrost_player player, bifrost_task_fn run, bifrost_task_done_fn done, void *user);
-    bifrost_status (*send_message)(void *context, bifrost_player player, bifrost_str text);
+    bifrost_status (*spawn_task)(void *context, bifrost_player player, bifrost_task_fn run, bifrost_task_done_fn done, void *user) BIFROST_NOEXCEPT;
+    bifrost_status (*send_message)(void *context, bifrost_player player, bifrost_str text) BIFROST_NOEXCEPT;
     /* Runs done on the player's worker, same rules as spawn_task */
-    bifrost_status (*post)(void *context, bifrost_player player, bifrost_task_done_fn done, void *user);
-    bifrost_status (*register_command_info)(void *context, const bifrost_command_info *info);
+    bifrost_status (*post)(void *context, bifrost_player player, bifrost_task_done_fn done, void *user) BIFROST_NOEXCEPT;
+    bifrost_status (*register_command_info)(void *context, const bifrost_command_info *info) BIFROST_NOEXCEPT;
     /* Check BIFROST_HOST_HAS(host, set_description) first */
-    bifrost_status (*set_description)(void *context, bifrost_str description);
+    bifrost_status (*set_description)(void *context, bifrost_str description) BIFROST_NOEXCEPT;
 } bifrost_host;
 
 /* Older hosts have a shorter table, so use this instead of sizeof */
@@ -221,10 +228,10 @@ typedef struct bifrost_plugin {
     bifrost_str plugin_version;
     uint64_t capabilities;
     void *state;
-    void (*shutdown)(void *state);
+    void (*shutdown)(void *state) BIFROST_NOEXCEPT;
 } bifrost_plugin;
 
-BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin);
+BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin) BIFROST_NOEXCEPT;
 
 #ifdef __cplusplus
 }

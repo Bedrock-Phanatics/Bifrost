@@ -21,6 +21,7 @@ const Context = struct {
 const Plugin = struct {
     example: *std.Build.Step.Compile,
     c_fixture: *std.Build.Step.Compile,
+    cpp_fixture: *std.Build.Step.Compile,
     header: *std.Build.Module,
 };
 
@@ -94,7 +95,14 @@ fn addPluginSdk(ctx: Context) Plugin {
     }) });
     c_fixture.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/fixture.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
     c_fixture.root_module.addIncludePath(b.path("include"));
-    return .{ .example = example, .c_fixture = c_fixture, .header = header.createModule() };
+    const cpp_fixture = b.addLibrary(.{ .name = "cpp_fixture", .linkage = .dynamic, .root_module = b.createModule(.{
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libcpp = true,
+    }) });
+    cpp_fixture.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/fixture.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
+    cpp_fixture.root_module.addIncludePath(b.path("include"));
+    return .{ .example = example, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .header = header.createModule() };
 }
 
 fn addTests(ctx: Context, plugin: Plugin) void {
@@ -113,6 +121,7 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     options.addOption(u32, "soak", b.option(u32, "soak", "Multiply the transfer stress rounds, e.g. 25 for a soak run") orelse 1);
     options.addOptionPath("example_plugin", plugin.example.getEmittedBin());
     options.addOptionPath("c_plugin", plugin.c_fixture.getEmittedBin());
+    options.addOptionPath("cpp_plugin", plugin.cpp_fixture.getEmittedBin());
     integration_tests.root_module.addImport("test_options", options.createModule());
 
     const step = b.step("test", "Run unit and integration tests");
