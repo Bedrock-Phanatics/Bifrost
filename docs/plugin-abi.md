@@ -19,6 +19,11 @@ startup. Bifrost refuses a plugin whose `abi_version` differs from `BIFROST_ABI_
 smaller than it knows, or that asks for a capability bit it doesn't know. `TASKS` is the only capability enforced
 today, but declare the ones you use.
 
+`name` (up to 64 bytes) and `plugin_version` (up to 64 bytes) are required and must be printable UTF-8: no control
+characters, and no `NULL` pointer with a non-zero length. A plugin can also call `set_description` with up to 256
+bytes of the same. Bifrost checks and copies all three when `bifrost_plugin_init` returns, so they only have to stay
+valid until then, and logs them as the plugin loads.
+
 `shutdown(state)` runs once, after every worker has stopped and every task has finished or been canceled, newest
 plugin first. Stop any threads you started before it returns; Bifrost unloads the library right after.
 
@@ -33,7 +38,7 @@ and `PROXY_STOPPING` on whichever thread stops the proxy.
 |---|---|
 | `log`, `worker_count`, `backend_count`, `backend_name`, `player_name`, `send_message`, `post` | any thread |
 | `transfer`, `spawn_task` | inside a callback Bifrost is running |
-| `subscribe`, `subscribe_packet`, `register_command`, `register_command_info` | inside `bifrost_plugin_init` |
+| `subscribe`, `subscribe_packet`, `register_command`, `register_command_info`, `set_description` | inside `bifrost_plugin_init` |
 
 A restricted call made from your own thread returns `WRONG_THREAD` and does nothing. To act on a player from your
 own thread, `post` to their worker and make the call from the `done` callback.
@@ -57,6 +62,7 @@ of memory.
 | `subscribe_packet(direction, id, phase, flags, callback, user)` | hooks one packet id in one direction, managed mode only | `UNSUPPORTED` in passthrough; `INVALID_ARGUMENT` for a bad direction, id or phase, no callback or a duplicate; `TOO_LATE` |
 | `register_command(name, callback, user)` | same as `register_command_info` with no description and permission `ANY` | as below |
 | `register_command_info(info)` | claims a `/command` and advertises it to clients, managed mode only | `UNSUPPORTED` in passthrough; `INVALID_ARGUMENT` for a name outside `[A-Za-z0-9_-]{1,32}`, a name already taken, a description over 256 bytes or not UTF-8, an unknown permission, no callback or a short `struct_size`; `TOO_LATE` |
+| `set_description(description)` | sets the description shown when the plugin loads; calling it again replaces it | `INVALID_ARGUMENT` for over 256 bytes, not printable UTF-8 or a `NULL` pointer with a length; `TOO_LATE` |
 | `backend_count()` | number of configured backends | none |
 | `backend_name(backend, name)` | name of a backend | `INVALID_ARGUMENT` for an unknown backend or no `name` |
 | `player_name(player, out, capacity, len)` | copies up to `capacity` bytes of the name and sets `len` to its full length | `STALE_HANDLE` after the player left (before authentication the name is empty); `INVALID_ARGUMENT` for no `len` or no `out` with a capacity |
@@ -90,7 +96,16 @@ it returns `STALE_HANDLE`, even if a new player gets the same slot. `id` 0 is ne
 
 ## Versioning
 
-- `BIFROST_ABI_VERSION` changes only for a breaking change, and Bifrost refuses plugins built for another version.
-- Structs only grow at the end. Each carries `struct_size`: check `host->struct_size` before using a host function
-  newer than your header, and fill in `struct_size` on structs you pass in so Bifrost knows which fields you set.
+- `BIFROST_ABI_VERSION` changes only for a breaking change. Each side checks the other's `abi_version` and refuses
+  a mismatch: Bifrost returns an error for the plugin, a plugin should return `INCOMPATIBLE`.
+- `bifrost_host` only grows at the end. A plugin must not compare `host->struct_size` with its own
+  `sizeof(bifrost_host)`, or it would refuse older v1 hosts for no reason. Check the functions it needs with
+  `BIFROST_HOST_HAS(host, fn)` (`host.has(.fn)` in Zig) and skip the optional ones that are missing.
+  `set_description` is the first function added this way.
+- Structs Bifrost passes in (`bifrost_event`, `bifrost_packet`, `bifrost_command`, `bifrost_task_result`) can grow
+  at the end too: read a field newer than your header only when `struct_size` covers it.
+- Structs a plugin writes into (`bifrost_plugin`, `bifrost_transfer_decision`, `bifrost_packet`) never grow in v1,
+  because a newer plugin writing a field into an older host's smaller struct would corrupt it. New outputs arrive as
+  new host functions instead.
+- Structs you pass in (`bifrost_command_info`) carry `struct_size` so Bifrost knows which fields you set; fill it in.
 - Enums and status codes can gain values; treat unknown ones as "not for me" rather than as errors.

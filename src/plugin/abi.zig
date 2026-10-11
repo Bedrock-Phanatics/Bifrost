@@ -179,6 +179,13 @@ pub const Host = extern struct {
     // Runs `done` on the player's worker, same rules as spawn_task
     post: *const fn (context: *anyopaque, player: Player, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
     register_command_info: *const fn (context: *anyopaque, info: ?*const CommandInfo) callconv(.c) Status,
+    // Check has(.set_description) first
+    set_description: *const fn (context: *anyopaque, description: Str) callconv(.c) Status,
+
+    pub fn has(self: *const Host, comptime field: std.meta.FieldEnum(Host)) bool {
+        const name = @tagName(field);
+        return self.struct_size >= @offsetOf(Host, name) + @sizeOf(@FieldType(Host, name));
+    }
 };
 
 pub const Plugin = extern struct {
@@ -192,3 +199,17 @@ pub const Plugin = extern struct {
 };
 
 pub const InitFn = *const fn (host: *const Host, plugin: *Plugin) callconv(.c) Status;
+
+// Older hosts allocate these, so a new field would overflow them
+test "structs plugins write into are frozen" {
+    const frozen = .{
+        .{ Plugin, &[_][]const u8{ "struct_size", "abi_version", "name", "plugin_version", "capabilities", "state", "shutdown" } },
+        .{ TransferDecision, &[_][]const u8{ "struct_size", "action", "backend" } },
+        .{ Packet, &[_][]const u8{ "struct_size", "direction", "id", "worker", "player", "bytes", "replacement", "replacement_capacity", "replacement_len" } },
+    };
+    inline for (frozen) |pair| {
+        const names = comptime std.meta.fieldNames(pair[0]);
+        try std.testing.expectEqual(pair[1].len, names.len);
+        for (names, pair[1]) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
+    }
+}

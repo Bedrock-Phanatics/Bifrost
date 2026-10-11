@@ -262,6 +262,9 @@ test "a C plugin built from the header loads, gets its event, shuts down and agr
 
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     try plugins.open(test_options.c_plugin);
+    try std.testing.expectEqualStrings("c-fixture", plugins.metadata(0).name());
+    try std.testing.expectEqualStrings("1.0.0", plugins.metadata(0).version());
+    try std.testing.expectEqualStrings("Counts players", plugins.metadata(0).description());
     plugins.emit(&.{ .kind = .player_connected }, null);
     plugins.emit(&.{ .kind = .proxy_started }, null);
     try std.testing.expectEqual(events_before + 1, events());
@@ -288,6 +291,7 @@ test "the example plugin loads from disk and keeps players off maintenance" {
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
     try plugins.open(test_options.example_plugin);
+    try std.testing.expectEqualStrings("Keeps players off the maintenance backend", plugins.metadata(0).description());
     var rig: Rig = undefined;
     try rig.start(.{ .plugins = &plugins, .b_name = "maintenance" });
     defer rig.deinit();

@@ -115,15 +115,23 @@ pub const Host = struct {
 };
 
 pub fn exportPlugin(comptime Plugin: type) void {
-    const Entry = struct {
+    @export(entry(Plugin), .{ .name = abi.entrypoint });
+}
+
+pub fn entry(comptime Plugin: type) abi.InitFn {
+    return struct {
         fn init(raw: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
-            if (raw.abi_version != abi.version or raw.struct_size < @sizeOf(abi.Host)) return .incompatible;
+            if (raw.abi_version != abi.version or !raw.has(.register_command_info)) return .incompatible;
             plugin.* = .{
                 .name = .of(Plugin.name),
                 .plugin_version = .of(Plugin.version),
                 .capabilities = if (@hasDecl(Plugin, "capabilities")) Plugin.capabilities else .{ .events = true },
                 .shutdown = shutdown,
             };
+            if (@hasDecl(Plugin, "description") and raw.has(.set_description)) {
+                const status = raw.set_description(raw.context, .of(Plugin.description));
+                if (status != .ok) return status;
+            }
             Plugin.init(.{ .raw = raw }) catch return .failed;
             return .ok;
         }
@@ -131,8 +139,7 @@ pub fn exportPlugin(comptime Plugin: type) void {
         fn shutdown(_: ?*anyopaque) callconv(.c) void {
             if (@hasDecl(Plugin, "deinit")) Plugin.deinit();
         }
-    };
-    @export(&Entry.init, .{ .name = abi.entrypoint });
+    }.init;
 }
 
 fn check(status: abi.Status) Error!void {

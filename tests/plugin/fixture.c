@@ -14,7 +14,7 @@ static void on_shutdown(void *state) {
 }
 
 BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin) {
-    if (host->abi_version != BIFROST_ABI_VERSION || host->struct_size < sizeof(bifrost_host)) return BIFROST_STATUS_INCOMPATIBLE;
+    if (host->abi_version != BIFROST_ABI_VERSION || !BIFROST_HOST_HAS(host, register_command_info)) return BIFROST_STATUS_INCOMPATIBLE;
     plugin->struct_size = sizeof(bifrost_plugin);
     plugin->abi_version = BIFROST_ABI_VERSION;
     plugin->name = (bifrost_str){(const uint8_t *)"c-fixture", 9};
@@ -22,6 +22,10 @@ BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifr
     plugin->capabilities = BIFROST_CAPABILITY_EVENTS;
     plugin->state = &shutdowns;
     plugin->shutdown = on_shutdown;
+    if (BIFROST_HOST_HAS(host, set_description)) {
+        bifrost_status status = host->set_description(host->context, (bifrost_str){(const uint8_t *)"Counts players", 14});
+        if (status != BIFROST_STATUS_OK) return status;
+    }
     return host->subscribe(host->context, BIFROST_EVENT_PLAYER_CONNECTED, on_connected, &events);
 }
 
@@ -104,6 +108,7 @@ BIFROST_EXPORT size_t bifrost_fixture_layout(uint64_t *out, size_t capacity) {
     FIELD(bifrost_host, send_message);
     FIELD(bifrost_host, post);
     FIELD(bifrost_host, register_command_info);
+    FIELD(bifrost_host, set_description);
     SIZE(bifrost_plugin);
     FIELD(bifrost_plugin, struct_size);
     FIELD(bifrost_plugin, abi_version);

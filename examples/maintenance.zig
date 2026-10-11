@@ -3,6 +3,7 @@ const bifrost = @import("bifrost_plugin");
 
 pub const name = "maintenance";
 pub const version = "1.0.0";
+pub const description = "Keeps players off the maintenance backend";
 
 var host: bifrost.Host = undefined;
 

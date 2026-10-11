@@ -6,12 +6,14 @@ pub const Handles = @import("Handles.zig");
 pub const Packets = @import("Packets.zig");
 const Pool = @import("Pool.zig");
 const Work = @import("Work.zig");
+const sdk = @import("sdk.zig");
 const Notify = @import("../net/Notify.zig");
 
 const Plugins = @This();
 const log = std.log.scoped(.plugin);
 
 pub const max_name_len = 64;
+pub const max_version_len = 64;
 pub const max_command_len = 32;
 pub const max_message_bytes = Work.max_message_bytes;
 
@@ -34,6 +36,27 @@ pub const Totals = struct {
 };
 
 pub const max_description_len = 256;
+
+pub const Metadata = struct {
+    name_buffer: [max_name_len]u8 = undefined,
+    version_buffer: [max_version_len]u8 = undefined,
+    description_buffer: [max_description_len]u8 = undefined,
+    name_len: u8 = 0,
+    version_len: u8 = 0,
+    description_len: u16 = 0,
+
+    pub fn name(self: *const Metadata) []const u8 {
+        return self.name_buffer[0..self.name_len];
+    }
+
+    pub fn version(self: *const Metadata) []const u8 {
+        return self.version_buffer[0..self.version_len];
+    }
+
+    pub fn description(self: *const Metadata) []const u8 {
+        return self.description_buffer[0..self.description_len];
+    }
+};
 
 pub const Command = struct {
     callback: abi.CommandFn,
@@ -69,13 +92,12 @@ const Loaded = struct {
     host: abi.Host = undefined,
     plugin: abi.Plugin = .{},
     library: ?Library,
-    name: [max_name_len]u8 = undefined,
-    name_len: usize = 0,
+    metadata: Metadata = .{},
     metrics: []Packets.Metrics = &.{},
     outstanding: std.atomic.Value(u32) = .init(0),
 
     fn label(self: *const Loaded) []const u8 {
-        return self.name[0..self.name_len];
+        return self.metadata.name();
     }
 };
 
@@ -160,12 +182,23 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
     errdefer shutdown(loaded);
 
     const plugin = &loaded.plugin;
-    loaded.name_len = @min(plugin.name.len, max_name_len);
-    @memcpy(loaded.name[0..loaded.name_len], plugin.name.slice()[0..loaded.name_len]);
     if (plugin.abi_version != abi.version or plugin.struct_size < @sizeOf(abi.Plugin)) {
-        log.warn("plugin {s} targets ABI {d}, Bifrost has {d}", .{ loaded.label(), plugin.abi_version, abi.version });
+        log.warn("plugin targets ABI {d}, Bifrost has {d}", .{ plugin.abi_version, abi.version });
         return error.IncompatiblePlugin;
     }
+    const meta = &loaded.metadata;
+    const plugin_name = required(plugin.name, max_name_len) orelse {
+        log.warn("plugin refused: its name must be 1 to {d} bytes of printable UTF-8", .{max_name_len});
+        return error.InvalidMetadata;
+    };
+    const version = required(plugin.plugin_version, max_version_len) orelse {
+        log.warn("plugin {s} refused: its version must be 1 to {d} bytes of printable UTF-8", .{ plugin_name, max_version_len });
+        return error.InvalidMetadata;
+    };
+    @memcpy(meta.name_buffer[0..plugin_name.len], plugin_name);
+    meta.name_len = @intCast(plugin_name.len);
+    @memcpy(meta.version_buffer[0..version.len], version);
+    meta.version_len = @intCast(version.len);
     const unsupported = @as(u64, @bitCast(plugin.capabilities)) & ~@as(u64, @bitCast(abi.Capabilities.supported));
     if (unsupported != 0) {
         log.warn("plugin {s} needs unsupported capabilities 0x{x}", .{ loaded.label(), unsupported });
@@ -187,7 +220,15 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
     for (self.pending_commands.items, names) |item, name| self.commands.putAssumeCapacityNoClobber(name, item.command);
     for (self.pending.items) |item| self.subscribers[@backingInt(item.kind)].appendAssumeCapacity(item.subscriber);
     self.loaded.appendAssumeCapacity(loaded);
-    log.info("loaded plugin {s} {s}", .{ loaded.label(), plugin.plugin_version.slice() });
+    if (meta.description_len == 0) {
+        log.info("loaded plugin {s} {s}", .{ meta.name(), meta.version() });
+    } else {
+        log.info("loaded plugin {s} {s}: {s}", .{ meta.name(), meta.version(), meta.description() });
+    }
+}
+
+pub fn metadata(self: *const Plugins, index: usize) *const Metadata {
+    return &self.loaded.items[index].metadata;
 }
 
 pub fn unload(self: *Plugins) void {
@@ -372,6 +413,22 @@ fn countKind(items: []const Pending, kind: abi.EventKind) usize {
     return count;
 }
 
+fn input(str: abi.Str, max: usize) ?[]const u8 {
+    if (str.len > max or (str.ptr == null and str.len != 0)) return null;
+    return str.slice();
+}
+
+fn printable(bytes: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(bytes)) return false;
+    for (bytes) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+fn required(str: abi.Str, max: usize) ?[]const u8 {
+    const bytes = input(str, max) orelse return null;
+    return if (bytes.len != 0 and printable(bytes)) bytes else null;
+}
+
 fn shutdown(loaded: *Loaded) void {
     if (loaded.plugin.shutdown) |stop| stop(loaded.plugin.state);
 }
@@ -392,6 +449,7 @@ fn hostFor(loaded: *Loaded) abi.Host {
         .send_message = hostSendMessage,
         .post = hostPost,
         .register_command_info = hostRegisterCommandInfo,
+        .set_description = hostSetDescription,
     };
 }
 
@@ -419,6 +477,17 @@ fn hostSubscribe(context: *anyopaque, kind: abi.EventKind, callback: ?abi.EventF
     const subscriber: Subscriber = .{ .callback = callback orelse return .invalid_argument, .user = user };
     for (owner.pending.items) |item| if (item.kind == kind and std.meta.eql(item.subscriber, subscriber)) return .invalid_argument;
     owner.pending.append(owner.gpa, .{ .kind = kind, .subscriber = subscriber }) catch return .failed;
+    return .ok;
+}
+
+fn hostSetDescription(context: *anyopaque, description: abi.Str) callconv(.c) abi.Status {
+    const loaded = from(context);
+    if (!Work.hosted) return .wrong_thread;
+    if (loaded.owner.initializing.load(.acquire) != loaded) return .too_late;
+    const bytes = input(description, max_description_len) orelse return .invalid_argument;
+    if (!printable(bytes)) return .invalid_argument;
+    @memcpy(loaded.metadata.description_buffer[0..bytes.len], bytes);
+    loaded.metadata.description_len = @intCast(bytes.len);
     return .ok;
 }
 
@@ -459,10 +528,9 @@ fn registerCommand(loaded: *Loaded, info: *const abi.CommandInfo) abi.Status {
     if (!Work.hosted) return .wrong_thread;
     if (owner.initializing.load(.acquire) != loaded) return .too_late;
     if (!owner.options.packets) return .unsupported;
-    const text = info.name.slice();
-    const description = info.description.slice();
-    if (text.len == 0 or text.len > max_command_len) return .invalid_argument;
-    if (description.len > max_description_len or !std.unicode.utf8ValidateSlice(description)) return .invalid_argument;
+    const text = input(info.name, max_command_len) orelse return .invalid_argument;
+    const description = input(info.description, max_description_len) orelse return .invalid_argument;
+    if (text.len == 0 or !std.unicode.utf8ValidateSlice(description)) return .invalid_argument;
     if (@backingInt(info.permission) > @backingInt(abi.CommandPermission.owner)) return .invalid_argument;
     var item: PendingCommand = .{ .name = undefined, .len = text.len, .command = .{
         .callback = info.callback orelse return .invalid_argument,
@@ -584,7 +652,7 @@ fn hostTransfer(context: *anyopaque, player: abi.Player, backend: u32) callconv(
 const testing = std.testing;
 
 const Probe = struct {
-    var shutdowns: [4]u8 = undefined;
+    var shutdowns: [32]u8 = undefined;
     var shutdown_count: usize = 0;
     var events: usize = 0;
     var seen_host: ?abi.Host = null;
@@ -674,6 +742,22 @@ const Probe = struct {
         describe(plugin, 5);
         plugin.capabilities = @bitCast(@as(u64, 1) << 40);
         return host.subscribe(host.context, .player_connected, onEvent, null);
+    }
+};
+
+const Meta = struct {
+    var name: abi.Str = .{};
+    var version: abi.Str = .{};
+    var description: abi.Str = .{};
+    var described: abi.Status = .ok;
+
+    fn init(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        Probe.describe(plugin, 8);
+        Probe.seen_host = host.*;
+        plugin.name = name;
+        plugin.plugin_version = version;
+        described = host.set_description(host.context, description);
+        return host.subscribe(host.context, .player_connected, Probe.onEvent, null);
     }
 };
 
@@ -1076,4 +1160,99 @@ test "a task that can't be allocated is refused and gives its reservations back"
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(abi.Status.ok, Tasker.spawn(Tasker.host.?, player));
     Tasker.settle(&plugins, 1);
+}
+
+test "plugin names and versions are checked before they're copied, and refused plugins leave nothing behind" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    const long: [max_name_len + 1]u8 = @splat('n');
+    const refused = [_]abi.Str{ .{}, .{ .ptr = null, .len = 4 }, .of(&long), .of("bad\xff"), .of("two\nlines"), .of("bell\x07"), .of("del\x7f") };
+    Meta.description = .{};
+    Meta.version = .of("1.0.0");
+    for (refused) |name| {
+        Meta.name = name;
+        try testing.expectError(error.InvalidMetadata, plugins.add(Meta.init, null));
+    }
+    Meta.name = .of("meta");
+    for (refused) |version| {
+        Meta.version = version;
+        try testing.expectError(error.InvalidMetadata, plugins.add(Meta.init, null));
+    }
+    try testing.expectEqual(2 * refused.len, Probe.shutdown_count);
+    try testing.expectEqual(@as(usize, 0), plugins.loaded.items.len);
+    try testing.expect(!plugins.subscribed(.player_connected));
+
+    const description: [max_description_len]u8 = @splat('d');
+    Meta.name = .of(long[0..max_name_len]);
+    Meta.version = .of("1.0.0-rc.1+build.7 \u{e9}t\u{e9}");
+    Meta.description = .of(&description);
+    try plugins.add(Meta.init, null);
+    try testing.expectEqual(abi.Status.ok, Meta.described);
+    const meta = plugins.metadata(0);
+    try testing.expectEqualStrings(long[0..max_name_len], meta.name());
+    try testing.expectEqualStrings("1.0.0-rc.1+build.7 \u{e9}t\u{e9}", meta.version());
+    try testing.expectEqualStrings(&description, meta.description());
+}
+
+test "a bad description is refused without failing the plugin, and can only be set during init" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    const long: [max_description_len + 1]u8 = @splat('d');
+    const refused = [_]abi.Str{ .{ .ptr = null, .len = 1 }, .of(&long), .of("\xc3"), .of("a\tb") };
+    Meta.name = .of("meta");
+    Meta.version = .of("1.0.0");
+    for (refused, 0..) |description, i| {
+        Meta.description = description;
+        try plugins.add(Meta.init, null);
+        try testing.expectEqual(abi.Status.invalid_argument, Meta.described);
+        try testing.expectEqualStrings("", plugins.metadata(i).description());
+    }
+
+    const host = Probe.seen_host.?;
+    try testing.expectEqual(abi.Status.wrong_thread, host.set_description(host.context, .of("late")));
+    Work.hosted = true;
+    defer Work.hosted = false;
+    try testing.expectEqual(abi.Status.too_late, host.set_description(host.context, .of("late")));
+}
+
+const SdkPlugin = struct {
+    pub const name = "sdk";
+    pub const version = "2.0.0";
+    pub const description = "Built with the SDK";
+
+    pub fn init(_: sdk.Host) !void {}
+};
+
+const OldHost = struct {
+    var asked: bool = false;
+
+    fn setDescription(_: *anyopaque, _: abi.Str) callconv(.c) abi.Status {
+        asked = true;
+        return .ok;
+    }
+};
+
+test "an SDK plugin loads on hosts older than its header and refuses ones older than v1" {
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(sdk.entry(SdkPlugin), null);
+    try testing.expectEqualStrings("Built with the SDK", plugins.metadata(0).description());
+
+    var loaded: Loaded = .{ .owner = &plugins, .library = null };
+    var old = hostFor(&loaded);
+    old.set_description = OldHost.setDescription;
+    old.struct_size = @offsetOf(abi.Host, "set_description");
+    try testing.expect(old.has(.register_command_info) and !old.has(.set_description));
+    var plugin: abi.Plugin = .{};
+    try testing.expectEqual(abi.Status.ok, sdk.entry(SdkPlugin)(&old, &plugin));
+    try testing.expect(!OldHost.asked);
+    try testing.expectEqualStrings("sdk", plugin.name.slice());
+
+    old.struct_size = @offsetOf(abi.Host, "register_command_info");
+    try testing.expectEqual(abi.Status.incompatible, sdk.entry(SdkPlugin)(&old, &plugin));
+    old.struct_size = @sizeOf(abi.Host);
+    old.abi_version = abi.version + 1;
+    try testing.expectEqual(abi.Status.incompatible, sdk.entry(SdkPlugin)(&old, &plugin));
 }

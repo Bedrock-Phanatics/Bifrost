@@ -207,7 +207,12 @@ typedef struct bifrost_host {
     /* Runs done on the player's worker, same rules as spawn_task */
     bifrost_status (*post)(void *context, bifrost_player player, bifrost_task_done_fn done, void *user);
     bifrost_status (*register_command_info)(void *context, const bifrost_command_info *info);
+    /* Check BIFROST_HOST_HAS(host, set_description) first */
+    bifrost_status (*set_description)(void *context, bifrost_str description);
 } bifrost_host;
+
+/* Older hosts have a shorter table, so use this instead of sizeof */
+#define BIFROST_HOST_HAS(host, fn) ((host)->struct_size >= offsetof(bifrost_host, fn) + sizeof((host)->fn))
 
 typedef struct bifrost_plugin {
     uint32_t struct_size;
