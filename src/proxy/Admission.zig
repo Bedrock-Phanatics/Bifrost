@@ -50,7 +50,7 @@ pub fn leave(self: *Admission, io: std.Io, address: IpAddress) void {
 
 fn key(address: IpAddress) [16]u8 {
     return switch (address) {
-        .ip4 => |ip4| [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ ip4.bytes,
+        .ip4 => |ip4| @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff } ++ ip4.bytes,
         .ip6 => |ip6| ip6.bytes,
     };
 }

@@ -1,6 +1,6 @@
 const std = @import("std");
 const bifrost = @import("bifrost");
-const fixtures = @import("support/fixtures.zig");
+const fixtures = @import("../support/fixtures.zig");
 
 const Backend = fixtures.Backend;
 const Running = fixtures.Running;
@@ -20,7 +20,7 @@ fn workersConfig(backend: std.Io.net.IpAddress, count: u8) !bifrost.Config {
 
 test "more than one worker is refused where reuse_port isn't supported" {
     if (multi) return error.SkipZigTest;
-    try std.testing.expectError(error.InvalidLimit, bifrost.Workers.create(gpa, io, try workersConfig(fixtures.nowhere, 2), .off));
+    try std.testing.expectError(error.InvalidLimit, bifrost.Workers.create(gpa, io, try workersConfig(fixtures.nowhere, 2), .{}));
 }
 
 test "max_players is shared by proxies using one admission" {
@@ -146,7 +146,7 @@ test "workers start and stop repeatedly" {
 test "workers clean up after allocation failures" {
     try std.testing.checkAllAllocationFailures(gpa, struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const workers = try bifrost.Workers.create(allocator, io, try workersConfig(fixtures.nowhere, if (multi) 3 else 1), .off);
+            const workers = try bifrost.Workers.create(allocator, io, try workersConfig(fixtures.nowhere, if (multi) 3 else 1), .{});
             workers.destroy();
         }
     }.run, .{});

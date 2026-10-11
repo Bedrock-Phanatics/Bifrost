@@ -14,8 +14,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
-      - run: zig fmt --check build.zig build.zig.zon src tests bench
+          version: 0.17.0
+      - run: zig fmt --check build.zig build.zig.zon src tests examples
 
   test:
     needs: format
@@ -29,10 +29,27 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
       - run: zig build test
       - run: zig build test -Doptimize=ReleaseSafe
       - run: zig build test -Doptimize=ReleaseFast
+
+  stress:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - run: zig build stress -Doptimize=ReleaseSafe -Dtransfer-report=true
+      - run: zig build stress -Doptimize=ReleaseSafe
+      - run: zig build stress -Doptimize=ReleaseSafe
 
   cross:
     needs: format
@@ -41,7 +58,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
       - run: zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe
       - run: zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
       - run: zig build bench -- --help

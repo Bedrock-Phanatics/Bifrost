@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const bifrost = @import("bifrost");
+const managed = @import("managed.zig");
 
 const IpAddress = std.Io.net.IpAddress;
 const Current = bedwire.protocol.Current;
@@ -38,13 +39,15 @@ pub const Snapshot = struct {
     gave_up: u64 = 0,
     heap_bytes: u64 = 0,
     session_bytes: u64 = 0,
+    relayed: u64 = 0,
+    decoded: u64 = 0,
     per_worker: [max_workers]u64 = @splat(0),
     workers: usize = 0,
 
-    const scalar_fields = 12;
+    const scalar_fields = 14;
 
     pub fn write(self: Snapshot, w: *std.Io.Writer) !void {
-        inline for (@typeInfo(Snapshot).@"struct".fields[0..scalar_fields]) |field| try w.print("{d} ", .{@field(self, field.name)});
+        inline for (@typeInfo(Snapshot).@"struct".field_names[0..scalar_fields]) |name| try w.print("{d} ", .{@field(self, name)});
         for (self.per_worker[0..self.workers]) |count| try w.print("{d} ", .{count});
         try w.writeByte('\n');
     }
@@ -52,8 +55,8 @@ pub const Snapshot = struct {
     pub fn parse(line: []const u8) !Snapshot {
         var result: Snapshot = .{};
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
-        inline for (@typeInfo(Snapshot).@"struct".fields[0..scalar_fields]) |field| {
-            @field(result, field.name) = try std.fmt.parseInt(u64, fields.next() orelse return error.BadStats, 10);
+        inline for (@typeInfo(Snapshot).@"struct".field_names[0..scalar_fields]) |name| {
+            @field(result, name) = try std.fmt.parseInt(u64, fields.next() orelse return error.BadStats, 10);
         }
         while (fields.next()) |count| {
             if (result.workers == max_workers) return error.BadStats;
@@ -175,6 +178,8 @@ pub const Proxy = struct {
         workers: u8 = 1,
         connect_timeout_ms: u32 = 1_000,
         health_interval_ms: u32 = 1_000,
+        managed: bool = false,
+        plugins: []const u8 = "none",
         backends: []const u16,
     };
 
@@ -188,6 +193,7 @@ pub const Proxy = struct {
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.workers}));
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.connect_timeout_ms}));
         try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{options.health_interval_ms}));
+        try argv.append(gpa, if (options.managed) try std.fmt.allocPrint(gpa, "managed+{s}", .{options.plugins}) else try gpa.dupe(u8, "passthrough"));
         for (options.backends) |port| try argv.append(gpa, try std.fmt.allocPrint(gpa, "{d}", .{port}));
 
         self.io = io;
@@ -309,7 +315,7 @@ pub const Frames = struct {
         errdefer gpa.free(frame);
         const framed = try codec.encode(writer.written(), frame[2..], scratch);
         frame[0] = bedwire.framing.batch.header;
-        frame[1] = @intFromEnum(framed.algorithm);
+        frame[1] = @backingInt(framed.algorithm);
         return gpa.realloc(frame, 2 + framed.bytes.len);
     }
 };
@@ -329,7 +335,7 @@ pub const Backend = struct {
         config.listener.maximum_pending_handshakes = 16_384;
         self.* = .{
             .io = io,
-            .listener = try raknet.Server.listen(gpa, io, loopback(0), .{ .advertisement = "MCPE;bench", .config = config }),
+            .listener = try raknet.Server.listen(gpa, io, loopback(0), .{ .advertisement = "MCPE;bench", .config = config, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000 }),
             .frames = frames,
         };
         errdefer self.listener.destroy();
@@ -409,6 +415,7 @@ pub const Player = struct {
     expect: ?[]const u8 = null,
     recorder: ?*Recorder = null,
     count_until_ns: u64 = 0,
+    bedrock: ?*managed.Bedrock = null,
 
     pub fn connect(self: *Player, gpa: std.mem.Allocator, io: std.Io, address: IpAddress) !void {
         self.* = .{ .io = io, .client = try raknet.Client.connect(gpa, io, address, .{}) };
@@ -416,10 +423,14 @@ pub const Player = struct {
 
     pub fn deinit(self: *Player) void {
         self.client.destroy();
+        if (self.bedrock) |bedrock| bedrock.destroy();
     }
 
     pub fn send(self: *Player, payload: []const u8) !void {
-        try self.client.send(payload, .reliable_ordered, 0);
+        const bedrock = self.bedrock orelse return self.client.send(payload, .reliable_ordered, 0);
+        const frame = try bedrock.wrap(payload);
+        defer frame.release();
+        try self.client.send(frame.bytes, .reliable_ordered, 0);
     }
 
     /// Sends and waits for exactly this reply
@@ -460,15 +471,22 @@ pub const Player = struct {
 
     fn onMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
         const self: *Player = @ptrCast(@alignCast(context));
+        const bedrock = self.bedrock orelse return self.record(payload.bytes);
+        var packets = bedrock.session.ingest(payload.bytes) catch return error.ApplicationFailure;
+        defer packets.deinit();
+        while (packets.next()) |packet| try self.record(packet.bytes[managed.header_len..]);
+    }
+
+    fn record(self: *Player, bytes: []const u8) error{ApplicationFailure}!void {
         self.received += 1;
-        if (self.expect) |expected| self.matched = std.mem.eql(u8, expected, payload.bytes);
+        if (self.expect) |expected| self.matched = std.mem.eql(u8, expected, bytes);
         const recorder = self.recorder orelse return;
-        if (payload.bytes.len < 9) return error.ApplicationFailure;
+        if (bytes.len < 9) return error.ApplicationFailure;
         const now = nowNs(self.io);
-        recorder.latencies_ns.appendBounded(now -| std.mem.readInt(u64, payload.bytes[1..9], .little)) catch {};
+        recorder.latencies_ns.appendBounded(now -| std.mem.readInt(u64, bytes[1..9], .little)) catch {};
         if (now <= self.count_until_ns) {
             recorder.messages += 1;
-            recorder.bytes += payload.bytes.len;
+            recorder.bytes += bytes.len;
         }
     }
 };

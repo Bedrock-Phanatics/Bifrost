@@ -15,7 +15,7 @@ pub fn millis(ms: i64) std.Io.Timeout {
 
 pub fn config(backends: []const IpAddress) !bifrost.Config {
     var result: bifrost.Config = .{ .bind = loopback, .max_players = 8, .connect_timeout_ms = 500 };
-    for (backends) |backend| try result.addBackend(backend);
+    for (backends) |backend| try result.addBackend(null, backend);
     return result;
 }
 
@@ -61,7 +61,7 @@ pub const Backend = struct {
     pub fn start(self: *Backend, io: std.Io, options: Options) !void {
         self.* = .{
             .io = io,
-            .listener = try raknet.Server.listen(gpa, io, loopback, .{ .advertisement = options.advertisement }),
+            .listener = try raknet.Server.listen(gpa, io, loopback, .{ .advertisement = options.advertisement, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000 }),
             .greeting = options.greeting,
             .replies = options.replies,
         };
@@ -132,7 +132,11 @@ pub const Running = struct {
     stopped: bool = false,
 
     pub fn start(self: *Running, io: std.Io, proxy_config: bifrost.Config, options: bifrost.Proxy.Options) !void {
-        const proxy = try bifrost.Proxy.create(gpa, io, proxy_config, options);
+        return self.startWith(io, gpa, proxy_config, options);
+    }
+
+    pub fn startWith(self: *Running, io: std.Io, allocator: std.mem.Allocator, proxy_config: bifrost.Config, options: bifrost.Proxy.Options) !void {
+        const proxy = try bifrost.Proxy.create(allocator, io, proxy_config, options);
         errdefer proxy.destroy();
         self.* = .{ .io = io, .proxy = proxy, .task = try io.concurrent(bifrost.Proxy.run, .{proxy}) };
     }
@@ -176,7 +180,7 @@ pub const RunningWorkers = struct {
     stopped: bool = false,
 
     pub fn start(self: *RunningWorkers, io: std.Io, workers_config: bifrost.Config) !void {
-        const workers = try bifrost.Workers.create(gpa, io, workers_config, .off);
+        const workers = try bifrost.Workers.create(gpa, io, workers_config, .{});
         errdefer workers.destroy();
         self.* = .{ .io = io, .workers = workers, .task = try io.concurrent(bifrost.Workers.run, .{workers}) };
     }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const toml = @import("toml");
+const Backend = @import("../backend/Backend.zig");
 const Config = @import("Config.zig");
 const IpAddress = std.Io.net.IpAddress;
 
@@ -66,7 +67,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
                 diag.line = position.line;
                 diag.column = position.pos;
             },
-            .struct_mapping => {},
+            .struct_mapping, .unknown_fields => {},
         };
         diag.set("invalid TOML ({t})", .{err});
         return error.InvalidSyntax;
@@ -82,6 +83,14 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
         return fail(diag, .{ .section = "health", .name = "timeout_ms" }, "must be shorter than interval_ms", .{});
     if (config.auth == .verify and config.keysFile() == null)
         return fail(diag, .{ .section = "auth", .name = "keys_file" }, "is required when mode = \"verify\"", .{});
+    if (config.transfer_timeout_ms < config.transfer_phase_timeout_ms)
+        return fail(diag, .{ .section = "transfer", .name = "timeout_ms" }, "can't be shorter than phase_timeout_ms", .{});
+    if (config.session_mode == .managed) {
+        if (config.auth != .verify)
+            return fail(diag, .{ .section = "session", .name = "mode" }, "\"managed\" needs [auth] mode = \"verify\"", .{});
+        if (config.proxyKeyFile() == null)
+            return fail(diag, .{ .section = "session", .name = "proxy_key_file" }, "is required when mode = \"managed\"", .{});
+    }
     return config;
 }
 
@@ -99,13 +108,38 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
             try readHealth(config, try table(diag, key, value), diag);
         } else if (eql(name, "auth")) {
             try readAuth(config, try table(diag, key, value), diag);
+        } else if (eql(name, "transfer")) {
+            try readTransfer(config, try table(diag, key, value), diag);
+        } else if (eql(name, "session")) {
+            try readSession(config, try table(diag, key, value), diag);
         } else if (eql(name, "backend")) {
             if (value != .array) return fail(diag, key, "expected [[backend]] tables", .{});
             for (value.array.items, 0..) |item, i| {
                 try readBackend(config, try table(diag, .{ .section = name, .index = i }, item), i, diag);
             }
+        } else if (eql(name, "plugin")) {
+            if (value != .array) return fail(diag, key, "expected [[plugin]] tables", .{});
+            for (value.array.items, 0..) |item, i| {
+                try readPlugin(config, try table(diag, .{ .section = name, .index = i }, item), i, diag);
+            }
         } else return fail(diag, key, "unknown section", .{});
     }
+}
+
+fn readPlugin(config: *Config, section: *const toml.Table, index: usize, diag: *Diagnostic) Error!void {
+    var path: ?[]const u8 = null;
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "plugin", .index = index, .name = entry.key_ptr.* };
+        if (eql(key.name.?, "path")) {
+            path = try string(diag, key, entry.value_ptr.*);
+        } else return fail(diag, key, "unknown key", .{});
+    }
+    const key: Key = .{ .section = "plugin", .index = index, .name = "path" };
+    config.addPlugin(path orelse return fail(diag, key, "is required", .{})) catch |err| return switch (err) {
+        error.InvalidPath => fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len}),
+        error.TooManyPlugins => fail(diag, key, "at most {d} plugins", .{Config.max_plugins}),
+    };
 }
 
 fn readServer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
@@ -141,6 +175,12 @@ fn readLimits(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
             config.pending_packets = try integer(u32, diag, key, value, 1, 4096);
         } else if (eql(key.name.?, "pending_bytes")) {
             config.pending_bytes = try integer(u32, diag, key, value, 1, 64 * 1024 * 1024);
+        } else if (eql(key.name.?, "slow_plugin_callback_ms")) {
+            config.slow_plugin_callback_ms = try integer(u32, diag, key, value, 1, 60_000);
+        } else if (eql(key.name.?, "plugin_task_threads")) {
+            config.plugin_task_threads = try integer(u8, diag, key, value, 1, 64);
+        } else if (eql(key.name.?, "handshake_rate_per_ip")) {
+            config.handshake_rate_per_ip = try integer(u32, diag, key, value, 1, 1_000_000);
         } else return fail(diag, key, "unknown key", .{});
     }
 }
@@ -174,20 +214,59 @@ fn readAuth(config: *Config, section: *const toml.Table, diag: *Diagnostic) Erro
     }
 }
 
+fn readTransfer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "transfer", .name = entry.key_ptr.* };
+        const value = entry.value_ptr.*;
+        if (eql(key.name.?, "phase_timeout_ms")) {
+            config.transfer_phase_timeout_ms = try integer(u32, diag, key, value, 100, 60_000);
+        } else if (eql(key.name.?, "timeout_ms")) {
+            config.transfer_timeout_ms = try integer(u32, diag, key, value, 100, 300_000);
+        } else if (eql(key.name.?, "content")) {
+            const text = try string(diag, key, value);
+            config.content_policy = std.meta.stringToEnum(@TypeOf(config.content_policy), text) orelse
+                return fail(diag, key, "expected \"initial\" or \"match\", got \"{s}\"", .{text});
+        } else return fail(diag, key, "unknown key", .{});
+    }
+}
+
+fn readSession(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "session", .name = entry.key_ptr.* };
+        const value = entry.value_ptr.*;
+        if (eql(key.name.?, "mode")) {
+            const text = try string(diag, key, value);
+            config.session_mode = std.meta.stringToEnum(Config.SessionMode, text) orelse
+                return fail(diag, key, "expected \"passthrough\" or \"managed\", got \"{s}\"", .{text});
+        } else if (eql(key.name.?, "proxy_key_file")) {
+            config.setProxyKeyFile(try string(diag, key, value)) catch
+                return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len});
+        } else return fail(diag, key, "unknown key", .{});
+    }
+}
+
 fn readBackend(config: *Config, section: *const toml.Table, index: usize, diag: *Diagnostic) Error!void {
     var backend: ?IpAddress = null;
+    var name: ?[]const u8 = null;
     var it = section.iterator();
     while (it.next()) |entry| {
         const key: Key = .{ .section = "backend", .index = index, .name = entry.key_ptr.* };
         if (eql(key.name.?, "address")) {
             backend = try address(diag, key, entry.value_ptr.*, false);
+        } else if (eql(key.name.?, "name")) {
+            name = try string(diag, key, entry.value_ptr.*);
         } else return fail(diag, key, "unknown key", .{});
     }
     const key: Key = .{ .section = "backend", .index = index, .name = "address" };
-    config.addBackend(backend orelse return fail(diag, key, "is required", .{})) catch |err| return switch (err) {
+    const name_key: Key = .{ .section = "backend", .index = index, .name = "name" };
+    config.addBackend(name, backend orelse return fail(diag, key, "is required", .{})) catch |err| return switch (err) {
         error.InvalidPort => fail(diag, key, "needs a non-zero port", .{}),
         error.DuplicateBackend => fail(diag, key, "duplicates an earlier backend", .{}),
         error.TooManyBackends => fail(diag, key, "more than {d} backends", .{Config.max_backends}),
+        error.InvalidName => fail(diag, name_key, "must be 1 to {d} of a-z A-Z 0-9 - _ . : [ ]", .{Backend.max_name_len}),
+        error.DuplicateName => fail(diag, name_key, "duplicates an earlier backend", .{}),
     };
 }
 
@@ -254,8 +333,12 @@ test "full config reads every key" {
         \\connect_timeout_ms = 2000
         \\pending_packets = 8
         \\pending_bytes = 4096
+        \\slow_plugin_callback_ms = 20
+        \\plugin_task_threads = 2
+        \\handshake_rate_per_ip = 50
         \\
         \\[[backend]]
+        \\name = "lobby"
         \\address = "127.0.0.1:2000"
         \\
         \\[[backend]]
@@ -268,8 +351,13 @@ test "full config reads every key" {
     try std.testing.expectEqual(@as(u32, 2000), config.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 8), config.pending_packets);
     try std.testing.expectEqual(@as(u32, 4096), config.pending_bytes);
-    try std.testing.expectEqual(@as(u16, 2000), config.backends()[0].getPort());
-    try std.testing.expectEqual(@as(u16, 3000), config.backends()[1].getPort());
+    try std.testing.expectEqual(@as(u32, 20), config.slow_plugin_callback_ms);
+    try std.testing.expectEqual(@as(u8, 2), config.plugin_task_threads);
+    try std.testing.expectEqual(@as(u32, 50), config.handshake_rate_per_ip);
+    try std.testing.expectEqual(@as(u16, 2000), config.backends()[0].address.getPort());
+    try std.testing.expectEqualStrings("lobby", config.backends()[0].name());
+    try std.testing.expectEqual(@as(u16, 3000), config.backends()[1].address.getPort());
+    try std.testing.expectEqualStrings("[::1]:3000", config.backends()[1].name());
 }
 
 test "syntax errors report a position" {
@@ -287,6 +375,8 @@ test "invalid values name the offending key" {
     try expectInvalid("[server]\nbind = \"localhost:1\"\n" ++ backend, "server.bind: expected \"ip:port\", got \"localhost:1\"");
     try expectInvalid("[server]\nbind = 19132\n" ++ backend, "server.bind: expected a string");
     try expectInvalid("[server]\nworkers = 0\n" ++ backend, "server.workers: must be between 1 and 64");
+    try expectInvalid("[limits]\nplugin_task_threads = 65\n" ++ backend, "limits.plugin_task_threads: must be between 1 and 64");
+    try expectInvalid("[limits]\nhandshake_rate_per_ip = 0\n" ++ backend, "limits.handshake_rate_per_ip: must be between 1 and 1000000");
     if (!Config.multi_worker_supported) try expectInvalid("[server]\nworkers = 2\n" ++ backend, "server.workers: more than 1 needs Linux (SO_REUSEPORT)");
     try expectInvalid("[server]\nmax_players = 2\nmax_players_per_ip = 3\n" ++ backend, "server.max_players_per_ip: can't be more than max_players");
     try expectInvalid("[server]\nmax_players = 0\n" ++ backend, "server.max_players: must be between 1 and 100000");
@@ -298,6 +388,9 @@ test "invalid values name the offending key" {
     try expectInvalid("[[backend]]\naddress = \"127.0.0.1:0\"\n", "backend[0].address: needs a non-zero port, got \"127.0.0.1:0\"");
     try expectInvalid("[[backend]]\naddress = \"127.0.0.1:1\"\nweight = 1\n", "backend[0].weight: unknown key");
     try expectInvalid(backend ++ backend, "backend[1].address: duplicates an earlier backend");
+    try expectInvalid("[[backend]]\nname = \"a b\"\naddress = \"127.0.0.1:1\"\n", "backend[0].name: must be 1 to 48 of a-z A-Z 0-9 - _ . : [ ]");
+    try expectInvalid("[[backend]]\nname = 1\naddress = \"127.0.0.1:1\"\n", "backend[0].name: expected a string");
+    try expectInvalid("[[backend]]\nname = \"x\"\naddress = \"127.0.0.1:1\"\n[[backend]]\nname = \"x\"\naddress = \"127.0.0.1:2\"\n", "backend[1].name: duplicates an earlier backend");
     try expectInvalid("backend = \"127.0.0.1:1\"\n", "backend: expected [[backend]] tables");
     try expectInvalid("[auth]\nmode = \"strict\"\n" ++ backend, "auth.mode: expected \"off\" or \"verify\", got \"strict\"");
     try expectInvalid("[health]\ntimeout_ms = 50\n" ++ backend, "health.timeout_ms: must be between 100 and 10000");
@@ -312,6 +405,44 @@ test "auth section reads mode and keys file" {
     try std.testing.expectEqualStrings("keys.json", config.keysFile().?);
     const defaults = try parse(std.testing.allocator, "[[backend]]\naddress = \"127.0.0.1:1\"\n", &diag);
     try std.testing.expectEqual(Config.Auth.off, defaults.auth);
+}
+
+test "session section selects managed mode" {
+    var diag: Diagnostic = .{};
+    const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
+    const verify = "[auth]\nmode = \"verify\"\nkeys_file = \"keys.json\"\n";
+    const config = try parse(std.testing.allocator, verify ++ "[session]\nmode = \"managed\"\nproxy_key_file = \"proxy.key\"\n" ++ backend, &diag);
+    try std.testing.expectEqual(Config.SessionMode.managed, config.session_mode);
+    try std.testing.expectEqualStrings("proxy.key", config.proxyKeyFile().?);
+    try std.testing.expectEqual(Config.SessionMode.passthrough, (try parse(std.testing.allocator, backend, &diag)).session_mode);
+
+    try expectInvalid("[session]\nmode = \"mixed\"\n" ++ backend, "session.mode: expected \"passthrough\" or \"managed\", got \"mixed\"");
+    try expectInvalid("[session]\nmode = \"managed\"\nproxy_key_file = \"k\"\n" ++ backend, "session.mode: \"managed\" needs [auth] mode = \"verify\"");
+    try expectInvalid(verify ++ "[session]\nmode = \"managed\"\n" ++ backend, "session.proxy_key_file: is required when mode = \"managed\"");
+}
+
+test "transfer section sets the timeouts" {
+    var diag: Diagnostic = .{};
+    const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
+    const config = try parse(std.testing.allocator, "[transfer]\nphase_timeout_ms = 2000\ntimeout_ms = 9000\n" ++ backend, &diag);
+    try std.testing.expectEqual(@as(u32, 2000), config.transfer_phase_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 9000), config.transfer_timeout_ms);
+    try expectInvalid("[transfer]\nphase_timeout_ms = 50\n" ++ backend, "transfer.phase_timeout_ms: must be between 100 and 60000");
+    try expectInvalid("[transfer]\nphase_timeout_ms = 6000\ntimeout_ms = 5000\n" ++ backend, "transfer.timeout_ms: can't be shorter than phase_timeout_ms");
+    try expectInvalid("[transfer]\nretries = 1\n" ++ backend, "transfer.retries: unknown key");
+    try expectInvalid("[transfer]\ncontent = \"latest\"\n" ++ backend, "transfer.content: expected \"initial\" or \"match\", got \"latest\"");
+    const matching = try parse(std.testing.allocator, "[transfer]\ncontent = \"match\"\n" ++ backend, &diag);
+    try std.testing.expectEqual(.match, matching.content_policy);
+}
+
+test "plugin tables list libraries to load" {
+    var diag: Diagnostic = .{};
+    const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
+    const config = try parse(std.testing.allocator, "[[plugin]]\npath = \"plugins/a.so\"\n[[plugin]]\npath = \"b.dll\"\n" ++ backend, &diag);
+    try std.testing.expectEqual(@as(usize, 2), config.plugin_count);
+    try std.testing.expectEqualStrings("b.dll", config.pluginPath(1));
+    try expectInvalid("[[plugin]]\nname = \"a\"\n" ++ backend, "plugin[0].name: unknown key");
+    try expectInvalid("[[plugin]]\n" ++ backend, "plugin[0].path: is required");
 }
 
 test "loadFile reports missing and oversized files" {

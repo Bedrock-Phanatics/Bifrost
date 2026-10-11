@@ -2,7 +2,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const bifrost = @import("bifrost");
+const bench_options = @import("bench_options");
+const sample = @import("sample");
 const harness = @import("harness.zig");
+const managed = @import("managed.zig");
+const bench_plugins = @import("plugins.zig");
+const bench_ids = @import("runtime_ids.zig");
+const bench_tasks = @import("tasks.zig");
+const bench_handles = @import("handles.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -18,11 +25,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|handshake|connections|workers|backends ...] [--quick] [--driver-threads N]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|ids|tasks|handles|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "ids", "tasks", "handles", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -32,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
 
     var driver_threads: u8 = 4;
     var quick = false;
+    var proxy_exe: ?[]const u8 = null;
     var selected: std.ArrayList([]const u8) = .empty;
     defer selected.deinit(gpa);
     var i: usize = 1;
@@ -45,6 +53,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--driver-threads") and i + 1 < args.len) {
             i += 1;
             driver_threads = try std.fmt.parseInt(u8, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--proxy-exe") and i + 1 < args.len) {
+            i += 1;
+            proxy_exe = args[i];
         } else if (for (all_scenarios) |name| {
             if (std.mem.eql(u8, arg, name)) break true;
         } else false) {
@@ -68,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
         .gpa = gpa,
         .io = io,
         .process_io = init.io,
-        .exe = try std.process.executablePathAlloc(init.io, gpa),
+        .exe = if (proxy_exe) |path| try gpa.dupeSentinel(u8, path, 0) else try std.process.executablePathAlloc(init.io, gpa),
         .frames = &frames,
         .out = &stdout.interface,
         .quick = quick,
@@ -76,8 +87,14 @@ pub fn main(init: std.process.Init) !void {
     };
     defer gpa.free(env.exe);
 
-    try env.out.print("# Bifrost benchmark\n\n{t}-{t}, {t} build, {d} CPUs, driver threads {d}{s}\n", .{
-        builtin.os.tag, builtin.cpu.arch, builtin.mode, env.cpus, driver_threads, if (quick) ", quick" else "",
+    try env.out.print("# Bifrost benchmark\n\n{t}-{t}, {t} build, {d} CPUs, driver threads {d}, proxy scheduling {s}{s}\n", .{
+        builtin.os.tag,
+        builtin.cpu.arch,
+        builtin.mode,
+        env.cpus,
+        driver_threads,
+        if (proxy_exe == null) "work_stealing" else bench_options.scheduling,
+        if (quick) ", quick" else "",
     });
     try env.out.print("Login frame {d} B, {d} iterations of {d} ms after {d} ms warmup\n", .{
         frames.login.len, env.iterations(), env.iterationMs(), env.warmupMs(),
@@ -86,6 +103,13 @@ pub fn main(init: std.process.Init) !void {
 
     for (selected.items) |name| {
         if (std.mem.eql(u8, name, "relay")) try relayScenario(&env);
+        if (std.mem.eql(u8, name, "fairness")) try fairnessScenario(&env);
+        if (std.mem.eql(u8, name, "managed")) try managedScenario(&env);
+        if (std.mem.eql(u8, name, "deflate")) try deflateScenario(&env);
+        if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
+        if (std.mem.eql(u8, name, "ids")) try idsScenario(&env);
+        if (std.mem.eql(u8, name, "tasks")) try tasksScenario(&env);
+        if (std.mem.eql(u8, name, "handles")) try handlesScenario(&env);
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
         if (std.mem.eql(u8, name, "connections")) try connectionsScenario(&env);
         if (std.mem.eql(u8, name, "workers")) try workersScenario(&env);
@@ -135,22 +159,33 @@ const Memory = struct {
     churn_heap: [3]u64 = @splat(0),
 };
 
-/// args: workers connect_timeout_ms health_interval_ms backend_port...
+/// args: workers connect_timeout_ms health_interval_ms passthrough|managed+<plugin setup> backend_port...
 fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (args.len < 4) return error.InvalidArguments;
+    if (args.len < 5) return error.InvalidArguments;
     var config: bifrost.Config = .{ .bind = harness.loopback(0), .max_players = 16_384 };
     config.workers = try std.fmt.parseInt(u8, args[0], 10);
     config.connect_timeout_ms = try std.fmt.parseInt(u32, args[1], 10);
     config.health_interval_ms = try std.fmt.parseInt(u32, args[2], 10);
     config.health_timeout_ms = @min(1_000, config.health_interval_ms / 2);
-    for (args[3..]) |port| try config.addBackend(harness.loopback(try std.fmt.parseInt(u16, port, 10)));
+    for (args[4..]) |port| try config.addBackend(null, harness.loopback(try std.fmt.parseInt(u16, port, 10)));
+    var keys = try sample.keySet(init.gpa);
+    defer keys.deinit();
+    var options: bifrost.Workers.Options = .{};
+    var plugins: bifrost.Plugins = try .init(init.gpa, config.backends(), .{ .workers = config.workers });
+    defer plugins.deinit();
+    if (std.mem.startsWith(u8, args[3], "managed+")) {
+        config.session_mode = .managed;
+        options = .{ .auth = .{ .verify = &keys }, .proxy_key = managed.proxyKey(), .plugins = &plugins };
+        const setup = bench_plugins.parse(args[3]["managed+".len..]) orelse return error.InvalidArguments;
+        try bench_plugins.load(&plugins, setup, bench_plugins.relay_packet_id);
+    }
 
     // Same runtime setup as the real binary
     const rt = try zio.Runtime.init(init.gpa, .{ .executors = .exact(config.workers) });
     defer rt.deinit();
     const io = rt.io();
     var heap: harness.CountingAllocator = .{ .backing = init.gpa };
-    const workers = try bifrost.Workers.create(heap.allocator(), io, config, .off);
+    const workers = try bifrost.Workers.create(heap.allocator(), io, config, options);
     defer workers.destroy();
     var task = try io.concurrent(bifrost.Workers.run, .{workers});
 
@@ -187,6 +222,8 @@ fn snapshot(io: std.Io, workers: *bifrost.Workers, heap: *const harness.Counting
         .handshakes = totals.handshakes_observed,
         .gave_up = totals.observer_gave_up,
         .heap_bytes = heap.live.load(.monotonic),
+        .relayed = totals.managed_relayed_batches,
+        .decoded = totals.managed_decoded_batches,
         .workers = workers.proxies.len,
     };
     for (workers.proxies, 0..) |proxy, i| {
@@ -355,9 +392,11 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
     const io = env.io;
     const jobs = try gpa.alloc(RelayJob, players.len);
     defer gpa.free(jobs);
+    // Random, so compression can't flatter managed mode
+    var prng: std.Random.DefaultPrng = .init(size);
     for (jobs, players) |*job, *player| {
         const payload = try gpa.alloc(u8, size);
-        for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 7);
+        prng.random().bytes(payload);
         payload[0] = 0xfe;
         job.* = .{ .io = io, .player = player, .payload = payload, .window = window, .until_ns = 0 };
         job.recorder.latencies_ns = try .initCapacity(gpa, 1 << 18);
@@ -416,6 +455,70 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
     };
 }
 
+const Mixed = struct { light: Percentiles, hot: ?Percentiles };
+
+fn mixedRelay(env: *Env, players: []Player, light_count: usize) !Mixed {
+    const gpa = env.gpa;
+    const io = env.io;
+    const jobs = try gpa.alloc(RelayJob, players.len);
+    defer gpa.free(jobs);
+    for (jobs, players, 0..) |*job, *player, i| {
+        const light = i < light_count;
+        const payload = try gpa.alloc(u8, if (light) 64 else 512);
+        @memset(payload, 0x5a);
+        payload[0] = 0xfe;
+        job.* = .{ .io = io, .player = player, .payload = payload, .window = if (light) 1 else 32, .until_ns = 0 };
+        job.recorder.latencies_ns = try .initCapacity(gpa, 1 << 18);
+    }
+    defer for (jobs) |*job| {
+        gpa.free(job.payload);
+        job.recorder.deinit(gpa);
+    };
+    var light: std.ArrayList(u64) = .empty;
+    defer light.deinit(gpa);
+    var hot: std.ArrayList(u64) = .empty;
+    defer hot.deinit(gpa);
+    for (0..env.iterations() + 1) |iteration| {
+        const started = nowNs(io);
+        const duration_ms = if (iteration == 0) env.warmupMs() else env.iterationMs();
+        for (jobs) |*job| {
+            job.until_ns = started + duration_ms * std.time.ns_per_ms;
+            job.recorder.latencies_ns.clearRetainingCapacity();
+        }
+        var group: std.Io.Group = .init;
+        for (jobs) |*job| group.concurrent(io, RelayJob.run, .{job}) catch RelayJob.run(job);
+        try group.await(io);
+        if (iteration == 0) continue;
+        for (jobs, 0..) |*job, i| try (if (i < light_count) &light else &hot).appendSlice(gpa, job.recorder.latencies_ns.items);
+    }
+    return .{ .light = .of(light.items), .hot = if (hot.items.len == 0) null else .of(hot.items) };
+}
+
+fn fairnessScenario(env: *Env) !void {
+    var backends: Backends = try .start(env, 1);
+    defer backends.deinit(env);
+    var proxy: Proxy = undefined;
+    try env.startProxy(&proxy, .{ .backends = backends.ports[0..1] });
+    defer proxy.stop();
+    const players = try joinedPlayers(env, proxy.address(), 8);
+    defer leave(env, players);
+
+    const alone = try mixedRelay(env, players[0..4], 4);
+    const loaded = try mixedRelay(env, players, 4);
+    try env.out.print(
+        \\
+        \\## Fairness
+        \\
+        \\4 light players (64 B, 1 in flight) alone, then next to 4 hot players (512 B, 32 in flight), 1 worker, passthrough.
+        \\
+        \\| run | light p50 us | light p99 us | hot p50 us | hot p99 us |
+        \\|---|---|---|---|---|
+        \\| alone | {d:.0} | {d:.0} | - | - |
+        \\| with hot players | {d:.0} | {d:.0} | {d:.0} | {d:.0} |
+        \\
+    , .{ alone.light.p50, alone.light.p99, loaded.light.p50, loaded.light.p99, loaded.hot.?.p50, loaded.hot.?.p99 });
+}
+
 fn windowFor(size: usize) usize {
     return std.math.clamp(256 * 1024 / size, 1, 32);
 }
@@ -467,6 +570,282 @@ fn relayScenario(env: *Env) !void {
     try env.out.print("\nTap: {d} handshakes observed, {d} gave up. Proxy RSS {d} KiB fresh, {d} KiB with 8 players, peak {d} KiB. Proxy CPU with 8 silent players: {d:.1}%.\n", .{
         after.handshakes, after.gave_up, base.rss_kb, joined.rss_kb, after.hwm_kb, idle_cpu,
     });
+}
+
+const ManagedSetup = struct {
+    name: []const u8,
+    managed: bool = true,
+    plugins: []const u8 = "none",
+    backends: usize = 1,
+};
+const managed_setups = [_]ManagedSetup{
+    .{ .name = "passthrough", .managed = false },
+    .{ .name = "managed, transfers possible", .backends = 2 },
+    .{ .name = "managed, relayed", .backends = 1 },
+    .{ .name = "managed, relayed, 10 idle plugins", .plugins = "idle_10" },
+    .{ .name = "managed, 1 decoded subscriber", .plugins = "one_decoded" },
+};
+const managed_sizes = [_]usize{ 256, 1024, 8 * 1024, 20 * 1024 };
+
+const ManagedRow = struct { result: RelayResult, relayed_pct: f64 };
+
+fn managedScenario(env: *Env) !void {
+    var rows: [managed_setups.len][managed_sizes.len][2]ManagedRow = undefined;
+    var join_ms: [managed_setups.len]f64 = undefined;
+    for (managed_setups, &rows, &join_ms) |setup, *setup_rows, *join| {
+        var echoes: [2]managed.Backend = undefined;
+        var started_echoes: usize = 0;
+        var passthrough: ?Backends = null;
+        defer {
+            for (echoes[0..started_echoes]) |*echo| echo.deinit();
+            if (passthrough) |b| b.deinit(env);
+        }
+        var ports: [2]u16 = undefined;
+        if (setup.managed) {
+            for (echoes[0..setup.backends], ports[0..setup.backends]) |*echo, *port| {
+                try echo.start(env.gpa, env.io);
+                started_echoes += 1;
+                port.* = echo.port();
+            }
+        } else {
+            passthrough = try .start(env, 1);
+            ports[0] = passthrough.?.ports[0];
+        }
+        var proxy: Proxy = undefined;
+        try env.startProxy(&proxy, .{ .backends = ports[0..setup.backends], .managed = setup.managed, .plugins = setup.plugins });
+        defer proxy.stop();
+
+        const players = try env.gpa.alloc(Player, 8);
+        var joined: usize = 0;
+        defer {
+            for (players[0..joined]) |*player| player.deinit();
+            env.gpa.free(players);
+        }
+        const started = nowNs(env.io);
+        for (players, 0..) |*player, i| {
+            try player.connect(env.gpa, env.io, proxy.address());
+            joined += 1;
+            if (setup.managed) try managed.join(env.gpa, env.io, player, @intCast(i + 2)) else try player.handshake(env.frames);
+        }
+        join.* = elapsedS(env.io, started) * 1000 / @as(f64, @floatFromInt(players.len));
+        for (managed_sizes, setup_rows) |size, *pair| for (pair, 0..) |*row, loaded| {
+            const before = try proxy.stats();
+            const result = try relay(env, &proxy, if (loaded == 1) players else players[0..1], size, if (loaded == 1) windowFor(size) else 1);
+            const after = try proxy.stats();
+            const relayed: f64 = @floatFromInt(after.relayed - before.relayed);
+            const decoded: f64 = @floatFromInt(after.decoded - before.decoded);
+            row.* = .{ .result = result, .relayed_pct = if (relayed + decoded == 0) 0 else relayed * 100 / (relayed + decoded) };
+        };
+    }
+
+    try env.out.print(
+        \\
+        \\## Passthrough vs managed
+        \\
+        \\Same echo workload as the raw relay, 1 worker, random payloads, deflate over 256 B on both legs. Decoded batches
+        \\are decrypted, decompressed, re-batched, compressed and encrypted again. Relayed batches are only re-encrypted.
+        \\Two backends make transfers possible, so every batch is decoded for client state tracking; active transfers and
+        \\runtime ID mapping always take that path. The decoded subscriber listens to player packets only.
+        \\
+        \\| payload | load | setup | round trips/s | MiB/s | p50 us | p95 us | p99 us | proxy CPU | relayed |
+        \\|---|---|---|---|---|---|---|---|---|---|
+        \\
+    , .{});
+    for (managed_sizes, 0..) |size, s| for (0..2) |loaded| for (managed_setups, rows) |setup, setup_rows| {
+        const row = setup_rows[s][loaded];
+        const result = row.result;
+        try env.out.print("| {Bi} | {s}{d} | {s} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} | {d:.0} | {d:.0} | {d:.0} | {d:.0}% | {d:.0}% |\n", .{
+            size,                   if (loaded == 1) "8x" else "1x", if (loaded == 1) windowFor(size) else 1,
+            setup.name,             result.round_trips.median,       result.round_trips.min,
+            result.round_trips.max, result.mib_s.median,             result.latency.p50,
+            result.latency.p95,     result.latency.p99,              result.cpu_pct,
+            row.relayed_pct,
+        });
+    };
+    try env.out.print("\nJoin time per player:", .{});
+    for (managed_setups, join_ms) |setup, ms| try env.out.print(" {d:.1} ms {s};", .{ ms, setup.name });
+    try env.out.print("\n", .{});
+}
+
+const deflate_levels = [_]struct { name: []const u8, options: std.compress.flate.Compress.Options }{
+    .{ .name = "1", .options = .level_1 },
+    .{ .name = "4", .options = .level_4 },
+    .{ .name = "6 (used)", .options = .level_6 },
+    .{ .name = "9", .options = .level_9 },
+};
+
+fn deflateScenario(env: *Env) !void {
+    try env.out.print(
+        \\
+        \\## Deflate levels
+        \\
+        \\In-process raw deflate of one batch, for comparison only; Bedwire compresses at level 6. "Game" repeats a
+        \\structured 64 B record with a few changing bytes, "noise" is random.
+        \\
+        \\| data | size | level | us per batch | MiB/s | output |
+        \\|---|---|---|---|---|---|
+        \\
+    , .{});
+    const input = try env.gpa.alloc(u8, 64 * 1024);
+    defer env.gpa.free(input);
+    const output = try env.gpa.alloc(u8, 128 * 1024);
+    defer env.gpa.free(output);
+    const history = try env.gpa.create([std.compress.flate.max_window_len]u8);
+    defer env.gpa.destroy(history);
+    var prng: std.Random.DefaultPrng = .init(0xdef1a7e);
+    for ([_]bool{ true, false }) |game| {
+        if (game) {
+            for (input, 0..) |*byte, i| byte.* = @truncate(i % 64 *% 31 +% 7);
+            var i: usize = 0;
+            while (i < input.len) : (i += 64) prng.random().bytes(input[i..][0..4]);
+        } else prng.random().bytes(input);
+        for ([_]usize{ 1024, 8 * 1024, 64 * 1024 }) |size| for (deflate_levels) |level| {
+            const mib_per_level: usize = if (env.quick) 4 else 16;
+            const rounds = @max(4, mib_per_level * 1024 * 1024 / size);
+            var len: usize = 0;
+            const started = nowNs(env.io);
+            for (0..rounds) |_| {
+                var writer: std.Io.Writer = .fixed(output);
+                var compressor: std.compress.flate.Compress = try .init(&writer, history, .raw, level.options);
+                try compressor.writer.writeAll(input[0..size]);
+                try compressor.finish();
+                len = writer.end;
+            }
+            const ns = @as(f64, @floatFromInt(nowNs(env.io) - started)) / @as(f64, @floatFromInt(rounds));
+            try env.out.print("| {s} | {Bi} | {s} | {d:.1} | {d:.0} | {d:.1}% |\n", .{
+                if (game) "game" else "noise",                 size,                                                               level.name, ns / 1000,
+                mib(@as(f64, @floatFromInt(size))) * 1e9 / ns, @as(f64, @floatFromInt(len)) * 100 / @as(f64, @floatFromInt(size)),
+            });
+        };
+    }
+}
+
+fn idsScenario(env: *Env) !void {
+    const results = try bench_ids.run(env.gpa, env.io, env.quick);
+    try env.out.print(
+        \\
+        \\## Player id translation
+        \\
+        \\Per-packet work a managed relay adds after a transfer to keep the client's own actor ids, in-process. Half the
+        \\stream is MovePlayer and SetActorMotion, the rest text and raw packets that are never decoded. Packets naming
+        \\the player are decoded, rewritten and re-encoded.
+        \\
+        \\| case | ns per packet | added ns |
+        \\|---|---|---|
+        \\
+    , .{});
+    for (results) |result| try env.out.print("| {s} | {d:.1} | {d:.1} |\n", .{ result.case.describe(), result.ns_per_packet, result.extra_ns });
+}
+
+fn tasksScenario(env: *Env) !void {
+    const result = try bench_tasks.measure(env.gpa, env.io, env.quick);
+    try env.out.print(
+        \\
+        \\## Plugin tasks
+        \\
+        \\Empty tasks from one plugin and player, in-process, with `done` drained on the submitting thread.
+        \\
+        \\| tasks/s, up to the limit in flight | submit to done p50 | p99 |
+        \\|---|---|---|
+        \\| {d:.0} | {d:.1} us | {d:.1} us |
+        \\
+    , .{ result.tasks_per_s, result.p50_us, result.p99_us });
+}
+
+fn handlesScenario(env: *Env) !void {
+    const results = try bench_handles.run(env.gpa, env.io, env.quick);
+    try env.out.print(
+        \\
+        \\## Plugin handle table
+        \\
+        \\Threads resolving random handles among 1024 live players as fast as they can, optionally while another
+        \\thread joins and leaves players nonstop.
+        \\
+        \\| lookup threads | join/leave churn | ns per lookup | lookups/s |
+        \\|---|---|---|---|
+        \\
+    , .{});
+    for (results) |result| try env.out.print("| {d} | {s} | {d:.1} | {d:.1}M |\n", .{
+        result.threads, if (result.churn) "yes" else "no", result.ns_per_lookup, result.lookups_per_s / 1e6,
+    });
+}
+
+const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot };
+
+fn pluginsScenario(env: *Env) !void {
+    const dispatch = try bench_plugins.dispatch(env.gpa, env.io, env.quick);
+    try env.out.print(
+        \\
+        \\## Plugin packet dispatch
+        \\
+        \\Per-packet work a managed relay adds for plugins, in-process: the table check, and the callbacks when someone
+        \\subscribed. The stream alternates a text packet (the hot packet here) and a 64 B raw packet. Callbacks do
+        \\nothing, so the cost is dispatch, timing and metrics. Decoded subscribers get the packet only after a full decode.
+        \\
+        \\| setup | ns per packet | added ns | ns per callback | budget |
+        \\|---|---|---|---|---|
+        \\
+    , .{});
+    for (dispatch) |result| {
+        const callbacks = result.setup.callbacksPerPacket();
+        const cost = if (callbacks == 0) result.extra_ns else result.extra_ns / callbacks;
+        const budget = result.setup.budgetNs();
+        try env.out.print("| {s} | {d:.1} | {d:.1} | {d:.1} | {s} {d:.0} ns |\n", .{
+            result.setup.describe(),              result.ns_per_packet,
+            result.extra_ns,                      cost,
+            if (cost <= budget) "ok" else "OVER", budget,
+        });
+    }
+
+    var results: [plugin_relays.len][2]RelayResult = undefined;
+    var heaps: [plugin_relays.len][2]u64 = undefined;
+    for (plugin_relays, &results, &heaps) |setup, *result, *heap| {
+        var echo: managed.Backend = undefined;
+        try echo.start(env.gpa, env.io);
+        defer echo.deinit();
+        var proxy: Proxy = undefined;
+        try env.startProxy(&proxy, .{ .backends = &.{echo.port()}, .managed = true, .plugins = @tagName(setup) });
+        defer proxy.stop();
+        heap[0] = (try proxy.stats()).heap_bytes;
+        const players = try env.gpa.alloc(Player, 8);
+        var joined: usize = 0;
+        defer {
+            for (players[0..joined]) |*player| player.deinit();
+            env.gpa.free(players);
+        }
+        for (players, 0..) |*player, i| {
+            try player.connect(env.gpa, env.io, proxy.address());
+            joined += 1;
+            try managed.join(env.gpa, env.io, player, @intCast(i + 2));
+        }
+        heap[1] = ((try proxy.stats()).heap_bytes - heap[0]) / players.len;
+        result[0] = try relay(env, &proxy, players[0..1], 512, 1);
+        result[1] = try relay(env, &proxy, players, 512, windowFor(512));
+    }
+    try env.out.print(
+        \\
+        \\Managed echo relay, 512 B, 1 worker, with the same setups. Here the hot packet is the relayed payload itself.
+        \\
+        \\| setup | load | round trips/s | p50 us | p95 us | p99 us | proxy CPU |
+        \\|---|---|---|---|---|---|---|
+        \\
+    , .{});
+    for (plugin_relays, results) |setup, pair| for (pair, 0..) |result, loaded| {
+        try env.out.print("| {s} | {s} | {d:.0} [{d:.0}-{d:.0}] | {d:.0} | {d:.0} | {d:.0} | {d:.0}% |\n", .{
+            setup.describe(),          if (loaded == 1) "8x32" else "1x1",
+            result.round_trips.median, result.round_trips.min,
+            result.round_trips.max,    result.latency.p50,
+            result.latency.p95,        result.latency.p99,
+            result.cpu_pct,
+        });
+    };
+    try env.out.print(
+        \\
+        \\| setup | heap of a fresh managed proxy | heap per managed player |
+        \\|---|---|---|
+        \\
+    , .{});
+    for (plugin_relays, heaps) |setup, heap| try env.out.print("| {s} | {Bi:.1} | {Bi:.1} |\n", .{ setup.describe(), heap[0], heap[1] });
 }
 
 /// Proxy CPU while connected players send nothing; should be close to zero

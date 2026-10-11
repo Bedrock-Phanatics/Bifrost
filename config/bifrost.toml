@@ -2,7 +2,7 @@
 bind = "0.0.0.0:19132"
 # Linux only above 1
 workers = 1
-motd = "MCPE;Bifrost;944;1.26.0;0;100;0;Bifrost;Survival;1;19132;19133;"
+motd = "MCPE;Bifrost;2193;1.26.51;0;100;0;Bifrost;Survival;1;19132;19133;"
 max_players = 4096
 # 0 turns it off
 max_players_per_ip = 0
@@ -11,6 +11,11 @@ max_players_per_ip = 0
 connect_timeout_ms = 5000
 pending_packets = 64
 pending_bytes = 1048576
+# Plugin callbacks slower than this get a warning, at most every 10 s per plugin
+slow_plugin_callback_ms = 5
+plugin_task_threads = 4
+# Handshake traffic per IP, in RakNet tokens a second (one per 64 bytes); lower it if floods are a concern
+handshake_rate_per_ip = 2000
 
 [health]
 interval_ms = 5000
@@ -22,8 +27,25 @@ timeout_ms = 1000
 mode = "off"
 # keys_file = "minecraft-keys.json"
 
+[session]
+# "managed" needs auth mode = "verify", and backends must trust the proxy key it logs
+mode = "passthrough"
+# proxy_key_file = "bifrost-proxy.key"
+
+[transfer]
+phase_timeout_ms = 5000
+timeout_ms = 15000
+# "initial" keeps the first backend's packs for the whole session; "match" also needs every target to offer the same
+content = "initial"
+
 [[backend]]
+# Defaults to the address
+name = "lobby"
 address = "127.0.0.1:19133"
 
 [[backend]]
+name = "survival"
 address = "127.0.0.1:19134"
+
+# [[plugin]]
+# path = "plugins/libexample.so"
