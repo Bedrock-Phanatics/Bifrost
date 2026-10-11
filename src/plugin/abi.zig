@@ -105,6 +105,8 @@ pub const PacketPhase = enum(u32) { any, before_game, in_game, _ };
 pub const PacketFlags = packed struct(u32) {
     validated: bool = false,
     _: u31 = 0,
+
+    pub const supported: PacketFlags = .{ .validated = true };
 };
 
 pub const PacketAction = enum(u32) { pass, cancel, replace, _ };

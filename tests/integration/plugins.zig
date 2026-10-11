@@ -647,3 +647,17 @@ test "a slow packet callback is measured and the packet still goes through" {
     try std.testing.expect(totals.max_ns >= 3 * std.time.ns_per_ms);
     try std.testing.expect(totals.calls >= 2);
 }
+
+test "a C plugin can be loaded and unloaded repeatedly" {
+    var library: bifrost.Plugins.Library = try .open(test_options.c_plugin);
+    defer library.close();
+    const shutdowns = library.lookup(*const fn () callconv(.c) u32, "bifrost_fixture_shutdowns").?;
+    const before = shutdowns();
+    for (0..20) |_| {
+        var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+        defer plugins.deinit();
+        try plugins.open(test_options.c_plugin);
+        try std.testing.expect(plugins.subscribed(.player_connected));
+    }
+    try std.testing.expectEqual(before + 20, shutdowns());
+}

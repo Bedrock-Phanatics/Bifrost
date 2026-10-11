@@ -16,8 +16,10 @@ memory corruption in a plugin takes the whole proxy down. There is no sandbox or
 `plugin` (`name`, `plugin_version`, `capabilities`, optionally `state` and `shutdown`) and register everything you
 need; subscriptions and commands can't be added later. Returning anything but `OK` unloads the plugin and fails
 startup. Bifrost refuses a plugin whose `abi_version` differs from `BIFROST_ABI_VERSION`, whose `struct_size` is
-smaller than it knows, or that asks for a capability bit it doesn't know. `TASKS` is the only capability enforced
-today, but declare the ones you use.
+smaller than it knows, or that asks for a capability bit it doesn't know. It also refuses one that subscribes to
+events, hooks packets or registers commands without declaring `EVENTS`, `PACKETS` or `COMMANDS`, and `spawn_task`
+returns `UNSUPPORTED` without `TASKS`. Whatever a refused plugin registered is dropped with it. `spawn_task` and
+`post` also return `UNSUPPORTED` during `bifrost_plugin_init`, so no work can outlive a plugin that is then refused.
 
 `name` (up to 64 bytes) and `plugin_version` (up to 64 bytes) are required and must be printable UTF-8: no control
 characters, and no `NULL` pointer with a non-zero length. A plugin can also call `set_description` with up to 256
@@ -25,7 +27,8 @@ bytes of the same. Bifrost checks and copies all three when `bifrost_plugin_init
 valid until then, and logs them as the plugin loads.
 
 `shutdown(state)` runs once, after every worker has stopped and every task has finished or been canceled, newest
-plugin first. Stop any threads you started before it returns; Bifrost unloads the library right after.
+plugin first. Stop any threads you started before it returns; Bifrost unloads the library right after. It also
+runs if `bifrost_plugin_init` returned `OK` and Bifrost then refused the plugin, but never after a failed init.
 
 ## Threads
 
@@ -33,6 +36,10 @@ Callbacks run on Bifrost's worker threads, several at once, so they must be quic
 one; anything slower than `slow_plugin_callback_ms` is logged. Player events, packet hooks, commands and task
 completions for a player always run on that player's worker. `PROXY_STARTED` runs on whichever worker starts first,
 and `PROXY_STOPPING` on whichever thread stops the proxy.
+
+Callbacks for one player never overlap. Bifrost holds no lock while it calls a plugin, so callbacks may call host
+functions, including ones that queue more work for the same player; that work runs after the callback returns,
+never inside it.
 
 | host function | where it may be called |
 |---|---|
@@ -59,7 +66,7 @@ of memory.
 |---|---|---|
 | `log(level, message)` | logs under the plugin's name | none |
 | `subscribe(kind, callback, user)` | calls `callback` for every event of `kind` | `INVALID_ARGUMENT` for an unknown kind, no callback or a duplicate; `TOO_LATE` after init |
-| `subscribe_packet(direction, id, phase, flags, callback, user)` | hooks one packet id in one direction, managed mode only | `UNSUPPORTED` in passthrough; `INVALID_ARGUMENT` for a bad direction, id or phase, no callback or a duplicate; `TOO_LATE` |
+| `subscribe_packet(direction, id, phase, flags, callback, user)` | hooks one packet id in one direction, managed mode only | `UNSUPPORTED` in passthrough; `INVALID_ARGUMENT` for a bad direction, id or phase, an unknown flag, no callback or a duplicate; `TOO_LATE` |
 | `register_command(name, callback, user)` | same as `register_command_info` with no description and permission `ANY` | as below |
 | `register_command_info(info)` | claims a `/command` and advertises it to clients, managed mode only | `UNSUPPORTED` in passthrough; `INVALID_ARGUMENT` for a name outside `[A-Za-z0-9_-]{1,32}`, a name already taken, a description over 256 bytes or not UTF-8, an unknown permission, no callback or a short `struct_size`; `TOO_LATE` |
 | `set_description(description)` | sets the description shown when the plugin loads; calling it again replaces it | `INVALID_ARGUMENT` for over 256 bytes, not printable UTF-8 or a `NULL` pointer with a length; `TOO_LATE` |
@@ -68,9 +75,9 @@ of memory.
 | `player_name(player, out, capacity, len)` | copies up to `capacity` bytes of the name and sets `len` to its full length | `STALE_HANDLE` after the player left (before authentication the name is empty); `INVALID_ARGUMENT` for no `len` or no `out` with a capacity |
 | `transfer(player, backend)` | asks to move a player; the outcome arrives as `TRANSFER_COMPLETED` or `TRANSFER_FAILED` | `INVALID_ARGUMENT` for an unknown backend; `STALE_HANDLE`; `BUSY` when the worker's transfer mailbox is full |
 | `worker_count()` | number of workers | none |
-| `spawn_task(player, run, done, user)` | runs `run` on a shared task thread, then `done` once | `UNSUPPORTED` without `TASKS`; `INVALID_ARGUMENT` for no `run` or `done`; `BUSY` past 128 tasks in total or 32 per plugin |
+| `spawn_task(player, run, done, user)` | runs `run` on a shared task thread, then `done` once | `UNSUPPORTED` without `TASKS` or during init; `INVALID_ARGUMENT` for no `run` or `done`; `BUSY` past 128 tasks in total or 32 per plugin |
 | `send_message(player, text)` | sends the player a chat message, managed mode only | `UNSUPPORTED` in passthrough or while shutting down; `INVALID_ARGUMENT` for empty, over 1024 bytes or not UTF-8; `STALE_HANDLE`; `BUSY` past 1024 queued messages and posts |
-| `post(player, done, user)` | runs `done` once on the player's worker | `INVALID_ARGUMENT` for no `done`; `STALE_HANDLE`; `BUSY` as for `send_message`; `UNSUPPORTED` while shutting down |
+| `post(player, done, user)` | runs `done` once on the player's worker | `INVALID_ARGUMENT` for no `done`; `STALE_HANDLE`; `BUSY` as for `send_message`; `UNSUPPORTED` during init or while shutting down |
 
 `done` from `spawn_task` and `post` always runs exactly once. Its `bifrost_task_result.status` is `OK` on the
 player's worker, `STALE_HANDLE` if the player left or the proxy stopped while it ran, or `CANCELED` if the proxy stopped before `run` started. A task

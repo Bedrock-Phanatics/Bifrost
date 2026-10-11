@@ -204,6 +204,19 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
         log.warn("plugin {s} needs unsupported capabilities 0x{x}", .{ loaded.label(), unsupported });
         return error.UnsupportedCapability;
     }
+    const caps = plugin.capabilities;
+    const undeclared: ?[]const u8 = if (self.pending.items.len != 0 and !caps.events)
+        "EVENTS"
+    else if (self.pending_packets.items.len != 0 and !caps.packets)
+        "PACKETS"
+    else if (self.pending_commands.items.len != 0 and !caps.commands)
+        "COMMANDS"
+    else
+        null;
+    if (undeclared) |capability| {
+        log.warn("plugin {s} registered hooks without declaring {s}", .{ loaded.label(), capability });
+        return error.UndeclaredCapability;
+    }
 
     if (plugin.capabilities.tasks and self.pool == null) try self.startPool();
     for (self.pending.items) |item| try self.subscribers[@backingInt(item.kind)].ensureUnusedCapacity(self.gpa, countKind(self.pending.items, item.kind));
@@ -498,6 +511,7 @@ fn hostSubscribePacket(context: *anyopaque, direction: abi.Direction, id: u32, p
     if (owner.initializing.load(.acquire) != loaded) return .too_late;
     if (!owner.options.packets) return .unsupported;
     if (@backingInt(direction) > 1 or id >= Packets.id_count or @backingInt(phase) > 2) return .invalid_argument;
+    if (@as(u32, @bitCast(flags)) & ~@as(u32, @bitCast(abi.PacketFlags.supported)) != 0) return .invalid_argument;
     const packet_callback = callback orelse return .invalid_argument;
     for (owner.pending_packets.items) |item| {
         if (item.direction == direction and item.id == id and item.subscriber.callback == packet_callback and item.subscriber.user == user) return .invalid_argument;
@@ -555,7 +569,7 @@ fn hostSpawnTask(context: *anyopaque, player: abi.Player, run: ?abi.TaskFn, done
     const loaded = from(context);
     const owner = loaded.owner;
     if (!Work.hosted) return .wrong_thread;
-    if (!loaded.plugin.capabilities.tasks) return .unsupported;
+    if (!loaded.plugin.capabilities.tasks or owner.initializing.load(.acquire) == loaded) return .unsupported;
     const pool = owner.pool orelse return .unsupported;
     const run_fn = run orelse return .invalid_argument;
     const done_fn = done orelse return .invalid_argument;
@@ -605,6 +619,7 @@ fn hostPost(context: *anyopaque, player: abi.Player, callback: ?abi.TaskDoneFn, 
     const loaded = from(context);
     const owner = loaded.owner;
     const done = callback orelse return .invalid_argument;
+    if (owner.initializing.load(.acquire) == loaded) return .unsupported;
     const route = owner.handles.route(player) orelse return .stale_handle;
     if (route.worker >= owner.queues.len) return .invalid_argument;
     if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
@@ -688,6 +703,7 @@ const Probe = struct {
 
     fn doubled(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
         describe(plugin, 6);
+        plugin.capabilities = .{ .events = true, .packets = true, .commands = true };
         seen_host = host.*;
         if (host.subscribe(host.context, .player_connected, onEvent, null) != .ok) return .failed;
         if (host.subscribe(host.context, .player_connected, onEvent, null) != .invalid_argument) return .failed;
@@ -699,6 +715,7 @@ const Probe = struct {
 
     fn described(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
         describe(plugin, 7);
+        plugin.capabilities = .{ .commands = true };
         const long: [max_description_len + 1]u8 = @splat('a');
         const refused = [_]abi.CommandInfo{
             .{ .name = .of("long"), .description = .of(&long), .callback = onCommand },
@@ -1255,4 +1272,165 @@ test "an SDK plugin loads on hosts older than its header and refuses ones older 
     old.struct_size = @sizeOf(abi.Host);
     old.abi_version = abi.version + 1;
     try testing.expectEqual(abi.Status.incompatible, sdk.entry(SdkPlugin)(&old, &plugin));
+}
+
+const Undeclared = struct {
+    var flags: abi.Status = .ok;
+
+    fn events(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        Probe.describe(plugin, 9);
+        plugin.capabilities = .{ .packets = true, .commands = true };
+        return host.subscribe(host.context, .player_connected, Probe.onEvent, null);
+    }
+
+    fn packets(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        Probe.describe(plugin, 10);
+        flags = host.subscribe_packet(host.context, .from_player, 7, .any, @bitCast(@as(u32, 2)), Probe.onPacket, null);
+        return host.subscribe_packet(host.context, .from_player, 7, .any, .{ .validated = true }, Probe.onPacket, null);
+    }
+
+    fn commands(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        Probe.describe(plugin, 11);
+        return host.register_command(host.context, .of("hub"), Probe.onCommand, null);
+    }
+};
+
+test "hooks need their capability declared, and unknown packet flags are refused" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    try testing.expectError(error.UndeclaredCapability, plugins.add(Undeclared.events, null));
+    try testing.expectError(error.UndeclaredCapability, plugins.add(Undeclared.packets, null));
+    try testing.expectError(error.UndeclaredCapability, plugins.add(Undeclared.commands, null));
+    try testing.expectEqual(abi.Status.invalid_argument, Undeclared.flags);
+    try testing.expectEqualSlices(u8, &.{ 9, 10, 11 }, Probe.shutdowns[0..Probe.shutdown_count]);
+    try testing.expect(!plugins.subscribed(.player_connected) and !plugins.hasCommands());
+    try testing.expectEqual(@as(?*const Packets.Table, null), plugins.packetTable(.from_player));
+}
+
+const Eager = struct {
+    var spawned: abi.Status = .ok;
+    var posted: abi.Status = .ok;
+    var player: abi.Player = .{};
+
+    fn init(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.capabilities = .{ .tasks = true };
+        spawned = host.spawn_task(host.context, .{}, Tasker.run, Tasker.done, null);
+        posted = host.post(host.context, player, Tasker.done, null);
+        return .ok;
+    }
+};
+
+test "a plugin can't start work during init that could outlive its refusal" {
+    Tasker.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .task_threads = 1 });
+    defer plugins.deinit();
+    try plugins.add(Tasker.init, null);
+    Eager.player = try taskPlayer(&plugins);
+    try testing.expectError(error.InvalidMetadata, plugins.add(Eager.init, null));
+    try testing.expectEqual(abi.Status.unsupported, Eager.spawned);
+    try testing.expectEqual(abi.Status.unsupported, Eager.posted);
+    try testing.expectEqual(@as(u32, 0), plugins.outstanding.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.acquire));
+}
+
+const Full = struct {
+    var succeeded: bool = false;
+    var shutdowns: usize = 0;
+
+    fn init(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("full");
+        plugin.plugin_version = .of("1.0.0");
+        plugin.capabilities = .{ .events = true, .commands = true, .packets = true, .tasks = true };
+        plugin.shutdown = onShutdown;
+        const info: abi.CommandInfo = .{ .name = .of("full"), .description = .of("Everything"), .callback = Probe.onCommand };
+        const statuses = [_]abi.Status{
+            host.set_description(host.context, .of("Uses everything")),
+            host.subscribe(host.context, .player_connected, Probe.onEvent, null),
+            host.subscribe(host.context, .transfer_requested, Probe.onEvent, null),
+            host.subscribe_packet(host.context, .from_player, 7, .any, .{}, Probe.onPacket, null),
+            host.subscribe_packet(host.context, .from_backend, 9, .in_game, .{}, Probe.onPacket, null),
+            host.register_command_info(host.context, &info),
+        };
+        for (statuses) |status| if (status != .ok) return status;
+        succeeded = true;
+        return .ok;
+    }
+
+    fn onShutdown(_: ?*anyopaque) callconv(.c) void {
+        shutdowns += 1;
+    }
+};
+
+test "running out of memory anywhere while loading leaves nothing registered" {
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+        var plugins: Plugins = try .init(failing.allocator(), &.{}, .{ .task_threads = 1 });
+        defer plugins.deinit();
+        failing.fail_index = failing.alloc_index + fail_after;
+        Full.succeeded = false;
+        Full.shutdowns = 0;
+        plugins.add(Full.init, null) catch |err| {
+            try testing.expect(err == error.OutOfMemory or err == error.PluginInitFailed);
+            try testing.expectEqual(@as(usize, @intFromBool(Full.succeeded)), Full.shutdowns);
+            try testing.expectEqual(@as(usize, 0), plugins.loaded.items.len);
+            try testing.expect(!plugins.subscribed(.player_connected) and !plugins.subscribed(.transfer_requested));
+            try testing.expect(!plugins.hasCommands());
+            try testing.expectEqual(@as(usize, 0), plugins.registrations.items.len);
+            try testing.expectEqual(@as(?*const Packets.Table, null), plugins.packetTable(.from_player));
+            continue;
+        };
+        try testing.expect(fail_after > 0);
+        try testing.expect(plugins.hasCommands() and plugins.packetTable(.from_backend) != null);
+        break;
+    }
+}
+
+const Poster = struct {
+    var host: abi.Host = undefined;
+    var player: abi.Player = .{};
+    var delivery: Delivery = .{ .worker = 0 };
+    var accepted: std.atomic.Value(u32) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    var running: usize = 0;
+
+    fn init(api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("poster");
+        plugin.plugin_version = .of("1.0.0");
+        plugin.shutdown = stop;
+        host = api.*;
+        return .ok;
+    }
+
+    fn loop() void {
+        while (true) switch (host.post(host.context, player, Delivery.done, &delivery)) {
+            .ok => _ = accepted.fetchAdd(1, .acq_rel),
+            .busy => std.Thread.yield() catch {},
+            else => return,
+        };
+    }
+
+    fn stop(_: ?*anyopaque) callconv(.c) void {
+        for (threads[0..running]) |thread| thread.join();
+    }
+};
+
+test "posts from plugin threads racing unload are each settled once before shutdown" {
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .max_messages = 64 });
+    try plugins.add(Poster.init, null);
+    var context: u8 = 0;
+    Poster.player = try plugins.handles.acquire(testing.allocator, .{ .context = &context, .link = 1, .transfer = routedTransfer });
+    for (&Poster.threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Poster.loop, .{});
+        Poster.running += 1;
+    }
+    for (0..200) |_| {
+        plugins.drain(0, testing.io, null);
+        std.Thread.yield() catch {};
+    }
+    plugins.deinit();
+    const delivery = &Poster.delivery;
+    try testing.expectEqual(Poster.accepted.load(.acquire), delivery.ok.load(.acquire) + delivery.stale.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), delivery.misplaced.load(.acquire));
 }
