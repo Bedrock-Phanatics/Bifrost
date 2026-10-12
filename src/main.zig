@@ -39,8 +39,10 @@ pub fn main(init: std.process.Init) !void {
         .task_threads = config.plugin_task_threads,
     });
     defer plugins.deinit();
-    for (0..config.plugin_count) |i| plugins.open(config.pluginPath(i)) catch |err| {
-        log.err("plugin {s}: {t}", .{ config.pluginPath(i), err });
+    var disabled: [bifrost.Config.max_disabled_plugins][]const u8 = undefined;
+    for (disabled[0..config.disabled_count], 0..) |*name, i| name.* = config.disabledPlugin(i);
+    bifrost.Plugins.Package.discover(&plugins, init.io, config.pluginsDir(), disabled[0..config.disabled_count]) catch |err| {
+        log.err("plugins from {s}: {t}", .{ config.pluginsDir(), err });
         return error.PluginLoadFailed;
     };
 

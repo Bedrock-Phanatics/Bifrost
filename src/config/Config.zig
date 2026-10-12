@@ -11,7 +11,9 @@ pub const max_workers = 64;
 pub const multi_worker_supported = builtin.os.tag == .linux;
 pub const max_motd_len = 256;
 pub const max_path_len = 1024;
-pub const max_plugins = 16;
+pub const max_disabled_plugins = 16;
+pub const max_plugin_dir_name = 255;
+pub const default_plugins_dir = "plugins";
 // raknet retries every 500 ms and rejects anything shorter
 pub const min_connect_timeout_ms = 500;
 pub const default_motd = "MCPE;Bifrost;2193;1.26.51;0;100;0;Bifrost;Survival;1;19132;19133;";
@@ -41,9 +43,11 @@ motd_storage: [max_motd_len]u8 = undefined,
 motd_len: usize = 0,
 backend_storage: [max_backends]Backend = undefined,
 backend_count: usize = 0,
-plugin_storage: [max_plugins][max_path_len]u8 = undefined,
-plugin_lens: [max_plugins]u16 = undefined,
-plugin_count: usize = 0,
+plugins_dir_storage: [max_path_len]u8 = undefined,
+plugins_dir_len: usize = 0,
+disabled_storage: [max_disabled_plugins][max_plugin_dir_name]u8 = undefined,
+disabled_lens: [max_disabled_plugins]u8 = undefined,
+disabled_count: usize = 0,
 
 pub const Auth = enum {
     off,
@@ -85,16 +89,26 @@ pub fn setMotd(self: *Config, value: []const u8) error{InvalidMotd}!void {
     self.motd_len = value.len;
 }
 
-pub fn pluginPath(self: *const Config, index: usize) []const u8 {
-    return self.plugin_storage[index][0..self.plugin_lens[index]];
+pub fn pluginsDir(self: *const Config) []const u8 {
+    return if (self.plugins_dir_len == 0) default_plugins_dir else self.plugins_dir_storage[0..self.plugins_dir_len];
 }
 
-pub fn addPlugin(self: *Config, path: []const u8) error{ InvalidPath, TooManyPlugins }!void {
+pub fn setPluginsDir(self: *Config, path: []const u8) error{InvalidPath}!void {
     if (path.len == 0 or path.len > max_path_len) return error.InvalidPath;
-    if (self.plugin_count == max_plugins) return error.TooManyPlugins;
-    @memcpy(self.plugin_storage[self.plugin_count][0..path.len], path);
-    self.plugin_lens[self.plugin_count] = @intCast(path.len);
-    self.plugin_count += 1;
+    @memcpy(self.plugins_dir_storage[0..path.len], path);
+    self.plugins_dir_len = path.len;
+}
+
+pub fn disabledPlugin(self: *const Config, index: usize) []const u8 {
+    return self.disabled_storage[index][0..self.disabled_lens[index]];
+}
+
+pub fn disablePlugin(self: *Config, name: []const u8) error{ InvalidName, TooManyPlugins }!void {
+    if (name.len == 0 or name.len > max_plugin_dir_name) return error.InvalidName;
+    if (self.disabled_count == max_disabled_plugins) return error.TooManyPlugins;
+    @memcpy(self.disabled_storage[self.disabled_count][0..name.len], name);
+    self.disabled_lens[self.disabled_count] = @intCast(name.len);
+    self.disabled_count += 1;
 }
 
 pub fn backends(self: *const Config) []const Backend {

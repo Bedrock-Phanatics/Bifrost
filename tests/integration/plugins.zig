@@ -97,6 +97,38 @@ fn loadRecorder(plugins: *bifrost.Plugins) !void {
     try plugins.add(Recorder.init, null);
 }
 
+const Packages = struct {
+    tmp: std.testing.TmpDir,
+    root: [:0]u8,
+
+    fn init() !Packages {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        return .{ .tmp = tmp, .root = try tmp.dir.realPathFileAlloc(io, ".", gpa) };
+    }
+
+    fn deinit(self: *Packages) void {
+        gpa.free(self.root);
+        self.tmp.cleanup();
+    }
+
+    fn add(self: *Packages, dir_name: []const u8, name: []const u8, version: []const u8, description: []const u8, built: []const u8) ![:0]u8 {
+        var dir = try self.tmp.dir.createDirPathOpen(io, dir_name, .{});
+        defer dir.close(io);
+        const library = try std.fmt.allocPrint(gpa, "{s}{s}", .{ dir_name, bifrost.Plugins.Package.library_extension });
+        defer gpa.free(library);
+        try std.Io.Dir.copyFile(.cwd(), built, dir, library, io, .{});
+        const manifest = try std.fmt.allocPrint(gpa, "name = \"{s}\"\nversion = \"{s}\"\ndescription = \"{s}\"\nlibrary = \"{s}\"\n", .{ name, version, description, library });
+        defer gpa.free(manifest);
+        try dir.writeFile(io, .{ .sub_path = bifrost.Plugins.Package.manifest_file, .data = manifest });
+        return dir.realPathFileAlloc(io, library, gpa);
+    }
+
+    fn load(self: *Packages, plugins: *bifrost.Plugins, dir_name: []const u8) !void {
+        try bifrost.Plugins.Package.load(plugins, io, self.tmp.dir, dir_name);
+    }
+};
+
 test "a passthrough player's life is visible without decrypting anything" {
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
@@ -251,8 +283,12 @@ fn expectConstants(comptime Enum: type, comptime prefix: []const u8) !void {
     }
 }
 
-test "a C plugin built from the header loads, gets its event, shuts down and agrees on the layout" {
-    var library: bifrost.Plugins.Library = try .open(test_options.c_plugin);
+test "a packaged C plugin built from the header loads, gets its event, shuts down and agrees on the layout" {
+    var packages: Packages = try .init();
+    defer packages.deinit();
+    const path = try packages.add("CFixture", "c-fixture", "1.0.0", "Counts players, says plugin.toml", test_options.c_plugin);
+    defer gpa.free(path);
+    var library: bifrost.Plugins.Library = try .open(path);
     defer library.close();
     const events = library.lookup(*const fn () callconv(.c) u32, "bifrost_fixture_events").?;
     const shutdowns = library.lookup(*const fn () callconv(.c) u32, "bifrost_fixture_shutdowns").?;
@@ -261,10 +297,11 @@ test "a C plugin built from the header loads, gets its event, shuts down and agr
     const shutdowns_before = shutdowns();
 
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
-    try plugins.open(test_options.c_plugin);
+    try packages.load(&plugins, "CFixture");
     try std.testing.expectEqualStrings("c-fixture", plugins.metadata(0).name());
     try std.testing.expectEqualStrings("1.0.0", plugins.metadata(0).version());
-    try std.testing.expectEqualStrings("Counts players", plugins.metadata(0).description());
+    try std.testing.expectEqualStrings("Counts players, says plugin.toml", plugins.metadata(0).description());
+    try std.testing.expectEqualStrings(std.fs.path.dirname(path).?, plugins.metadata(0).package);
     plugins.emit(&.{ .kind = .player_connected }, null);
     plugins.emit(&.{ .kind = .proxy_started }, null);
     try std.testing.expectEqual(events_before + 1, events());
@@ -288,9 +325,12 @@ test "a C plugin built from the header loads, gets its event, shuts down and agr
 }
 
 test "the example plugin loads from disk and keeps players off maintenance" {
+    var packages: Packages = try .init();
+    defer packages.deinit();
+    gpa.free(try packages.add("Maintenance", "maintenance", "1.0.0", "Keeps players off the maintenance backend", test_options.example_plugin));
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
     defer plugins.deinit();
-    try plugins.open(test_options.example_plugin);
+    try packages.load(&plugins, "Maintenance");
     try std.testing.expectEqualStrings("Keeps players off the maintenance backend", plugins.metadata(0).description());
     var rig: Rig = undefined;
     try rig.start(.{ .plugins = &plugins, .b_name = "maintenance" });
@@ -648,22 +688,30 @@ test "a slow packet callback is measured and the packet still goes through" {
     try std.testing.expect(totals.calls >= 2);
 }
 
-test "a C plugin can be loaded and unloaded repeatedly" {
-    var library: bifrost.Plugins.Library = try .open(test_options.c_plugin);
+test "a packaged C plugin can be loaded and unloaded repeatedly" {
+    var packages: Packages = try .init();
+    defer packages.deinit();
+    const path = try packages.add("CFixture", "c-fixture", "1.0.0", "Counts players", test_options.c_plugin);
+    defer gpa.free(path);
+    var library: bifrost.Plugins.Library = try .open(path);
     defer library.close();
     const shutdowns = library.lookup(*const fn () callconv(.c) u32, "bifrost_fixture_shutdowns").?;
     const before = shutdowns();
     for (0..20) |_| {
         var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
         defer plugins.deinit();
-        try plugins.open(test_options.c_plugin);
+        try packages.load(&plugins, "CFixture");
         try std.testing.expect(plugins.subscribed(.player_connected));
     }
     try std.testing.expectEqual(before + 20, shutdowns());
 }
 
-test "a C++23 plugin loads, keeps its exceptions to itself and shuts down" {
-    var library: bifrost.Plugins.Library = try .open(test_options.cpp_plugin);
+test "a packaged C++23 plugin loads, keeps its exceptions to itself and shuts down" {
+    var packages: Packages = try .init();
+    defer packages.deinit();
+    const path = try packages.add("CppFixture", "cpp-fixture", "1.0.0", "Built as C++23", test_options.cpp_plugin);
+    defer gpa.free(path);
+    var library: bifrost.Plugins.Library = try .open(path);
     defer library.close();
     const counter = *const fn () callconv(.c) u32;
     const events = library.lookup(counter, "bifrost_fixture_events").?;
@@ -677,7 +725,7 @@ test "a C++23 plugin loads, keeps its exceptions to itself and shuts down" {
     const shutdowns_before = shutdowns();
 
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
-    try plugins.open(test_options.cpp_plugin);
+    try packages.load(&plugins, "CppFixture");
     try std.testing.expectEqualStrings("cpp-fixture", plugins.metadata(0).name());
     try std.testing.expectEqualStrings("Built as C++23", plugins.metadata(0).description());
     plugins.emit(&.{ .kind = .player_connected }, null);
@@ -689,4 +737,56 @@ test "a C++23 plugin loads, keeps its exceptions to itself and shuts down" {
     try std.testing.expectEqualStrings("hello there", buffer[0..args(&buffer, buffer.len)]);
     plugins.deinit();
     try std.testing.expectEqual(shutdowns_before + 1, shutdowns());
+}
+
+test "packages are discovered in name order, skipping disabled ones, and unload newest first" {
+    var packages: Packages = try .init();
+    defer packages.deinit();
+    const c_path = try packages.add("B-C", "c-fixture", "1.0.0", "C", test_options.c_plugin);
+    defer gpa.free(c_path);
+    gpa.free(try packages.add("A-Cpp", "cpp-fixture", "1.0.0", "C++", test_options.cpp_plugin));
+    gpa.free(try packages.add("C-Zig", "maintenance", "1.0.0", "Zig", test_options.example_plugin));
+    try packages.tmp.dir.createDirPath(io, "D-Off");
+    var library: bifrost.Plugins.Library = try .open(c_path);
+    defer library.close();
+    const shutdowns = library.lookup(*const fn () callconv(.c) u32, "bifrost_fixture_shutdowns").?;
+    const before = shutdowns();
+
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    try bifrost.Plugins.Package.discover(&plugins, io, packages.root, &.{"d-off"});
+    try std.testing.expectEqual(@as(usize, 3), plugins.loaded.items.len);
+    for ([_][]const u8{ "cpp-fixture", "c-fixture", "maintenance" }, [_][]const u8{ "A-Cpp", "B-C", "C-Zig" }, 0..) |name, dir, i| {
+        try std.testing.expectEqualStrings(name, plugins.metadata(i).name());
+        try std.testing.expectEqualStrings(dir, std.fs.path.basename(plugins.metadata(i).package));
+    }
+    plugins.deinit();
+    try std.testing.expectEqual(before + 1, shutdowns());
+}
+
+test "a package whose library disagrees with its manifest, repeats a name or has no entry point is refused" {
+    var packages: Packages = try .init();
+    defer packages.deinit();
+    const path = try packages.add("Mismatch", "c-fixture", "2.0.0", "Wrong version", test_options.c_plugin);
+    defer gpa.free(path);
+    gpa.free(try packages.add("Renamed", "C-Fixture-Two", "1.0.0", "Wrong name", test_options.c_plugin));
+    gpa.free(try packages.add("NoEntry", "no-entry", "1.0.0", "Not a plugin", test_options.no_entry_library));
+    gpa.free(try packages.add("Good", "c-fixture", "1.0.0", "First copy", test_options.c_plugin));
+    gpa.free(try packages.add("Twin", "c-fixture", "1.0.0", "Second copy", test_options.c_plugin));
+    var library: bifrost.Plugins.Library = try .open(path);
+    defer library.close();
+    const shutdowns = library.lookup(*const fn () callconv(.c) u32, "bifrost_fixture_shutdowns").?;
+    const before = shutdowns();
+
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    try std.testing.expectError(error.MetadataMismatch, packages.load(&plugins, "Mismatch"));
+    try std.testing.expectError(error.MetadataMismatch, packages.load(&plugins, "Renamed"));
+    try std.testing.expectError(error.MissingEntrypoint, packages.load(&plugins, "NoEntry"));
+    try std.testing.expectEqual(before + 1, shutdowns());
+    try std.testing.expectEqual(@as(usize, 0), plugins.loaded.items.len);
+    try std.testing.expect(!plugins.subscribed(.player_connected));
+
+    try packages.load(&plugins, "Good");
+    try std.testing.expectError(error.DuplicatePlugin, packages.load(&plugins, "Twin"));
+    try std.testing.expectEqual(@as(usize, 1), plugins.loaded.items.len);
 }

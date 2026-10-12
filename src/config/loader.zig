@@ -117,29 +117,30 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
             for (value.array.items, 0..) |item, i| {
                 try readBackend(config, try table(diag, .{ .section = name, .index = i }, item), i, diag);
             }
+        } else if (eql(name, "plugins")) {
+            try readPlugins(config, try table(diag, key, value), diag);
         } else if (eql(name, "plugin")) {
-            if (value != .array) return fail(diag, key, "expected [[plugin]] tables", .{});
-            for (value.array.items, 0..) |item, i| {
-                try readPlugin(config, try table(diag, .{ .section = name, .index = i }, item), i, diag);
-            }
+            return fail(diag, key, "[[plugin]] path is gone; put each library in plugins/<Name>/ with a plugin.toml", .{});
         } else return fail(diag, key, "unknown section", .{});
     }
 }
 
-fn readPlugin(config: *Config, section: *const toml.Table, index: usize, diag: *Diagnostic) Error!void {
-    var path: ?[]const u8 = null;
+fn readPlugins(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
     var it = section.iterator();
     while (it.next()) |entry| {
-        const key: Key = .{ .section = "plugin", .index = index, .name = entry.key_ptr.* };
-        if (eql(key.name.?, "path")) {
-            path = try string(diag, key, entry.value_ptr.*);
+        const key: Key = .{ .section = "plugins", .name = entry.key_ptr.* };
+        const value = entry.value_ptr.*;
+        if (eql(key.name.?, "directory")) {
+            config.setPluginsDir(try string(diag, key, value)) catch
+                return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len});
+        } else if (eql(key.name.?, "disabled")) {
+            if (value != .array) return fail(diag, key, "expected a list of package directory names", .{});
+            for (value.array.items) |item| config.disablePlugin(try string(diag, key, item)) catch |err| return switch (err) {
+                error.InvalidName => fail(diag, key, "names must be 1 to {d} bytes", .{Config.max_plugin_dir_name}),
+                error.TooManyPlugins => fail(diag, key, "at most {d} names", .{Config.max_disabled_plugins}),
+            };
         } else return fail(diag, key, "unknown key", .{});
     }
-    const key: Key = .{ .section = "plugin", .index = index, .name = "path" };
-    config.addPlugin(path orelse return fail(diag, key, "is required", .{})) catch |err| return switch (err) {
-        error.InvalidPath => fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len}),
-        error.TooManyPlugins => fail(diag, key, "at most {d} plugins", .{Config.max_plugins}),
-    };
 }
 
 fn readServer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
@@ -435,14 +436,21 @@ test "transfer section sets the timeouts" {
     try std.testing.expectEqual(.match, matching.content_policy);
 }
 
-test "plugin tables list libraries to load" {
+test "plugins section picks the package directory and disables packages" {
     var diag: Diagnostic = .{};
     const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
-    const config = try parse(std.testing.allocator, "[[plugin]]\npath = \"plugins/a.so\"\n[[plugin]]\npath = \"b.dll\"\n" ++ backend, &diag);
-    try std.testing.expectEqual(@as(usize, 2), config.plugin_count);
-    try std.testing.expectEqualStrings("b.dll", config.pluginPath(1));
-    try expectInvalid("[[plugin]]\nname = \"a\"\n" ++ backend, "plugin[0].name: unknown key");
-    try expectInvalid("[[plugin]]\n" ++ backend, "plugin[0].path: is required");
+    const defaults = try parse(std.testing.allocator, backend, &diag);
+    try std.testing.expectEqualStrings("plugins", defaults.pluginsDir());
+    try std.testing.expectEqual(@as(usize, 0), defaults.disabled_count);
+    const config = try parse(std.testing.allocator, "[plugins]\ndirectory = \"mods\"\ndisabled = [\"A\", \"B\"]\n" ++ backend, &diag);
+    try std.testing.expectEqualStrings("mods", config.pluginsDir());
+    try std.testing.expectEqual(@as(usize, 2), config.disabled_count);
+    try std.testing.expectEqualStrings("B", config.disabledPlugin(1));
+    try expectInvalid("[plugins]\ndisabled = \"A\"\n" ++ backend, "plugins.disabled: expected a list of package directory names");
+    try expectInvalid("[plugins]\ndisabled = [1]\n" ++ backend, "plugins.disabled: expected a string");
+    try expectInvalid("[plugins]\ndirectory = \"\"\n" ++ backend, "plugins.directory: must be 1 to 1024 bytes");
+    try expectInvalid("[plugins]\npath = \"a.so\"\n" ++ backend, "plugins.path: unknown key");
+    try expectInvalid("[[plugin]]\npath = \"plugins/a.so\"\n" ++ backend, "plugin: [[plugin]] path is gone; put each library in plugins/<Name>/ with a plugin.toml");
 }
 
 test "loadFile reports missing and oversized files" {

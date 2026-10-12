@@ -2,6 +2,7 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const Backend = @import("../backend/Backend.zig");
 pub const Library = @import("Library.zig").Library;
+pub const Package = @import("Package.zig");
 pub const Handles = @import("Handles.zig");
 pub const Packets = @import("Packets.zig");
 const Pool = @import("Pool.zig");
@@ -44,6 +45,7 @@ pub const Metadata = struct {
     name_len: u8 = 0,
     version_len: u8 = 0,
     description_len: u16 = 0,
+    package: []const u8 = "",
 
     pub fn name(self: *const Metadata) []const u8 {
         return self.name_buffer[0..self.name_len];
@@ -150,14 +152,12 @@ pub fn deinit(self: *Plugins) void {
     self.handles.deinit(self.gpa);
 }
 
-pub fn open(self: *Plugins, path: []const u8) !void {
-    var library = try Library.open(path);
-    errdefer library.close();
-    const entry = library.lookup(abi.InitFn, abi.entrypoint) orelse return error.MissingEntrypoint;
-    try self.add(entry, library);
+pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
+    return self.load(entry, library, null);
 }
 
-pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
+/// Takes ownership of `library` only on success.
+pub fn load(self: *Plugins, entry: abi.InitFn, library: ?Library, manifest: ?*const Metadata) !void {
     try self.loaded.ensureUnusedCapacity(self.gpa, 1);
     const loaded = try self.gpa.create(Loaded);
     errdefer self.gpa.destroy(loaded);
@@ -166,6 +166,8 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
     loaded.metrics = try self.gpa.alloc(Packets.Metrics, self.options.workers);
     errdefer self.gpa.free(loaded.metrics);
     @memset(loaded.metrics, .{});
+    if (manifest) |expected| loaded.metadata.package = try self.gpa.dupe(u8, expected.package);
+    errdefer self.gpa.free(loaded.metadata.package);
 
     self.pending.clearRetainingCapacity();
     self.pending_packets.clearRetainingCapacity();
@@ -195,10 +197,24 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
         log.warn("plugin {s} refused: its version must be 1 to {d} bytes of printable UTF-8", .{ plugin_name, max_version_len });
         return error.InvalidMetadata;
     };
+    if (manifest) |expected| {
+        if (!std.mem.eql(u8, plugin_name, expected.name()) or !std.mem.eql(u8, version, expected.version())) {
+            log.warn("plugin {s} {s} refused: plugin.toml says {s} {s}", .{ plugin_name, version, expected.name(), expected.version() });
+            return error.MetadataMismatch;
+        }
+    }
+    if (self.isLoaded(plugin_name)) {
+        log.warn("plugin {s} refused: a plugin with that name is already loaded", .{plugin_name});
+        return error.DuplicatePlugin;
+    }
     @memcpy(meta.name_buffer[0..plugin_name.len], plugin_name);
     meta.name_len = @intCast(plugin_name.len);
     @memcpy(meta.version_buffer[0..version.len], version);
     meta.version_len = @intCast(version.len);
+    if (manifest) |expected| {
+        meta.description_buffer = expected.description_buffer;
+        meta.description_len = expected.description_len;
+    }
     const unsupported = @as(u64, @bitCast(plugin.capabilities)) & ~@as(u64, @bitCast(abi.Capabilities.supported));
     if (unsupported != 0) {
         log.warn("plugin {s} needs unsupported capabilities 0x{x}", .{ loaded.label(), unsupported });
@@ -233,7 +249,9 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
     for (self.pending_commands.items, names) |item, name| self.commands.putAssumeCapacityNoClobber(name, item.command);
     for (self.pending.items) |item| self.subscribers[@backingInt(item.kind)].appendAssumeCapacity(item.subscriber);
     self.loaded.appendAssumeCapacity(loaded);
-    if (meta.description_len == 0) {
+    if (meta.package.len != 0) {
+        log.info("loaded plugin {s} {s} from {s}: {s}", .{ meta.name(), meta.version(), meta.package, meta.description() });
+    } else if (meta.description_len == 0) {
         log.info("loaded plugin {s} {s}", .{ meta.name(), meta.version() });
     } else {
         log.info("loaded plugin {s} {s}: {s}", .{ meta.name(), meta.version(), meta.description() });
@@ -242,6 +260,11 @@ pub fn add(self: *Plugins, entry: abi.InitFn, library: ?Library) !void {
 
 pub fn metadata(self: *const Plugins, index: usize) *const Metadata {
     return &self.loaded.items[index].metadata;
+}
+
+pub fn isLoaded(self: *const Plugins, name: []const u8) bool {
+    for (self.loaded.items) |other| if (std.ascii.eqlIgnoreCase(other.label(), name)) return true;
+    return false;
 }
 
 pub fn unload(self: *Plugins) void {
@@ -266,6 +289,7 @@ pub fn unload(self: *Plugins) void {
     while (self.loaded.pop()) |loaded| {
         shutdown(loaded);
         if (loaded.library) |*library| library.close();
+        self.gpa.free(loaded.metadata.package);
         self.gpa.free(loaded.metrics);
         self.gpa.destroy(loaded);
     }
@@ -431,7 +455,7 @@ fn input(str: abi.Str, max: usize) ?[]const u8 {
     return str.slice();
 }
 
-fn printable(bytes: []const u8) bool {
+pub fn printable(bytes: []const u8) bool {
     if (!std.unicode.utf8ValidateSlice(bytes)) return false;
     for (bytes) |byte| if (byte < 0x20 or byte == 0x7f) return false;
     return true;
@@ -687,8 +711,14 @@ const Probe = struct {
         shutdown_count += 1;
     }
 
+    const names = blk: {
+        var list: [16][]const u8 = undefined;
+        for (&list, 0..) |*name, i| name.* = std.fmt.comptimePrint("probe{d}", .{i});
+        break :blk list;
+    };
+
     fn describe(plugin: *abi.Plugin, id: usize) void {
-        plugin.name = .of("probe");
+        plugin.name = .of(names[id]);
         plugin.plugin_version = .of("1.0.0");
         plugin.capabilities = .{ .events = true };
         plugin.state = @ptrFromInt(id);
@@ -1012,6 +1042,7 @@ test "posts are bounded, go stale with the player and are settled once at unload
 
 const Tasker = struct {
     var host: ?abi.Host = null;
+    var name: []const u8 = "tasker";
     var gate: std.atomic.Value(bool) = .init(true);
     var started: std.atomic.Value(u32) = .init(0);
     var results: [4]std.atomic.Value(u32) = @splat(.init(0));
@@ -1023,7 +1054,7 @@ const Tasker = struct {
     }
 
     fn init(api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
-        plugin.name = .of("tasker");
+        plugin.name = .of(name);
         plugin.plugin_version = .of("1.0.0");
         plugin.capabilities = .{ .tasks = true };
         host = api.*;
@@ -1076,6 +1107,8 @@ test "tasks respect the per-plugin and global limits and finish on the player's 
     defer plugins.deinit();
     try plugins.add(Tasker.init, null);
     const first = Tasker.host.?;
+    Tasker.name = "tasker2";
+    defer Tasker.name = "tasker";
     try plugins.add(Tasker.init, null);
     const second = Tasker.host.?;
     const player = try taskPlayer(&plugins);
@@ -1218,9 +1251,10 @@ test "a bad description is refused without failing the plugin, and can only be s
     defer plugins.deinit();
     const long: [max_description_len + 1]u8 = @splat('d');
     const refused = [_]abi.Str{ .{ .ptr = null, .len = 1 }, .of(&long), .of("\xc3"), .of("a\tb") };
-    Meta.name = .of("meta");
+    const names = [_][]const u8{ "meta0", "meta1", "meta2", "meta3" };
     Meta.version = .of("1.0.0");
-    for (refused, 0..) |description, i| {
+    for (refused, names, 0..) |description, name, i| {
+        Meta.name = .of(name);
         Meta.description = description;
         try plugins.add(Meta.init, null);
         try testing.expectEqual(abi.Status.invalid_argument, Meta.described);
@@ -1371,7 +1405,7 @@ test "running out of memory anywhere while loading leaves nothing registered" {
         failing.fail_index = failing.alloc_index + fail_after;
         Full.succeeded = false;
         Full.shutdowns = 0;
-        plugins.add(Full.init, null) catch |err| {
+        plugins.load(Full.init, null, &testManifest("full", "1.0.0")) catch |err| {
             try testing.expect(err == error.OutOfMemory or err == error.PluginInitFailed);
             try testing.expectEqual(@as(usize, @intFromBool(Full.succeeded)), Full.shutdowns);
             try testing.expectEqual(@as(usize, 0), plugins.loaded.items.len);
@@ -1385,6 +1419,43 @@ test "running out of memory anywhere while loading leaves nothing registered" {
         try testing.expect(plugins.hasCommands() and plugins.packetTable(.from_backend) != null);
         break;
     }
+}
+
+fn testManifest(name: []const u8, version: []const u8) Metadata {
+    var meta: Metadata = .{ .package = "plugins" ++ std.fs.path.sep_str ++ "Probe" };
+    @memcpy(meta.name_buffer[0..name.len], name);
+    meta.name_len = @intCast(name.len);
+    @memcpy(meta.version_buffer[0..version.len], version);
+    meta.version_len = @intCast(version.len);
+    const description = "From plugin.toml";
+    @memcpy(meta.description_buffer[0..description.len], description);
+    meta.description_len = description.len;
+    return meta;
+}
+
+test "a packaged plugin must match its manifest, which supplies its description and package path" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    Meta.name = .of("meta");
+    Meta.version = .of("1.0.0");
+    Meta.description = .of("From the library");
+    try testing.expectError(error.MetadataMismatch, plugins.load(Meta.init, null, &testManifest("Meta", "1.0.0")));
+    try testing.expectError(error.MetadataMismatch, plugins.load(Meta.init, null, &testManifest("meta", "1.0.1")));
+    try testing.expectError(error.PluginInitFailed, plugins.load(Probe.failing, null, &testManifest("probe3", "1.0.0")));
+    try testing.expectEqualSlices(u8, &.{ 8, 8 }, Probe.shutdowns[0..Probe.shutdown_count]);
+    try testing.expect(!plugins.subscribed(.player_connected));
+
+    try plugins.load(Meta.init, null, &testManifest("meta", "1.0.0"));
+    const meta = plugins.metadata(0);
+    try testing.expectEqualStrings("From plugin.toml", meta.description());
+    try testing.expectEqualStrings("plugins" ++ std.fs.path.sep_str ++ "Probe", meta.package);
+    try testing.expect(plugins.isLoaded("META"));
+
+    Meta.name = .of("Meta");
+    try testing.expectError(error.DuplicatePlugin, plugins.add(Meta.init, null));
+    try testing.expectEqual(@as(usize, 1), plugins.loaded.items.len);
+    try testing.expectEqual(@as(usize, 3), Probe.shutdown_count);
 }
 
 const Poster = struct {

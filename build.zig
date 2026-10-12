@@ -22,6 +22,7 @@ const Plugin = struct {
     example: *std.Build.Step.Compile,
     c_fixture: *std.Build.Step.Compile,
     cpp_fixture: *std.Build.Step.Compile,
+    no_entry: *std.Build.Step.Compile,
     header: *std.Build.Module,
 };
 
@@ -81,7 +82,15 @@ fn addPluginSdk(ctx: Context) Plugin {
     const example = b.addLibrary(.{ .name = "maintenance", .linkage = .dynamic, .root_module = ctx.module("examples/maintenance.zig", &.{
         .{ .name = "bifrost_plugin", .module = sdk },
     }) });
-    b.installArtifact(example);
+    installPackage(ctx, example, "Maintenance", "maintenance", "Keeps players off the maintenance backend");
+    const greeter = b.addLibrary(.{ .name = "Greeter", .linkage = .dynamic, .root_module = b.createModule(.{
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libcpp = true,
+    }) });
+    greeter.root_module.addCSourceFile(.{ .file = b.path("examples/greeter/Greeter.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
+    greeter.root_module.addIncludePath(b.path("include"));
+    installPackage(ctx, greeter, "Greeter", "Greeter", "Logs a welcome for every player");
     const header = b.addTranslateC(.{
         .root_source_file = b.path("include/bifrost_plugin.h"),
         .target = ctx.target,
@@ -102,7 +111,27 @@ fn addPluginSdk(ctx: Context) Plugin {
     }) });
     cpp_fixture.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/fixture.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
     cpp_fixture.root_module.addIncludePath(b.path("include"));
-    return .{ .example = example, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .header = header.createModule() };
+    const no_entry = b.addLibrary(.{ .name = "no_entry", .linkage = .dynamic, .root_module = b.createModule(.{
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = true,
+    }) });
+    no_entry.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/no_entry.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
+    no_entry.root_module.addIncludePath(b.path("include"));
+    return .{ .example = example, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .no_entry = no_entry, .header = header.createModule() };
+}
+
+// The manifest is generated so `library` has the target's extension
+fn installPackage(ctx: Context, library: *std.Build.Step.Compile, dir: []const u8, name: []const u8, description: []const u8) void {
+    const b = ctx.b;
+    const file = b.fmt("{s}{s}", .{ dir, ctx.target.result.dynamicLibSuffix() });
+    const manifest = b.addWriteFiles().add("plugin.toml", b.fmt(
+        "name = \"{s}\"\nversion = \"1.0.0\"\ndescription = \"{s}\"\nlibrary = \"{s}\"\n",
+        .{ name, description, file },
+    ));
+    const dest: std.Build.InstallDir = .{ .custom = b.fmt("plugins/{s}", .{dir}) };
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(manifest, dest, "plugin.toml").step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(library.getEmittedBin(), dest, file).step);
 }
 
 fn addTests(ctx: Context, plugin: Plugin) void {
@@ -122,6 +151,7 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     options.addOptionPath("example_plugin", plugin.example.getEmittedBin());
     options.addOptionPath("c_plugin", plugin.c_fixture.getEmittedBin());
     options.addOptionPath("cpp_plugin", plugin.cpp_fixture.getEmittedBin());
+    options.addOptionPath("no_entry_library", plugin.no_entry.getEmittedBin());
     integration_tests.root_module.addImport("test_options", options.createModule());
 
     const step = b.step("test", "Run unit and integration tests");

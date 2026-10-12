@@ -42,6 +42,8 @@ test {
     _ = @import("session/self_id.zig");
     _ = @import("session/commands.zig");
     _ = @import("plugin/Plugins.zig");
+    _ = @import("plugin/Package.zig");
+    _ = @import("plugin/Library.zig");
     _ = @import("plugin/abi.zig");
     _ = @import("plugin/Handles.zig");
     _ = @import("plugin/Packets.zig");
