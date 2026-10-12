@@ -15,6 +15,9 @@ pub const Setup = enum {
     one_decoded,
     ten_ids,
     ten_hot,
+    phase_miss,
+    one_replace,
+    two_replace,
 
     pub fn describe(self: Setup) []const u8 {
         return switch (self) {
@@ -24,23 +27,26 @@ pub const Setup = enum {
             .one_decoded => "1 decoded subscriber on the hot packet",
             .ten_ids => "10 subscribers on different packet ids",
             .ten_hot => "10 subscribers on the same hot packet",
+            .phase_miss => "1 before-game subscriber on the hot packet, in game",
+            .one_replace => "1 subscriber replacing the hot packet",
+            .two_replace => "2 subscribers chaining replacements",
         };
     }
 
     // Half the stream is the hot packet
     pub fn callbacksPerPacket(self: Setup) f64 {
         return switch (self) {
-            .none, .idle_10 => 0,
-            .one_raw, .one_decoded => 0.5,
-            .ten_ids => 1,
+            .none, .idle_10, .phase_miss => 0,
+            .one_raw, .one_decoded, .one_replace => 0.5,
+            .ten_ids, .two_replace => 1,
             .ten_hot => 5,
         };
     }
 
     pub fn budgetNs(self: Setup) f64 {
         return switch (self) {
-            .none, .idle_10 => 2,
-            .one_decoded => 200,
+            .none, .idle_10, .phase_miss => 2,
+            .one_decoded, .one_replace, .two_replace => 200,
             else => 100,
         };
     }
@@ -51,29 +57,53 @@ const text_packet_id: u10 = Current.packetId(.text).?;
 const cold_ids = [_]u10{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
 var target_id: u10 = 0;
+var instance: u8 = 0;
+var name_buffer: [32]u8 = undefined;
+
+fn named(plugin: *abi.Plugin, base: []const u8) void {
+    instance +%= 1;
+    plugin.name = .of(std.fmt.bufPrint(&name_buffer, "{s}{d}", .{ base, instance }) catch unreachable);
+    plugin.plugin_version = .of("1");
+}
 
 fn pass(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
     return .pass;
 }
 
+fn copy(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+    const bytes = packet.bytes.slice();
+    @memcpy(packet.replacement.?[0..bytes.len], bytes);
+    packet.replacement_len = bytes.len;
+    return .replace;
+}
+
 fn idle(_: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
-    plugin.name = .of("idle");
-    plugin.plugin_version = .of("1");
+    named(plugin, "idle");
     return .ok;
 }
 
 fn raw(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
-    plugin.name = .of("raw");
-    plugin.plugin_version = .of("1");
+    named(plugin, "raw");
     plugin.capabilities = .{ .packets = true };
     return host.subscribe_packet(host.context, .from_player, target_id, .any, .{}, pass, null);
 }
 
 fn decoded(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
-    plugin.name = .of("decoded");
-    plugin.plugin_version = .of("1");
+    named(plugin, "decoded");
     plugin.capabilities = .{ .packets = true };
     return host.subscribe_packet(host.context, .from_player, target_id, .any, .{ .validated = true }, pass, null);
+}
+
+fn beforeGame(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+    named(plugin, "before");
+    plugin.capabilities = .{ .packets = true };
+    return host.subscribe_packet(host.context, .from_player, target_id, .before_game, .{}, pass, null);
+}
+
+fn replacer(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+    named(plugin, "replacer");
+    plugin.capabilities = .{ .packets = true };
+    return host.subscribe_packet(host.context, .from_player, target_id, .any, .{}, copy, null);
 }
 
 pub fn load(plugins: *bifrost.Plugins, setup: Setup, hot: u10) !void {
@@ -84,6 +114,9 @@ pub fn load(plugins: *bifrost.Plugins, setup: Setup, hot: u10) !void {
         .one_raw => try plugins.add(raw, null),
         .one_decoded => try plugins.add(decoded, null),
         .ten_hot => for (0..10) |_| try plugins.add(raw, null),
+        .phase_miss => try plugins.add(beforeGame, null),
+        .one_replace => try plugins.add(replacer, null),
+        .two_replace => for (0..2) |_| try plugins.add(replacer, null),
         .ten_ids => {
             try plugins.add(raw, null);
             for (cold_ids) |id| {
@@ -137,6 +170,8 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![std.enums.val
     }
     const scratch = try gpa.alloc(u8, Packets.scratch_bytes);
     defer gpa.free(scratch);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
 
     const rounds: usize = if (quick) 200 else 1000;
     var results: [std.enums.values(Setup).len]DispatchResult = undefined;
@@ -151,14 +186,21 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![std.enums.val
         for (&samples) |*sample_ns| {
             var kept: usize = 0;
             const started = harness.nowNs(io);
-            for (0..rounds) |_| for (bounds) |bound| {
-                const bytes = storage.items[bound[0]..][0..bound[1]];
-                if (table) |hooks| switch (Packets.run(hooks, call, bytes, scratch, Checker{})) {
-                    .cancel => continue,
-                    else => {},
-                };
-                kept += bytes.len;
-            };
+            for (0..rounds) |_| {
+                defer _ = arena.reset(.retain_capacity);
+                for (bounds) |bound| {
+                    const bytes = storage.items[bound[0]..][0..bound[1]];
+                    var packet = bytes;
+                    if (table) |hooks| if (Packets.packetId(bytes)) |id| if (hooks.wants(id, call.in_game)) {
+                        switch (Packets.run(hooks, call, id, bytes, scratch, Checker{})) {
+                            .pass => {},
+                            .cancel => continue,
+                            .replace => |replacement| packet = try arena.allocator().dupe(u8, replacement),
+                        }
+                    };
+                    kept += packet.len;
+                }
+            }
             std.mem.doNotOptimizeAway(kept);
             sample_ns.* = @as(f64, @floatFromInt(harness.nowNs(io) - started)) / @as(f64, @floatFromInt(rounds * stream_len));
         }
