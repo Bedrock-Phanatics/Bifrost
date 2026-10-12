@@ -97,8 +97,10 @@ spawned with no player (`id` 0) finishes with `OK` on the task thread itself. Ta
   `CANCEL`, or to `REDIRECT` with a `backend`. Other events pass `NULL`.
 - **Packets** get the whole packet, header included, in `bytes`. Return `PASS`, `CANCEL` or `REPLACE` after writing
   a whole replacement packet into `replacement` (up to `replacement_capacity`, 64 KiB) and setting
-  `replacement_len`. A replacement that doesn't decode is dropped and counted as an error. With
-  `BIFROST_PACKET_VALIDATED` the hook only sees packets that decode.
+  `replacement_len`. A replacement that doesn't decode or has a different packet id is dropped and counted as an
+  error. Later hooks on the same packet see the latest replacement; a `CANCEL` stops the rest. Proxy state, such as
+  what gets cleaned up on a transfer, follows what was actually delivered. With `BIFROST_PACKET_VALIDATED` the hook
+  only sees packets that decode.
 - **Commands** get the lowercase `name` and the trimmed `args`. A plugin command replaces a backend command with the
   same name, both in autocomplete and when run.
 

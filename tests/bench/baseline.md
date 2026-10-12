@@ -136,6 +136,27 @@ microseconds per batch, so a few callbacks per packet don't show. Windows end-to
 Heap of a managed proxy (WSL2): 16.6 MiB fresh, 252 KiB per managed player. Idle plugins add nothing; packet
 subscribers add one ~190 KiB rewrite buffer per worker.
 
+### Lazy scratch and chained clock reads
+
+Recorded 2026-10-11 on Windows, ReleaseFast, `-- plugins --quick`, dispatch table only, three alternating runs each
+against 019660c. Ns per packet; the stream is half hot packets.
+
+| setup | before | after |
+|---|---|---|
+| 1 raw subscriber on the hot packet | 29 to 43 | 31 to 34 |
+| 1 decoded subscriber on the hot packet | 55 to 77 | 56 to 63 |
+| 10 subscribers on different packet ids | 58 to 75 | 62 to 68 |
+| 10 subscribers on the same hot packet | 285 to 339 | 171 to 180 |
+| 1 before-game subscriber on the hot packet, in game | 4.4 to 6.3 | 2.0 to 3.4 |
+| 1 subscriber replacing the hot packet | 55 to 73 | 66 to 75 |
+| 2 subscribers chaining replacements | 122 to 137 | 118 to 139 |
+
+One clock read now ends a callback and starts the next, so ten callbacks on a packet take 11 reads instead of 20.
+Packets nobody hooks for the current phase skip dispatch, and in-game batches still take the opaque relay when every
+hook in that direction is before-game only. The rewrite buffer is gone: a 128 KiB scratch buffer per worker is
+allocated on the first hooked packet, and replacements are copied into the batch arena, so they no longer split
+batches. A single replacement costs one extra copy, within run-to-run noise here.
+
 ## Player id translation
 
 `zig build bench -Doptimize=ReleaseFast -- ids`, recorded 2026-10-08, three runs each. After a transfer the proxy swaps
