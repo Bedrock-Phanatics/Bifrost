@@ -190,11 +190,16 @@ fn addBench(ctx: Context, packet_filter: *std.Build.Step.Compile) void {
     };
     // The driver keeps the default scheduler so only the proxy under test changes
     const driver = benchExe(ctx, "bifrost-bench", imports, ctx.zio);
+    const usage_tests = b.addTest(.{ .root_module = driver.root_module, .filters = &.{"benchmark process usage"} });
+    b.step("bench-test", "Check benchmark process counters").dependOn(&b.addRunArtifact(usage_tests).step);
     const proxy = benchExe(ctx, "bifrost-bench-proxy", imports, b.dependency("zio", .{
         .target = ctx.target,
         .optimize = ctx.optimize,
         .scheduling = scheduling,
     }).module("zio"));
+    const compile = b.step("bench-build", "Build the benchmark driver and proxy");
+    compile.dependOn(&driver.step);
+    compile.dependOn(&proxy.step);
     const run = b.addRunArtifact(driver);
     run.addArg("--proxy-exe");
     run.addArtifactArg(proxy);

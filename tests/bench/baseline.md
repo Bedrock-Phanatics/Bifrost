@@ -452,3 +452,45 @@ old-host SDK rejection, formatting, whitespace checks, and Windows/Linux Release
 Linux runtime behavior, injection transport throughput, lookup scaling, multi-worker network throughput, process
 CPU/RSS and allocator page retention were not measured. The supported injection set is Text in both directions and
 RequestChunkRadius to the backend; other packet kinds remain unsupported.
+
+## Windows process counters
+
+Recorded 2026-10-12 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast.
+Command: `zig build bench -Doptimize=ReleaseFast -- injection relay --quick`, with other Bifrost builds and tests
+stopped. Windows benchmarks previously returned zero for process CPU and resident memory. They now use
+[GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)
+for kernel plus user CPU time and
+[K32GetProcessMemoryInfo](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getprocessmemoryinfo)
+for current and peak working set. Working set includes resident shared pages; peak is the process lifetime peak.
+These figures are distinct from requested live heap bytes and are not directly comparable to the earlier WSL2 runs.
+
+Injection wall time remains the median of seven samples of 500 batches of 32. CPU is measured in a separate run
+of at least 250 ms per packet size (1000 ms without `--quick`), with time checked between blocks of 2048 packets.
+Process sampling occurs outside the packet loops and includes every process thread. CPU accounting resolution and
+the different sampling window can make CPU ns/packet differ from the wall-time median. The sink still does no
+session lookup, compression, encryption or transport work.
+
+| packet bytes | before, wall ns/packet | after, wall ns/packet | CPU ns/packet | packets/s | resident / peak KiB |
+|---|---|---|---|---|---|
+| 32 | 166.1 | 165.3 | 136.9 | 6,051,208 | 6,708 / 6,708 |
+| 1,024 | 224.9 | 275.2 | 261.4 | 3,634,381 | 6,772 / 6,780 |
+| 16,384 | 1,049.3 | 1,190.0 | 1,109.7 | 840,363 | 7,304 / 7,304 |
+| 65,536 | 3,434.8 | 3,570.3 | 3,390.8 | 280,091 | 8,896 / 8,912 |
+
+Every size still has one allocation per accepted packet and zero retained payload heap after draining. Queued
+heap for 32 packets remains 4,096 / 35,840 / 527,360 / 2,100,224 B. Resident memory covers the entire driver,
+including its runtime, buffers and allocator pages. The production injection implementation is unchanged; CPU
+probes now run between packet sizes, and these two runs do not establish a production speedup or regression.
+
+The real child proxy's raw-relay benchmark reported 83–94% CPU under load and 0.0% with eight silent players;
+100% means one fully occupied core. Working set was 6,956 KiB fresh, 9,920 KiB with eight players and 13,776 KiB
+at its lifetime peak. All eight measured relay workloads completed with zero lost messages. These are passthrough
+relay measurements, not injection transport throughput.
+
+`zig build bench-test` runs the two process-counter checks: 64-bit FILETIME conversion, including the maximum
+counter value, and live CPU/resident-memory sampling after touching 4 MiB. Both passed in Debug, ReleaseSafe and
+ReleaseFast. `zig build bench-build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast` compiled both benchmark
+binaries. The driver stops and joins its proxy worker task if stats collection or output fails. Failed supported
+platform counters propagate an error; unsupported injection CPU/resident fields print `null`. Formatting and
+whitespace checks passed. Linux runtime counters, macOS counters, injection network throughput and callback tail
+latency remain unmeasured in this batch.

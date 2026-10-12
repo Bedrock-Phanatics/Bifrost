@@ -26,6 +26,10 @@ pub const std_options_debug_io = zio.debug_io;
 // Expected failures (dead backends) would otherwise log inside timed sections
 pub const std_options: std.Options = .{ .log_level = .err };
 
+comptime {
+    if (builtin.is_test) std.testing.refAllDecls(harness);
+}
+
 const usage =
     \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|injection|decode|ids|tasks|handles|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
@@ -103,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
     try env.out.print("Login frame {d} B, {d} iterations of {d} ms after {d} ms warmup\n", .{
         frames.login.len, env.iterations(), env.iterationMs(), env.warmupMs(),
     });
+    if (builtin.os.tag == .windows) try env.out.writeAll("Resident memory uses Windows working set; peak is the process lifetime peak. CPU 100% means one fully occupied core.\n");
     try env.out.flush();
 
     for (selected.items) |name| {
@@ -114,8 +119,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "packet-dispatch")) try packetDispatch(&env);
         if (std.mem.eql(u8, name, "injection")) {
             const results = try bench_injection.run(env.gpa, env.io, env.quick);
-            try env.out.print("\n## Packet injection queue\n\nText packets, batches of 32, median of seven samples. Includes validation, copy, queue, drain and free with allocation accounting; sink does no transport work.\n\n| packet bytes | ns per packet | packets/s | allocations per packet | queued heap for 32 | retained heap after drain |\n|---|---|---|---|---|---|\n", .{});
-            for (results) |result| try env.out.print("| {d} | {d:.1} | {d:.0} | {d:.1} | {d} | {d} |\n", .{ result.bytes, result.ns_per_packet, std.time.ns_per_s / result.ns_per_packet, result.allocations_per_packet, result.queued_heap, result.retained_heap });
+            try env.out.print("\n## Packet injection queue\n\nText packets, batches of 32, median of seven samples. Includes validation, copy, queue, drain and free with allocation accounting; sink does no transport work. CPU is sampled separately over at least {d} ms and includes all process threads. Resident memory includes the whole benchmark process.\n\n| packet bytes | ns per packet | packets/s | CPU ns per packet | allocations per packet | queued heap for 32 | retained heap after drain | resident KiB | peak resident KiB |\n|---|---|---|---|---|---|---|---|---|\n", .{if (env.quick) @as(u32, 250) else 1000});
+            for (results) |result| try env.out.print("| {d} | {d:.1} | {d:.0} | {?d:.1} | {d:.1} | {d} | {d} | {?d} | {?d} |\n", .{ result.bytes, result.ns_per_packet, std.time.ns_per_s / result.ns_per_packet, result.cpu_ns_per_packet, result.allocations_per_packet, result.queued_heap, result.retained_heap, result.resident_kb, result.peak_resident_kb });
         }
         if (std.mem.eql(u8, name, "decode")) {
             const results = try bench_decoded.run(env.gpa, env.io, env.quick);
@@ -203,6 +208,10 @@ fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
     const workers = try bifrost.Workers.create(heap.allocator(), io, config, options);
     defer workers.destroy();
     var task = try io.concurrent(bifrost.Workers.run, .{workers});
+    errdefer {
+        workers.stop();
+        task.cancel(io) catch {};
+    }
 
     var out_buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &out_buffer);
@@ -214,15 +223,15 @@ fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
     var stdin = std.Io.File.stdin().readerStreaming(io, &in_buffer);
     while (stdin.interface.takeDelimiter('\n') catch null) |line| {
         if (!std.mem.eql(u8, line, "stats")) continue;
-        try snapshot(io, workers, &heap).write(out);
+        try (try snapshot(io, workers, &heap)).write(out);
         try out.flush();
     }
     workers.stop();
     try task.await(io);
 }
 
-fn snapshot(io: std.Io, workers: *bifrost.Workers, heap: *const harness.CountingAllocator) Snapshot {
-    const self = harness.selfUsage(io);
+fn snapshot(io: std.Io, workers: *bifrost.Workers, heap: *const harness.CountingAllocator) !Snapshot {
+    const self = try harness.selfUsage(io);
     const totals = workers.totals();
     const pool = &workers.proxies[0].observer_pool;
     var result: Snapshot = .{
@@ -1443,7 +1452,7 @@ fn failover(env: *Env) !void {
 fn memorySummary(env: *Env) !void {
     const memory = env.memory;
     if (!harness_has_rss) {
-        try env.out.print("\n## Memory\n\nRSS figures need Linux (/proc/self/status); this run reports zeros.\n", .{});
+        try env.out.print("\n## Memory\n\nProcess CPU and resident-memory counters are unavailable on this platform.\n", .{});
         return;
     }
     try env.out.print(
@@ -1469,4 +1478,4 @@ fn memorySummary(env: *Env) !void {
     try env.out.print("| pending queue cap per player (config) | {d} packets / {Bi} |\n", .{ (bifrost.Config{}).pending_packets, (bifrost.Config{}).pending_bytes });
 }
 
-const harness_has_rss = builtin.os.tag == .linux;
+const harness_has_rss = harness.has_usage;

@@ -10,6 +10,9 @@ pub const Result = struct {
     allocations_per_packet: f64,
     queued_heap: u64,
     retained_heap: u64,
+    cpu_ns_per_packet: ?f64,
+    resident_kb: ?u64,
+    peak_resident_kb: ?u64,
 };
 
 var host: ?*const abi.Host = null;
@@ -52,6 +55,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
     const player = try plugins.handles.acquire(heap.allocator(), .{ .context = &sink, .link = 1, .transfer = noTransfer });
     const baseline = heap.live.load(.monotonic);
     const rounds: usize = if (quick) 500 else 5000;
+    var expected: usize = 0;
     var results: [4]Result = undefined;
     const message: [65526]u8 = @splat('x');
     var buffer: [65536]u8 = undefined;
@@ -80,14 +84,38 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
             elapsed.* = harness.nowNs(io) - started;
         }
         std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        expected += batch * (1 + rounds * times.len);
+        var cpu_ns_per_packet: ?f64 = null;
+        if (harness.has_usage) {
+            const before_cpu = try harness.selfUsage(io);
+            const started = harness.nowNs(io);
+            var count: usize = 0;
+            while (true) {
+                for (0..64) |_| {
+                    try enqueue(player, packet);
+                    plugins.drain(0, io, &sink);
+                }
+                count += 64 * batch;
+                if (harness.nowNs(io) - started >= (if (quick) @as(u64, 250) else 1000) * std.time.ns_per_ms) break;
+            }
+            const after_cpu = try harness.selfUsage(io);
+            if (after_cpu.cpu_us < before_cpu.cpu_us) return error.InvalidCpuCounter;
+            cpu_ns_per_packet = @as(f64, @floatFromInt(after_cpu.cpu_us - before_cpu.cpu_us)) * 1000 / @as(f64, @floatFromInt(count));
+            expected += count;
+        }
+        const usage = try harness.selfUsage(io);
+        if (harness.has_usage and (usage.rss_kb == 0 or usage.hwm_kb < usage.rss_kb)) return error.InvalidMemoryCounter;
         result.* = .{
             .bytes = size,
             .ns_per_packet = @as(f64, @floatFromInt(times[times.len / 2])) / @as(f64, @floatFromInt(rounds * batch)),
             .allocations_per_packet = @as(f64, @floatFromInt(allocations)) / batch,
             .queued_heap = queued,
             .retained_heap = heap.live.load(.monotonic) - baseline,
+            .cpu_ns_per_packet = cpu_ns_per_packet,
+            .resident_kb = if (harness.has_usage) usage.rss_kb else null,
+            .peak_resident_kb = if (harness.has_usage) usage.hwm_kb else null,
         };
     }
-    if (sink.delivered != results.len * batch * (1 + rounds * 7)) return error.MissingInjection;
+    if (sink.delivered != expected) return error.MissingInjection;
     return results;
 }

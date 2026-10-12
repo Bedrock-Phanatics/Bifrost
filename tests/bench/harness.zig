@@ -68,9 +68,10 @@ pub const Snapshot = struct {
 };
 
 pub const Usage = struct { rss_kb: u64 = 0, hwm_kb: u64 = 0, cpu_us: u64 = 0 };
+pub const has_usage = builtin.os.tag == .linux or builtin.os.tag == .windows;
 
-/// Linux only, zeros elsewhere
-pub fn selfUsage(io: std.Io) Usage {
+pub fn selfUsage(io: std.Io) !Usage {
+    if (builtin.os.tag == .windows) return WindowsUsage.read();
     if (builtin.os.tag != .linux) return .{};
     var usage: Usage = .{};
     const ru = std.posix.getrusage(std.os.linux.rusage.SELF);
@@ -82,7 +83,62 @@ pub fn selfUsage(io: std.Io) Usage {
         if (statusKb(line, "VmRSS:")) |kb| usage.rss_kb = kb;
         if (statusKb(line, "VmHWM:")) |kb| usage.hwm_kb = kb;
     }
+    if (usage.rss_kb == 0 or usage.hwm_kb == 0) return error.ProcessMemoryUnavailable;
     return usage;
+}
+
+const WindowsUsage = struct {
+    const win = std.os.windows;
+    const MemoryCounters = extern struct {
+        cb: win.DWORD,
+        PageFaultCount: win.DWORD,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    };
+
+    extern "kernel32" fn GetProcessTimes(win.HANDLE, *win.FILETIME, *win.FILETIME, *win.FILETIME, *win.FILETIME) callconv(.winapi) win.BOOL;
+    extern "kernel32" fn K32GetProcessMemoryInfo(win.HANDLE, *MemoryCounters, win.DWORD) callconv(.winapi) win.BOOL;
+
+    fn read() !Usage {
+        const process = win.GetCurrentProcess();
+        var created: win.FILETIME = undefined;
+        var exited: win.FILETIME = undefined;
+        var kernel: win.FILETIME = undefined;
+        var user: win.FILETIME = undefined;
+        if (!GetProcessTimes(process, &created, &exited, &kernel, &user).toBool()) return error.ProcessTimesUnavailable;
+        var memory: MemoryCounters = undefined;
+        if (!K32GetProcessMemoryInfo(process, &memory, @sizeOf(MemoryCounters)).toBool()) return error.ProcessMemoryUnavailable;
+        return .{ .cpu_us = micros(kernel) + micros(user), .rss_kb = memory.WorkingSetSize / 1024, .hwm_kb = memory.PeakWorkingSetSize / 1024 };
+    }
+
+    fn micros(time: win.FILETIME) u64 {
+        return (@as(u64, time.dwHighDateTime) << 32 | time.dwLowDateTime) / 10;
+    }
+};
+
+test "benchmark process usage preserves Windows CPU counter high bits" {
+    try std.testing.expectEqual(@as(u64, 429496731), WindowsUsage.micros(.{ .dwHighDateTime = 1, .dwLowDateTime = 20 }));
+    try std.testing.expectEqual(std.math.maxInt(u64) / 10, WindowsUsage.micros(.{ .dwHighDateTime = std.math.maxInt(u32), .dwLowDateTime = std.math.maxInt(u32) }));
+}
+
+test "benchmark process usage reads live CPU and resident memory" {
+    if (!has_usage) return error.SkipZigTest;
+    const before = try selfUsage(std.testing.io);
+    const memory = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(memory);
+    @memset(memory, 0xa5);
+    std.mem.doNotOptimizeAway(memory);
+    const after = try selfUsage(std.testing.io);
+    try std.testing.expect(after.rss_kb > 0);
+    try std.testing.expect(after.hwm_kb >= after.rss_kb);
+    try std.testing.expect(after.hwm_kb >= before.hwm_kb);
+    try std.testing.expect(after.cpu_us >= before.cpu_us);
 }
 
 /// Host-wide UDP datagrams the kernel dropped because a socket's receive buffer was full
