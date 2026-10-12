@@ -58,7 +58,7 @@ pub const Shared = struct {
     key: Ecdsa.KeyPair,
     keys: *const bedwire.auth.KeySet,
     batch: [][]const u8,
-    rewrites: std.ArrayList(u8) = .empty,
+    scratch: []u8 = &.{},
     translated: std.heap.ArenaAllocator,
     hooks: ?Hooks = null,
     transfers: bool = true,
@@ -71,7 +71,7 @@ pub const Shared = struct {
 
     pub fn deinit(self: *Shared, gpa: std.mem.Allocator) void {
         self.translated.deinit();
-        self.rewrites.deinit(gpa);
+        gpa.free(self.scratch);
         gpa.free(self.batch);
         self.pool.deinit();
     }
@@ -174,7 +174,7 @@ pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
             skipped += 1;
             continue;
         }
-        try batch.add(kind, packet);
+        _ = try batch.add(kind, packet);
     }
     try batch.flush();
     return skipped;
@@ -203,58 +203,48 @@ const Batch = struct {
     table: ?*const Packets.Table = null,
     count: usize = 0,
 
-    fn add(self: *Batch, original_kind: ?bedwire.PacketKind, bytes: []const u8) !void {
+    // Returns what was queued, or null if a plugin cancelled the packet
+    fn add(self: *Batch, kind: ?bedwire.PacketKind, bytes: []const u8) !?[]const u8 {
         const shared = self.managed.shared;
-        var kind = original_kind;
         var packet = bytes;
         if (self.count == shared.batch.len) try self.flush();
-        if (self.table != null) try self.reserve(Packets.scratch_bytes);
         // Plugins and ClientState see the client's ids in both directions
         const ids = self.managed.idSwap();
-        if (self.to_player) {
-            if (ids) |swap| packet = try swap.apply(shared.translated.allocator(), kind, packet, protocolLimits()) orelse packet;
-            if (ClientState.tracks(kind)) self.managed.observeClient(packet);
-        }
-        if (self.table) |table| {
-            const hooks = shared.hooks.?;
-            const call: Packets.Call = .{
-                .io = self.ends.io,
-                .worker = hooks.worker,
-                .player = self.managed.plugin_player,
-                .direction = if (self.to_player) .from_backend else .from_player,
-                .in_game = self.managed.player.state == .in_game,
-                .slow_ns = hooks.plugins.options.slow_callback_ns,
-            };
-            switch (Packets.run(table, call, packet, shared.rewrites.unusedCapacitySlice(), Checker{ .managed = self.managed, .to_player = self.to_player })) {
-                .pass => {},
-                .cancel => return,
-                .replace => |replacement| {
-                    shared.rewrites.items.len += replacement.len;
-                    packet = shared.rewrites.items[shared.rewrites.items.len - replacement.len ..];
-                    kind = Current.packetKind(Packets.packetId(packet).?);
-                },
-            }
-        }
-        if (!self.to_player) if (ids) |swap| {
+        if (self.to_player) if (ids) |swap| {
             packet = try swap.apply(shared.translated.allocator(), kind, packet, protocolLimits()) orelse packet;
         };
+        if (self.table) |table| if (Packets.packetId(packet)) |id| {
+            const in_game = self.managed.player.state == .in_game;
+            if (table.wants(id, in_game)) {
+                if (shared.scratch.len == 0) shared.scratch = try self.managed.gpa.alloc(u8, Packets.scratch_bytes);
+                const hooks = shared.hooks.?;
+                const call: Packets.Call = .{
+                    .io = self.ends.io,
+                    .worker = hooks.worker,
+                    .player = self.managed.plugin_player,
+                    .direction = if (self.to_player) .from_backend else .from_player,
+                    .in_game = in_game,
+                    .slow_ns = hooks.plugins.options.slow_callback_ns,
+                };
+                switch (Packets.run(table, call, id, packet, shared.scratch, Checker{ .managed = self.managed, .to_player = self.to_player })) {
+                    .pass => {},
+                    .cancel => return null,
+                    .replace => |replacement| packet = try shared.translated.allocator().dupe(u8, replacement),
+                }
+            }
+        };
+        if (self.to_player) {
+            try self.managed.sentToPlayer(kind, packet);
+        } else if (ids) |swap| {
+            packet = try swap.apply(shared.translated.allocator(), kind, packet, protocolLimits()) orelse packet;
+        }
         shared.batch[self.count] = packet;
         self.count += 1;
-    }
-
-    // Flushing frees rewrites and translations, so it must happen before this packet points into them
-    fn reserve(self: *Batch, bytes: usize) !void {
-        const rewrites = &self.managed.shared.rewrites;
-        if (rewrites.unusedCapacitySlice().len >= bytes) return;
-        try self.flush();
-        try rewrites.ensureUnusedCapacity(self.managed.gpa, bytes);
+        return packet;
     }
 
     fn flush(self: *Batch) !void {
-        defer {
-            self.managed.shared.rewrites.clearRetainingCapacity();
-            _ = self.managed.shared.translated.reset(.{ .retain_with_limit = 256 * 1024 });
-        }
+        defer _ = self.managed.shared.translated.reset(.{ .retain_with_limit = 256 * 1024 });
         if (self.count == 0) return;
         const packets = self.managed.shared.batch[0..self.count];
         self.count = 0;
@@ -297,14 +287,32 @@ pub fn sendOutbox(self: *Managed, ends: Ends, outbox: *const Outbox) !void {
     }
 }
 
-fn observeClient(self: *Managed, packet: []const u8) void {
-    const decoded = Current.decodeBorrowed(packet, protocolLimits()) catch {
+// Proxy state follows what was delivered, after plugins had their say
+fn sentToPlayer(self: *Managed, kind: ?bedwire.PacketKind, packet: []const u8) !void {
+    if (kind == .change_dimension) self.client_dimension = (try typed(try decode(packet), .change_dimension)).dimension_id;
+    if (!ClientState.tracks(kind)) return;
+    const decoded = decode(packet) catch {
         self.client_state.untracked = true;
         return;
     };
     self.client_state.observe(self.gpa, decoded) catch {
         self.client_state.untracked = true;
     };
+}
+
+fn sentToBackend(self: *Managed, kind: ?bedwire.PacketKind, packet: []const u8) !void {
+    switch (kind orelse return) {
+        .request_chunk_radius => {
+            const request = try typed(try decode(packet), .request_chunk_radius);
+            self.chunk_radius = .{ .radius = request.chunk_radius, .max = request.max_chunk_radius };
+        },
+        .client_cache_status => self.cache_supported = (try typed(try decode(packet), .client_cache_status)).is_cache_supported,
+        else => {},
+    }
+}
+
+fn decode(packet: []const u8) !protocol.BorrowedEnvelope {
+    return Current.decodeBorrowed(packet, protocolLimits());
 }
 
 fn protocolLimits() protocol.DecodeLimits {
@@ -319,7 +327,8 @@ pub fn backendConnected(self: *Managed, ends: Ends) !void {
 fn relayable(self: *const Managed, direction: abi.Direction) bool {
     if (self.shared.transfers or !self.inGame()) return false;
     const hooks = self.shared.hooks orelse return true;
-    return hooks.plugins.packetTable(direction) == null and !hooks.plugins.hasCommands();
+    if (hooks.plugins.packetTable(direction)) |table| if (table.in_game) return false;
+    return !hooks.plugins.hasCommands();
 }
 
 fn pluginCommands(self: *const Managed) ?*const Plugins {
@@ -398,7 +407,13 @@ pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
         .wants_login => if (self.player_phase == .ready) try self.loginUpstream(&self.upstream, ctx),
         .logged_in => {
             defer self.early.clear(self.gpa);
-            if (self.early.items().len != 0) try self.upstream.send(ctx, self.early.items());
+            var batch = self.newBatch(ends, false);
+            for (self.early.items()) |bytes| {
+                const kind = Current.packetKind(Packets.packetId(bytes) orelse return error.MalformedBatch);
+                const sent = try batch.add(kind, bytes) orelse continue;
+                try self.sentToBackend(kind, sent);
+            }
+            try batch.flush();
         },
     }
 }
@@ -449,17 +464,9 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
     var next_state: ?bedwire.State = null;
     var batch = self.newBatch(ends, false);
     while (packets.next()) |packet| {
-        if (packet.kind) |kind| switch (kind) {
-            .request_chunk_radius => {
-                const request = try typed(try self.player.decodePacket(packet), .request_chunk_radius);
-                self.chunk_radius = .{ .radius = request.chunk_radius, .max = request.max_chunk_radius };
-            },
-            .client_cache_status => self.cache_supported = (try typed(try self.player.decodePacket(packet), .client_cache_status)).is_cache_supported,
-            .command_request => if (self.shared.hooks) |hooks| if (hooks.plugins.hasCommands()) {
-                const request = try typed(try self.player.decodePacket(packet), .command_request);
-                if (hooks.plugins.runCommand(hooks.worker, ends.io, self.plugin_player, request.command)) continue;
-            },
-            else => {},
+        if (packet.kind == .command_request) if (self.shared.hooks) |hooks| if (hooks.plugins.hasCommands()) {
+            const request = try typed(try self.player.decodePacket(packet), .command_request);
+            if (hooks.plugins.runCommand(hooks.worker, ends.io, self.plugin_player, request.command)) continue;
         };
         if (self.syncing) if (packet.kind) |kind| switch (kind) {
             .player_action => if (Handoff.isAck(try self.player.decodePacket(packet))) {
@@ -475,7 +482,8 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
             try self.early.push(self.gpa, packet.bytes);
             continue;
         }
-        try batch.add(packet.kind, packet.bytes);
+        const sent = try batch.add(packet.kind, packet.bytes) orelse continue;
+        try self.sentToBackend(packet.kind, sent);
     }
     try batch.flush();
     if (next_state) |state| try self.advance(state);
@@ -519,17 +527,13 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
                 }
             }
         }
-        if (packet.kind == .change_dimension) {
-            const decoded = try typed(try self.upstream.session.decodePacket(packet), .change_dimension);
-            self.client_dimension = decoded.dimension_id;
-        }
         if (self.hold) |hold| {
             try hold.push(self.gpa, bytes);
             continue;
         }
         if (packet.kind == .start_game) start_game = true;
         if (self.player.state == .resource_packs) try self.capturePacks(packet);
-        try batch.add(packet.kind, bytes);
+        _ = try batch.add(packet.kind, bytes);
     }
     try batch.flush();
     if (start_game) try self.advance(.spawn_ready);

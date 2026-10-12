@@ -344,7 +344,7 @@ test "the example plugin loads from disk and keeps players off maintenance" {
 }
 
 const Hook = struct {
-    const Mode = enum(u8) { pass, cancel, replace, corrupt };
+    const Mode = enum(u8) { pass, cancel, replace, corrupt, retag };
     var mode: std.atomic.Value(Mode) = .init(.pass);
     var calls: std.atomic.Value(u32) = .init(0);
 
@@ -370,6 +370,7 @@ const Hook = struct {
                 out[0] = 0xff;
                 packet.replacement_len = 1;
             },
+            .retag => packet.replacement_len = (managed.rawPacket(out, managed.game_packet_id - 1, "pong") catch unreachable).len,
         }
         return .replace;
     }
@@ -401,13 +402,66 @@ test "a packet hook can pass, cancel or replace player packets" {
     try Hook.sendWith(&rig, .cancel, "dropped");
     try Hook.sendWith(&rig, .replace, "ping");
     try std.testing.expectEqualStrings("pong", try rig.player.nextGamePacket(&buffer));
+    try Hook.sendWith(&rig, .retag, "ping");
+    try std.testing.expectEqualStrings("ping", try rig.player.nextGamePacket(&buffer));
 
     Hook.mode.store(.corrupt, .release);
     try rig.expectOn(&rig.a);
     const totals = plugins.totals(0);
-    try std.testing.expectEqual(@as(u64, 1), totals.errors);
+    try std.testing.expectEqual(@as(u64, 2), totals.errors);
     try std.testing.expectEqual(@as(u64, Hook.calls.load(.acquire)), totals.calls);
-    try std.testing.expectEqual(@as(u32, 3), rig.a.echoes.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 4), rig.a.echoes.load(.acquire));
+}
+
+const Filter = struct {
+    const Current = bedwire.protocol.Current;
+
+    fn init(host_api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("filter");
+        plugin.plugin_version = .of("1.0.0");
+        plugin.capabilities = .{ .packets = true };
+        for ([_]bedwire.PacketKind{ .add_painting, .container_open }) |kind| {
+            const status = host_api.subscribe_packet(host_api.context, .from_backend, Current.packetId(kind).?, .any, .{}, cancel, null);
+            if (status != .ok) return status;
+        }
+        return host_api.subscribe_packet(host_api.context, .from_player, Current.packetId(.client_cache_status).?, .any, .{}, noCache, null);
+    }
+
+    fn cancel(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
+        return .cancel;
+    }
+
+    fn noCache(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const out = packet.replacement.?[0..packet.replacement_capacity];
+        packet.replacement_len = (managed.typedPacket(out, .{ .client_cache_status = .{ .is_cache_supported = false } }) catch return .pass).len;
+        return .replace;
+    }
+
+    fn shown(player: *managed.Player) bool {
+        return player.received(.mob_effect) == 1;
+    }
+};
+
+test "proxy state and transfers follow what plugins let through, not what the other side sent" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(Filter.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins, .cache = true });
+    defer rig.deinit();
+    var buffer: [16]u8 = undefined;
+    try rig.player.send(&.{try managed.rawPacket(&buffer, managed.game_packet_id, "scene")});
+    try rig.pumpUntil(rig.player, Filter.shown);
+    try std.testing.expectEqual(@as(usize, 0), rig.player.received(.add_painting));
+
+    try rig.transfer(1);
+    try rig.waitFor(.transfers_committed, 1);
+    try rig.expectOn(&rig.b);
+    try std.testing.expectEqual(@as(usize, 0), rig.player.received(.remove_actor));
+    try std.testing.expectEqual(@as(usize, 0), rig.player.received(.container_close));
+    try std.testing.expectEqual(@as(usize, 1), rig.player.received(.remove_objective));
+    try std.testing.expectEqual(@as(u32, 1), rig.b.cache_reports.load(.acquire));
+    try std.testing.expect(!rig.a.cache_supported.load(.acquire) and !rig.b.cache_supported.load(.acquire));
 }
 
 test "passthrough refuses packet subscriptions" {

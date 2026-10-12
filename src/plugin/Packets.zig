@@ -51,11 +51,14 @@ pub const Registration = struct {
 const Range = struct {
     start: u32 = 0,
     len: u32 = 0,
+    before_game: bool = false,
+    in_game: bool = false,
 };
 
 pub const Table = struct {
     ranges: [id_count]Range = @splat(.{}),
     subscribers: []Subscriber = &.{},
+    in_game: bool = false,
 
     pub fn deinit(self: *Table, gpa: std.mem.Allocator) void {
         gpa.free(self.subscribers);
@@ -80,8 +83,16 @@ pub const Table = struct {
             const range = &table.ranges[item.id];
             table.subscribers[range.start + range.len] = item.subscriber;
             range.len += 1;
+            range.before_game = range.before_game or item.subscriber.phase != .in_game;
+            range.in_game = range.in_game or item.subscriber.phase != .before_game;
+            table.in_game = table.in_game or range.in_game;
         };
         return table;
+    }
+
+    pub fn wants(self: *const Table, id: u10, in_game: bool) bool {
+        const range = self.ranges[id];
+        return if (in_game) range.in_game else range.before_game;
     }
 };
 
@@ -100,8 +111,8 @@ pub const Result = union(enum) {
     replace: []const u8,
 };
 
-pub fn run(table: *const Table, call: Call, bytes: []const u8, scratch: []u8, checker: anytype) Result {
-    const id = packetId(bytes) orelse return .pass;
+// The replacement lives in scratch until the next run
+pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch: []u8, checker: anytype) Result {
     const range = table.ranges[id];
     if (range.len == 0) return .pass;
     std.debug.assert(scratch.len >= scratch_bytes);
@@ -111,6 +122,8 @@ pub fn run(table: *const Table, call: Call, bytes: []const u8, scratch: []u8, ch
     var current = bytes;
     var valid: ?bool = null;
     var next_half: usize = 0;
+    // One clock read ends a callback and starts the next, unless validation ran in between
+    var clock: ?u64 = null;
     for (table.subscribers[range.start..][0..range.len]) |*subscriber| {
         switch (subscriber.phase) {
             .in_game => if (!call.in_game) continue,
@@ -118,7 +131,10 @@ pub fn run(table: *const Table, call: Call, bytes: []const u8, scratch: []u8, ch
             else => {},
         }
         if (subscriber.validated) {
-            if (valid == null) valid = checker.valid(current);
+            if (valid == null) {
+                valid = checker.valid(current);
+                clock = null;
+            }
             if (!valid.?) continue;
         }
         const out = scratch[next_half * max_replacement ..][0..max_replacement];
@@ -131,18 +147,24 @@ pub fn run(table: *const Table, call: Call, bytes: []const u8, scratch: []u8, ch
             .replacement = out.ptr,
             .replacement_capacity = out.len,
         };
-        const started = now(call.io);
+        const started = clock orelse now(call.io);
         const action = subscriber.callback(subscriber.user, &packet);
-        const elapsed = now(call.io) -| started;
+        const ended = now(call.io);
+        clock = ended;
+        const elapsed = ended -| started;
         const metrics = &subscriber.metrics[call.worker];
         metrics.timed(elapsed);
-        if (elapsed >= call.slow_ns) warnSlow(metrics, subscriber.name, elapsed, call.io, "on packet {d}", .{id});
+        if (elapsed >= call.slow_ns) {
+            warnSlow(metrics, subscriber.name, elapsed, call.io, "on packet {d}", .{id});
+            clock = null;
+        }
         switch (action) {
             .pass => {},
             .cancel => return .cancel,
             .replace => {
+                clock = null;
                 const len = packet.replacement_len;
-                if (len == 0 or len > out.len or packetId(out[0..len]) == null or !checker.valid(out[0..len])) {
+                if (len == 0 or len > out.len or packetId(out[0..len]) != id or !checker.valid(out[0..len])) {
                     metrics.add(.errors, 1);
                     continue;
                 }
@@ -153,9 +175,7 @@ pub fn run(table: *const Table, call: Call, bytes: []const u8, scratch: []u8, ch
             else => metrics.add(.errors, 1),
         }
     }
-    if (current.ptr == bytes.ptr) return .pass;
-    if (current.ptr != scratch.ptr) std.mem.copyForwards(u8, scratch[0..current.len], current);
-    return .{ .replace = scratch[0..current.len] };
+    return if (current.ptr == bytes.ptr) .pass else .{ .replace = current };
 }
 
 pub fn packetId(bytes: []const u8) ?u10 {
@@ -216,16 +236,59 @@ const Script = struct {
     }
 
     fn corrupt(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
-        _ = pass(user, packet);
-        packet.replacement.?[0] = 0x05;
-        packet.replacement.?[1] = 0xff;
-        packet.replacement_len = 2;
+        return write(user, packet, &.{ 0x05, 0xff });
+    }
+
+    fn retag(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        return write(user, packet, &.{ 0x06, 0x00 });
+    }
+
+    fn unterminated(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        return write(user, packet, &.{0x85});
+    }
+
+    fn empty(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        return write(user, packet, &.{});
+    }
+
+    fn oversize(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        _ = write(user, packet, &.{ 0x05, 0x00 });
+        packet.replacement_len = packet.replacement_capacity + 1;
         return .replace;
+    }
+
+    fn write(user: ?*anyopaque, packet: *abi.Packet, bytes: []const u8) abi.PacketAction {
+        _ = pass(user, packet);
+        @memcpy(packet.replacement.?[0..bytes.len], bytes);
+        packet.replacement_len = bytes.len;
+        return .replace;
+    }
+
+    fn take() []const u8 {
+        defer log_len = 0;
+        return log_buffer[0..log_len];
+    }
+};
+
+const Counted = struct {
+    calls: *u32,
+
+    fn valid(self: Counted, bytes: []const u8) bool {
+        self.calls.* += 1;
+        return AllValid.valid(.{}, bytes);
     }
 };
 
 fn testSubscriber(callback: abi.PacketFn, tag: u8, metrics: []Metrics) Subscriber {
-    return .{ .callback = callback, .user = @ptrFromInt(tag), .phase = .any, .validated = false, .name = "test", .metrics = metrics };
+    return phased(callback, tag, .any, false, metrics);
+}
+
+fn phased(callback: abi.PacketFn, tag: u8, phase: abi.PacketPhase, validated: bool, metrics: []Metrics) Subscriber {
+    return .{ .callback = callback, .user = @ptrFromInt(tag), .phase = phase, .validated = validated, .name = "test", .metrics = metrics };
+}
+
+fn runBytes(table: *const Table, call: Call, bytes: []const u8, scratch: []u8, checker: anytype) Result {
+    return run(table, call, packetId(bytes) orelse return .pass, bytes, scratch, checker);
 }
 
 test "subscribers for a packet run in order, chain replacements and stop at a cancel" {
@@ -244,15 +307,15 @@ test "subscribers for a packet run in order, chain replacements and stop at a ca
     const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
 
     Script.log_len = 0;
-    const result = run(&table, call, &.{ 0x05, 0xaa }, scratch, AllValid{});
+    const result = runBytes(&table, call, &.{ 0x05, 0xaa }, scratch, AllValid{});
     try testing.expectEqualSlices(u8, &.{ 0x05, 0xaa, 1, 3 }, result.replace);
     try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, Script.log_buffer[0..Script.log_len]);
     try testing.expectEqual(@as(u64, 1), metrics[0].errors.load(.monotonic));
     try testing.expectEqual(@as(u64, 3), metrics[0].calls.load(.monotonic));
 
-    try testing.expectEqual(Result.cancel, run(&table, call, &.{ 0x07, 0x00 }, scratch, AllValid{}));
-    try testing.expectEqual(Result.pass, run(&table, call, &.{ 0x06, 0x00 }, scratch, AllValid{}));
-    try testing.expectEqual(Result.pass, run(&table, call, &.{0x85}, scratch, AllValid{}));
+    try testing.expectEqual(Result.cancel, runBytes(&table, call, &.{ 0x07, 0x00 }, scratch, AllValid{}));
+    try testing.expectEqual(Result.pass, runBytes(&table, call, &.{ 0x06, 0x00 }, scratch, AllValid{}));
+    try testing.expectEqual(Result.pass, runBytes(&table, call, &.{0x85}, scratch, AllValid{}));
 }
 
 const Chaos = struct {
@@ -297,12 +360,69 @@ test "dispatch survives arbitrary packets and plugin answers" {
         const packet = bytes[0..random.uintAtMost(usize, bytes.len)];
         random.bytes(packet);
         if (packet.len != 0 and random.boolean()) packet[0] = random.uintLessThan(u8, 3);
-        switch (run(&table, call, packet, scratch, Coin{})) {
+        switch (runBytes(&table, call, packet, scratch, Coin{})) {
             .pass, .cancel => {},
             .replace => |replacement| {
                 try testing.expect(replacement.len <= max_replacement and replacement.len != 0);
-                try testing.expect(replacement.ptr == scratch.ptr);
+                try testing.expect(@intFromPtr(replacement.ptr) >= @intFromPtr(scratch.ptr) and @intFromPtr(replacement.ptr) + replacement.len <= @intFromPtr(scratch.ptr) + scratch.len);
+                try testing.expectEqual(packetId(packet), packetId(replacement));
             },
         }
     }
+}
+
+test "replacements that change the packet id, are empty, oversized or malformed are ignored" {
+    const gpa = testing.allocator;
+    var metrics: [1]Metrics = .{.{}};
+    var table: Table = try .build(gpa, .from_player, &.{
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.retag, 1, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.oversize, 2, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.empty, 3, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.unterminated, 4, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.append, 5, &metrics) },
+    });
+    defer table.deinit(gpa);
+    const scratch = try gpa.alloc(u8, scratch_bytes);
+    defer gpa.free(scratch);
+    const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+
+    Script.log_len = 0;
+    try testing.expectEqualSlices(u8, &.{ 0x05, 0xaa, 5 }, runBytes(&table, call, &.{ 0x05, 0xaa }, scratch, AllValid{}).replace);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, Script.take());
+    try testing.expectEqual(@as(u64, 4), metrics[0].errors.load(.monotonic));
+}
+
+test "subscribers run only in their phase, and validation is decoded once per packet version" {
+    const gpa = testing.allocator;
+    var metrics: [1]Metrics = .{.{}};
+    var table: Table = try .build(gpa, .from_player, &.{
+        .{ .direction = .from_player, .id = 5, .subscriber = phased(Script.pass, 1, .before_game, false, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = phased(Script.pass, 2, .in_game, true, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = phased(Script.pass, 3, .any, true, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = phased(Script.append, 4, .any, false, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = phased(Script.pass, 5, .any, true, &metrics) },
+        .{ .direction = .from_player, .id = 6, .subscriber = phased(Script.pass, 6, .before_game, false, &metrics) },
+    });
+    defer table.deinit(gpa);
+    try testing.expect(table.in_game and table.wants(5, true) and table.wants(5, false));
+    try testing.expect(!table.wants(6, true) and table.wants(6, false) and !table.wants(7, false));
+    const scratch = try gpa.alloc(u8, scratch_bytes);
+    defer gpa.free(scratch);
+    var call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = false, .slow_ns = std.math.maxInt(u64) };
+    var checks: u32 = 0;
+
+    Script.log_len = 0;
+    try testing.expectEqualSlices(u8, &.{ 0x05, 0xaa, 4 }, runBytes(&table, call, &.{ 0x05, 0xaa }, scratch, Counted{ .calls = &checks }).replace);
+    try testing.expectEqualSlices(u8, &.{ 1, 3, 4, 5 }, Script.take());
+    try testing.expectEqual(@as(u32, 2), checks);
+
+    call.in_game = true;
+    checks = 0;
+    try testing.expectEqual(Result.pass, runBytes(&table, call, &.{ 0x05, 0xff }, scratch, Counted{ .calls = &checks }));
+    try testing.expectEqualSlices(u8, &.{4}, Script.take());
+    try testing.expectEqual(@as(u32, 2), checks);
+
+    var before: Table = try .build(gpa, .from_player, &.{.{ .direction = .from_player, .id = 5, .subscriber = phased(Script.pass, 1, .before_game, false, &metrics) }});
+    defer before.deinit(gpa);
+    try testing.expect(!before.in_game);
 }

@@ -1,10 +1,12 @@
 const std = @import("std");
 const bedwire = @import("bedwire");
+const bifrost = @import("bifrost");
 const managed = @import("../support/managed.zig");
 const sample = @import("../support/sample.zig");
 const Rig = @import("../support/rig.zig").Rig;
 
 const protocol = bedwire.protocol;
+const abi = bifrost.plugin_abi;
 const EntityLink = protocol.types.EntityLink;
 const typedPacket = sample.typedPacket;
 const zero: protocol.Vec3f = .{ .x = 0, .y = 0, .z = 0 };
@@ -16,8 +18,9 @@ const target_runtime = 2000;
 const target_unique = -2000;
 const other = 500;
 
-fn startOnTarget(rig: *Rig) !void {
+fn startOnTarget(rig: *Rig, plugins: ?*bifrost.Plugins) !void {
     try rig.start(.{
+        .plugins = plugins,
         .a_content = .{ .runtime_id = client_runtime, .unique_id = client_unique },
         .b_content = .{ .runtime_id = target_runtime, .unique_id = target_unique },
     });
@@ -53,7 +56,7 @@ fn abilities(unique_id: i64) protocol.types.AbilityData {
 
 test "server packets show the client its first ids, nested or not" {
     var rig: Rig = undefined;
-    try startOnTarget(&rig);
+    try startOnTarget(&rig, null);
     defer rig.deinit();
 
     var buffers: [11][512]u8 = undefined;
@@ -137,7 +140,7 @@ test "server packets show the client its first ids, nested or not" {
 
 test "player packets reach the backend with its own ids" {
     var rig: Rig = undefined;
-    try startOnTarget(&rig);
+    try startOnTarget(&rig, null);
     defer rig.deinit();
     rig.b.seen_runtime.clear();
     rig.b.seen_unique.clear();
@@ -193,7 +196,7 @@ test "a hundred transfers to backends with fresh ids keep the client's view stab
 
 test "effects a later backend put on the player are cleared when they leave it" {
     var rig: Rig = undefined;
-    try startOnTarget(&rig);
+    try startOnTarget(&rig, null);
     defer rig.deinit();
 
     var buffer: [128]u8 = undefined;
@@ -206,4 +209,48 @@ test "effects a later backend put on the player are cleared when they leave it" 
     try std.testing.expectEqual(.remove, cleared.event_id);
     try std.testing.expectEqual(@as(i32, 3), cleared.effect_id);
     try std.testing.expectEqual(@as(u64, client_runtime), cleared.target_runtime_id);
+}
+
+const Watcher = struct {
+    var seen: [2]std.atomic.Value(u64) = @splat(.init(0));
+
+    fn init(host_api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("watcher");
+        plugin.plugin_version = .of("1.0.0");
+        plugin.capabilities = .{ .packets = true };
+        for ([_]abi.Direction{ .from_player, .from_backend }) |direction| {
+            const status = host_api.subscribe_packet(host_api.context, direction, protocol.Current.packetId(.animate).?, .in_game, .{ .validated = true }, onAnimate, null);
+            if (status != .ok) return status;
+        }
+        return .ok;
+    }
+
+    fn onAnimate(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const decoded = protocol.Current.decodeBorrowed(packet.bytes.slice(), .{}) catch return .pass;
+        const runtime_id = decoded.value.typed.animate.target_actor_runtime_id;
+        seen[@backingInt(packet.direction)].store(runtime_id, .release);
+        if (packet.direction == .from_backend) return .pass;
+        packet.replacement_len = (animate(packet.replacement.?[0..packet.replacement_capacity], runtime_id) catch return .pass).len;
+        return .replace;
+    }
+};
+
+test "packet hooks see the client's ids after a transfer, and their replacements reach the backend translated" {
+    var plugins: bifrost.Plugins = try .init(std.testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(Watcher.init, null);
+    var rig: Rig = undefined;
+    try startOnTarget(&rig, &plugins);
+    defer rig.deinit();
+
+    var buffer: [128]u8 = undefined;
+    try rig.player.relay(&.{try animate(&buffer, target_runtime)});
+    try std.testing.expectEqual(@as(u64, client_runtime), Watcher.seen[@backingInt(abi.Direction.from_backend)].load(.acquire));
+
+    rig.b.seen_runtime.clear();
+    try rig.player.send(&.{try animate(&buffer, client_runtime)});
+    try rig.expectOn(&rig.b);
+    try std.testing.expectEqual(@as(u64, client_runtime), Watcher.seen[@backingInt(abi.Direction.from_player)].load(.acquire));
+    try std.testing.expect(rig.b.seen_runtime.contains(target_runtime) and !rig.b.seen_runtime.contains(client_runtime));
+    try std.testing.expectEqual(@as(u64, 0), plugins.totals(0).errors);
 }
