@@ -3,6 +3,7 @@ const bedwire = @import("bedwire");
 const bifrost = @import("bifrost");
 const sample = @import("sample");
 const harness = @import("harness.zig");
+const bench_options = @import("bench_options");
 
 const abi = bifrost.plugin_abi;
 const Packets = bifrost.Plugins.Packets;
@@ -18,6 +19,13 @@ pub const Setup = enum {
     phase_miss,
     one_replace,
     two_replace,
+    one_lazy,
+    ten_independent,
+    ten_shared,
+    typed_replace,
+    packet_filter,
+    native_chat_reader,
+    packet_filter_chat,
 
     pub fn describe(self: Setup) []const u8 {
         return switch (self) {
@@ -30,6 +38,13 @@ pub const Setup = enum {
             .phase_miss => "1 before-game subscriber on the hot packet, in game",
             .one_replace => "1 subscriber replacing the hot packet",
             .two_replace => "2 subscribers chaining replacements",
+            .one_lazy => "1 listener reading lazy typed fields",
+            .ten_independent => "10 listeners decoding independently",
+            .ten_shared => "10 listeners sharing typed fields",
+            .typed_replace => "1 listener modifying typed text",
+            .packet_filter => "1 C++ packet filter reading raw text",
+            .native_chat_reader => "1 native listener reading chat fields",
+            .packet_filter_chat => "1 C++ chat filter with player-name lookup",
         };
     }
 
@@ -37,16 +52,16 @@ pub const Setup = enum {
     pub fn callbacksPerPacket(self: Setup) f64 {
         return switch (self) {
             .none, .idle_10, .phase_miss => 0,
-            .one_raw, .one_decoded, .one_replace => 0.5,
+            .one_raw, .one_decoded, .one_replace, .one_lazy, .typed_replace, .packet_filter, .native_chat_reader, .packet_filter_chat => 0.5,
             .ten_ids, .two_replace => 1,
-            .ten_hot => 5,
+            .ten_hot, .ten_independent, .ten_shared => 5,
         };
     }
 
     pub fn budgetNs(self: Setup) f64 {
         return switch (self) {
             .none, .idle_10, .phase_miss => 2,
-            .one_decoded, .one_replace, .two_replace => 200,
+            .one_decoded, .one_replace, .two_replace, .one_lazy, .typed_replace, .packet_filter, .native_chat_reader, .packet_filter_chat => 200,
             else => 100,
         };
     }
@@ -106,7 +121,46 @@ fn replacer(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status 
     return host.subscribe_packet(host.context, .from_player, target_id, .any, .{}, copy, null);
 }
 
-pub fn load(plugins: *bifrost.Plugins, setup: Setup, hot: u10) !void {
+fn readFields(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+    const host: *const abi.Host = @ptrCast(@alignCast(user.?));
+    var text: abi.Text = undefined;
+    if (host.decode_packet(host.context, packet, .text, &text, @sizeOf(abi.Text)) == .ok) std.mem.doNotOptimizeAway(text);
+    return .pass;
+}
+
+fn editFields(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+    const host: *const abi.Host = @ptrCast(@alignCast(user.?));
+    var text: abi.Text = undefined;
+    if (host.decode_packet(host.context, packet, .text, &text, @sizeOf(abi.Text)) != .ok) return .pass;
+    text.message = .of("changed by plugin");
+    return if (host.encode_packet(host.context, packet, .text, &text, @sizeOf(abi.Text)) == .ok) .replace else .pass;
+}
+
+fn independent(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+    const value = Packets.Decoded.decode(packet.bytes.slice(), .text, .{}) catch return .pass;
+    std.mem.doNotOptimizeAway(value);
+    return .pass;
+}
+
+fn lazy(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+    named(plugin, "fields");
+    plugin.capabilities = .{ .packets = true };
+    return host.subscribe_packet(host.context, .from_player, target_id, .any, .{ .fields = true }, readFields, @constCast(host));
+}
+
+fn independentDecoder(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+    named(plugin, "independent");
+    plugin.capabilities = .{ .packets = true };
+    return host.subscribe_packet(host.context, .from_player, target_id, .any, .{}, independent, null);
+}
+
+fn typedReplacer(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+    named(plugin, "typed");
+    plugin.capabilities = .{ .packets = true };
+    return host.subscribe_packet(host.context, .from_player, target_id, .any, .{ .fields = true }, editFields, @constCast(host));
+}
+
+pub fn load(plugins: *bifrost.Plugins, io: std.Io, setup: Setup, hot: u10) !void {
     target_id = hot;
     switch (setup) {
         .none => {},
@@ -117,6 +171,18 @@ pub fn load(plugins: *bifrost.Plugins, setup: Setup, hot: u10) !void {
         .phase_miss => try plugins.add(beforeGame, null),
         .one_replace => try plugins.add(replacer, null),
         .two_replace => for (0..2) |_| try plugins.add(replacer, null),
+        .one_lazy, .native_chat_reader => try plugins.add(lazy, null),
+        .ten_independent => for (0..10) |_| try plugins.add(independentDecoder, null),
+        .ten_shared => for (0..10) |_| try plugins.add(lazy, null),
+        .typed_replace => try plugins.add(typedReplacer, null),
+        .packet_filter, .packet_filter_chat => {
+            const path = try std.Io.Dir.cwd().realPathFileAlloc(io, bench_options.packet_filter, plugins.gpa);
+            defer plugins.gpa.free(path);
+            var library = try bifrost.Plugins.Library.open(path);
+            errdefer library.close();
+            const entry = library.lookup(abi.InitFn, "bifrost_plugin_init") orelse return error.MissingEntrypoint;
+            try plugins.add(entry, library);
+        },
         .ten_ids => {
             try plugins.add(raw, null);
             for (cold_ids) |id| {
@@ -134,6 +200,12 @@ pub fn parse(text: []const u8) ?Setup {
 }
 
 const Checker = struct {
+    pub fn permits(_: Checker, _: abi.PacketType) bool {
+        return true;
+    }
+    pub fn decode(_: Checker, bytes: []const u8, packet_type: abi.PacketType) Packets.Decoded.Error!Packets.Decoded.Value {
+        return Packets.Decoded.decode(bytes, packet_type, .{});
+    }
     pub fn valid(_: Checker, bytes: []const u8) bool {
         const header = bedwire.protocol.packet.decode(bytes, .{ .max_packet_bytes = 1 << 20 }) catch return false;
         if (Current.packetKind(header.header.packet_id) == null) return true;
@@ -154,6 +226,7 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![std.enums.val
     var storage: std.ArrayList(u8) = .empty;
     defer storage.deinit(gpa);
     var bounds: [stream_len][2]usize = undefined;
+    var chat_bounds: [stream_len][2]usize = undefined;
     var payload: [64]u8 = undefined;
     for (&payload, 0..) |*byte, i| byte.* = @truncate(i * 31 + 7);
     for (&bounds, 0..) |*bound, i| {
@@ -167,6 +240,15 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![std.enums.val
         } }) else try sample.rawPacket(&buffer, relay_packet_id, &payload);
         bound.* = .{ storage.items.len, bytes.len };
         try storage.appendSlice(gpa, bytes);
+        const chat = if (i % 2 == 0) try sample.typedPacket(&buffer, .{ .text = .{
+            .localize = false,
+            .body = .{ .author_and_message = .{ .message_type = .chat, .player_name = "Steve", .message = "hello there, how are things going" } },
+            .senders_xuid = "",
+            .platform_id = "",
+            .filtered_message = null,
+        } }) else try sample.rawPacket(&buffer, relay_packet_id, &payload);
+        chat_bounds[i] = .{ storage.items.len, chat.len };
+        try storage.appendSlice(gpa, chat);
     }
     const scratch = try gpa.alloc(u8, Packets.scratch_bytes);
     defer gpa.free(scratch);
@@ -178,9 +260,21 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![std.enums.val
     for (std.enums.values(Setup), &results) |setup, *result| {
         var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{ .slow_callback_ns = std.math.maxInt(u64) });
         defer plugins.deinit();
-        try load(&plugins, setup, text_packet_id);
+        try load(&plugins, io, setup, text_packet_id);
+        var player_context: u8 = 0;
+        const player = try plugins.handles.acquire(gpa, .{
+            .context = &player_context,
+            .link = 0,
+            .transfer = struct {
+                fn transfer(_: *anyopaque, _: u64, _: u32) abi.Status {
+                    return .unsupported;
+                }
+            }.transfer,
+        });
+        plugins.handles.setName(player, "Steve");
         var table = plugins.packetTable(.from_player);
-        const call: Packets.Call = .{ .io = io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+        const call: Packets.Call = .{ .io = io, .worker = 0, .player = player, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+        const selected_bounds = if (setup == .native_chat_reader or setup == .packet_filter_chat) &chat_bounds else &bounds;
         if (call.in_game) if (table) |hooks| {
             if (!hooks.in_game) table = null;
         };
@@ -191,7 +285,7 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![std.enums.val
             const started = harness.nowNs(io);
             for (0..rounds) |_| {
                 defer _ = arena.reset(.retain_capacity);
-                for (bounds) |bound| {
+                for (selected_bounds) |bound| {
                     const bytes = storage.items[bound[0]..][0..bound[1]];
                     var packet = bytes;
                     if (table) |hooks| if (Packets.packetId(bytes)) |id| if (hooks.wants(id, call.in_game)) {

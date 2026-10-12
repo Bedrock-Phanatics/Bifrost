@@ -45,13 +45,16 @@ Native plugins are compiled shared libraries, each in its own package directory 
 `plugin.toml` naming it ([`docs/plugins.md`](docs/plugins.md)). They load at startup in directory name order and
 unload in reverse once every worker has stopped. A plugin exports `bifrost_plugin_init` and talks to Bifrost only
 through the C ABI in [`include/bifrost_plugin.h`](include/bifrost_plugin.h); Zig plugins can use the `bifrost_plugin`
-module instead. `zig build` packages two examples into `zig-out/plugins/`:
-[`examples/maintenance.zig`](examples/maintenance.zig) keeps players off any backend named `maintenance`, and
-[`examples/greeter/Greeter.cpp`](examples/greeter/Greeter.cpp) is a C++23 plugin that logs a welcome.
+module instead. `zig build` packages three examples into `zig-out/plugins/`:
+[`examples/maintenance.zig`](examples/maintenance.zig) keeps players off any backend named `maintenance`,
+[`examples/greeter/Greeter.cpp`](examples/greeter/Greeter.cpp) logs a welcome, and
+[`examples/packets/PacketFilter.cpp`](examples/packets/PacketFilter.cpp) limits chat size, corrects chat authors
+and caps requested chunk radius in C++23.
 
 Plugins get lifecycle and transfer events, can cancel or redirect a transfer before it starts, and can request
 transfers themselves. In managed mode they can also hook individual packets (pass, cancel or replace), register
-commands, send players chat messages and run slow work on task threads. Callbacks run on worker threads and must not
+commands, lazily read or modify text and chunk-radius fields through the native ABI, send players chat messages
+and run slow work on task threads. Callbacks run on worker threads and must not
 block; callbacks slower than `[limits] slow_plugin_callback_ms` are logged. Player handles stop working once the
 player leaves. [`docs/plugin-abi.md`](docs/plugin-abi.md) has the full contract: threads, memory, every host
 function and its statuses, and how the frozen v1 ABI may grow. Plugins run in-process, so one that crashes takes
@@ -80,6 +83,7 @@ zig build bench -Doptimize=ReleaseFast                          # full suite, ab
 zig build bench -Doptimize=ReleaseFast -- relay workers --quick # pick scenarios, shorter runs
 zig build bench -Doptimize=ReleaseFast -Dscheduling=pinned      # proxy without ZIO work stealing
 zig build bench -Doptimize=ReleaseFast -- managed               # passthrough vs managed sessions
+zig build bench -Doptimize=ReleaseFast -- packet-dispatch decode --quick # native packet dispatch and codec
 ```
 
 [`tests/bench/baseline.md`](tests/bench/baseline.md) records the numbers later changes are compared against.

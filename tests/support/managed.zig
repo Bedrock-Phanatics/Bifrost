@@ -347,6 +347,7 @@ pub const Backend = struct {
     echoes: std.atomic.Value(u32) = .init(0),
     handshakes: std.atomic.Value(u32) = .init(0),
     chunk_requests: std.atomic.Value(u32) = .init(0),
+    requested_max_radius: std.atomic.Value(u32) = .init(0),
     spawns: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
     sub_chunk_requests: std.atomic.Value(u32) = .init(0),
@@ -628,6 +629,7 @@ pub const Backend = struct {
             try sendFrame(session, carrier, &.{packet.bytes});
             continue;
         }) {
+            .text => try sendFrame(session, carrier, &.{packet.bytes}),
             .player_action, .animate, .emote, .interact, .actor_pick_request, .command_request, .move_player => |kind| {
                 try self.record(packet.bytes);
                 if (kind == .command_request) _ = self.commands.fetchAdd(1, .release);
@@ -709,7 +711,11 @@ pub const Backend = struct {
                 try session.advance(.spawn_ready);
             },
             .request_chunk_radius => {
-                if (self.hold_spawn.load(.acquire)) {
+                const request = (try session.decodePacket(packet)).value.typed.request_chunk_radius;
+                self.requested_max_radius.store(request.max_chunk_radius, .release);
+                if (session.state == .in_game) {
+                    try sendFrame(session, carrier, &.{try typedPacket(&buffer, .{ .chunk_radius_updated = .{ .chunk_radius = request.chunk_radius } })});
+                } else if (self.hold_spawn.load(.acquire)) {
                     try self.sendWorld(connection, .without_spawn);
                     self.held = connection;
                 } else try self.sendWorld(connection, .full);

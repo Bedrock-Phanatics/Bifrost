@@ -424,6 +424,7 @@ fn addPacketHooks(self: *Plugins, loaded: *Loaded) !void {
     for (self.pending_packets.items) |*item| {
         item.subscriber.name = loaded.label();
         item.subscriber.metrics = loaded.metrics;
+        item.subscriber.context = loaded;
     }
     try self.registrations.appendSlice(self.gpa, self.pending_packets.items);
     var tables: [2]Packets.Table = undefined;
@@ -487,6 +488,8 @@ fn hostFor(loaded: *Loaded) abi.Host {
         .post = hostPost,
         .register_command_info = hostRegisterCommandInfo,
         .set_description = hostSetDescription,
+        .decode_packet = Packets.decodePacket,
+        .encode_packet = Packets.encodePacket,
     };
 }
 
@@ -545,6 +548,7 @@ fn hostSubscribePacket(context: *anyopaque, direction: abi.Direction, id: u32, p
         .user = user,
         .phase = phase,
         .validated = flags.validated,
+        .fields = flags.fields,
         .name = "",
         .metrics = &.{},
     } }) catch return .failed;
@@ -1300,6 +1304,10 @@ test "an SDK plugin loads on hosts older than its header and refuses ones older 
     try testing.expectEqual(abi.Status.ok, sdk.entry(SdkPlugin)(&old, &plugin));
     try testing.expect(!OldHost.asked);
     try testing.expectEqualStrings("sdk", plugin.name.slice());
+    var packet: abi.Packet = undefined;
+    const old_sdk: sdk.Host = .{ .raw = &old };
+    try testing.expectError(error.Unsupported, old_sdk.decodePacket(&packet, abi.Text));
+    try testing.expectError(error.Unsupported, old_sdk.encodePacket(&packet, abi.Text{}));
 
     old.struct_size = @offsetOf(abi.Host, "register_command_info");
     try testing.expectEqual(abi.Status.incompatible, sdk.entry(SdkPlugin)(&old, &plugin));
@@ -1319,7 +1327,7 @@ const Undeclared = struct {
 
     fn packets(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
         Probe.describe(plugin, 10);
-        flags = host.subscribe_packet(host.context, .from_player, 7, .any, @bitCast(@as(u32, 2)), Probe.onPacket, null);
+        flags = host.subscribe_packet(host.context, .from_player, 7, .any, @bitCast(@as(u32, 4)), Probe.onPacket, null);
         return host.subscribe_packet(host.context, .from_player, 7, .any, .{ .validated = true }, Probe.onPacket, null);
     }
 

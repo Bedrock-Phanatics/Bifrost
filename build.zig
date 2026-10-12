@@ -23,6 +23,8 @@ const Plugin = struct {
     c_fixture: *std.Build.Step.Compile,
     cpp_fixture: *std.Build.Step.Compile,
     no_entry: *std.Build.Step.Compile,
+    packet_filter: *std.Build.Step.Compile,
+    filter_test: *std.Build.Step.Compile,
     header: *std.Build.Module,
 };
 
@@ -58,7 +60,7 @@ pub fn build(b: *std.Build) void {
     addProxy(ctx);
     const plugin = addPluginSdk(ctx);
     addTests(ctx, plugin);
-    addBench(ctx);
+    addBench(ctx, plugin.packet_filter);
 }
 
 fn addProxy(ctx: Context) void {
@@ -91,6 +93,13 @@ fn addPluginSdk(ctx: Context) Plugin {
     greeter.root_module.addCSourceFile(.{ .file = b.path("examples/greeter/Greeter.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
     greeter.root_module.addIncludePath(b.path("include"));
     installPackage(ctx, greeter, "Greeter", "Greeter", "Logs a welcome for every player");
+    const packet_filter = b.addLibrary(.{ .name = "PacketFilter", .linkage = .dynamic, .root_module = b.createModule(.{ .target = ctx.target, .optimize = ctx.optimize, .link_libcpp = true }) });
+    packet_filter.root_module.addCSourceFile(.{ .file = b.path("examples/packets/PacketFilter.cpp"), .flags = &.{ "-std=c++23", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror" } });
+    packet_filter.root_module.addIncludePath(b.path("include"));
+    installPackage(ctx, packet_filter, "PacketFilter", "PacketFilter", "Limits client chat and chunk-radius requests");
+    const filter_test = b.addExecutable(.{ .name = "packet-filter-test", .root_module = b.createModule(.{ .target = ctx.target, .optimize = ctx.optimize, .link_libcpp = true }) });
+    filter_test.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/packet_filter.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
+    filter_test.root_module.addIncludePath(b.path("include"));
     const header = b.addTranslateC(.{
         .root_source_file = b.path("include/bifrost_plugin.h"),
         .target = ctx.target,
@@ -118,7 +127,7 @@ fn addPluginSdk(ctx: Context) Plugin {
     }) });
     no_entry.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/no_entry.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
     no_entry.root_module.addIncludePath(b.path("include"));
-    return .{ .example = example, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .no_entry = no_entry, .header = header.createModule() };
+    return .{ .example = example, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .no_entry = no_entry, .packet_filter = packet_filter, .filter_test = filter_test, .header = header.createModule() };
 }
 
 // The manifest is generated so `library` has the target's extension
@@ -153,22 +162,25 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     options.addOptionPath("c_plugin", plugin.c_fixture.getEmittedBin());
     options.addOptionPath("cpp_plugin", plugin.cpp_fixture.getEmittedBin());
     options.addOptionPath("no_entry_library", plugin.no_entry.getEmittedBin());
+    options.addOptionPath("packet_filter", plugin.packet_filter.getEmittedBin());
     integration_tests.root_module.addImport("test_options", options.createModule());
 
     const step = b.step("test", "Run unit and integration tests");
     step.dependOn(&b.addRunArtifact(unit_tests).step);
     step.dependOn(&b.addRunArtifact(integration_tests).step);
+    step.dependOn(&b.addRunArtifact(plugin.filter_test).step);
 
     const stress = b.addRunArtifact(integration_tests);
     stress.has_side_effects = true;
     b.step("stress", "Run the integration tests again, never from cache").dependOn(&stress.step);
 }
 
-fn addBench(ctx: Context) void {
+fn addBench(ctx: Context, packet_filter: *std.Build.Step.Compile) void {
     const b = ctx.b;
     const scheduling = b.option(enum { work_stealing, pinned }, "scheduling", "ZIO scheduling of the benchmarked proxy (default: work_stealing)") orelse .work_stealing;
     const options = b.addOptions();
     options.addOption([]const u8, "scheduling", @tagName(scheduling));
+    options.addOptionPath("packet_filter", packet_filter.getEmittedBin());
     const imports: []const std.Build.Module.Import = &.{
         .{ .name = "bifrost", .module = ctx.bifrost },
         .{ .name = "raknet", .module = ctx.raknet },

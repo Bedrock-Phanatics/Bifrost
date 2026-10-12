@@ -104,9 +104,10 @@ pub const PacketPhase = enum(u32) { any, before_game, in_game, _ };
 
 pub const PacketFlags = packed struct(u32) {
     validated: bool = false,
-    _: u31 = 0,
+    fields: bool = false,
+    _: u30 = 0,
 
-    pub const supported: PacketFlags = .{ .validated = true };
+    pub const supported: PacketFlags = .{ .validated = true, .fields = true };
 };
 
 pub const PacketAction = enum(u32) { pass, cancel, replace, _ };
@@ -125,6 +126,41 @@ pub const Packet = extern struct {
 };
 
 pub const PacketFn = *const fn (user: ?*anyopaque, packet: *Packet) callconv(.c) PacketAction;
+
+pub const PacketType = enum(u32) { text = 1, chunk_radius = 2, _ };
+pub const TextType = enum(u32) {
+    raw,
+    chat,
+    translate,
+    popup,
+    jukebox_popup,
+    tip,
+    system_message,
+    whisper,
+    announcement,
+    text_object_whisper,
+    text_object,
+    text_object_announcement,
+    _,
+};
+
+pub const Text = extern struct {
+    message_type: TextType = .raw,
+    localize: u32 = 0,
+    has_filtered_message: u32 = 0,
+    parameter_count: u32 = 0,
+    source: Str = .{},
+    message: Str = .{},
+    xuid: Str = .{},
+    platform_id: Str = .{},
+    filtered_message: Str = .{},
+    parameters: [4]Str = @splat(.{}),
+};
+
+pub const ChunkRadius = extern struct {
+    radius: i32,
+    max_radius: u32,
+};
 
 pub const Command = extern struct {
     struct_size: u32 = @sizeOf(Command),
@@ -183,6 +219,8 @@ pub const Host = extern struct {
     register_command_info: *const fn (context: *anyopaque, info: ?*const CommandInfo) callconv(.c) Status,
     // Check has(.set_description) first
     set_description: *const fn (context: *anyopaque, description: Str) callconv(.c) Status,
+    decode_packet: *const fn (context: *anyopaque, packet: ?*const Packet, packet_type: PacketType, out: ?*anyopaque, capacity: usize) callconv(.c) Status,
+    encode_packet: *const fn (context: *anyopaque, packet: ?*Packet, packet_type: PacketType, data: ?*const anyopaque, size: usize) callconv(.c) Status,
 
     pub fn has(self: *const Host, comptime field: std.meta.FieldEnum(Host)) bool {
         const name = @tagName(field);
@@ -208,6 +246,8 @@ test "structs plugins write into are frozen" {
         .{ Plugin, &[_][]const u8{ "struct_size", "abi_version", "name", "plugin_version", "capabilities", "state", "shutdown" } },
         .{ TransferDecision, &[_][]const u8{ "struct_size", "action", "backend" } },
         .{ Packet, &[_][]const u8{ "struct_size", "direction", "id", "worker", "player", "bytes", "replacement", "replacement_capacity", "replacement_len" } },
+        .{ Text, &[_][]const u8{ "message_type", "localize", "has_filtered_message", "parameter_count", "source", "message", "xuid", "platform_id", "filtered_message", "parameters" } },
+        .{ ChunkRadius, &[_][]const u8{ "radius", "max_radius" } },
     };
     inline for (frozen) |pair| {
         const names = comptime std.meta.fieldNames(pair[0]);

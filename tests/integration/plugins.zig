@@ -248,6 +248,8 @@ test "the C header matches the Zig ABI" {
         .{ abi.Host, header.bifrost_host },
         .{ abi.Plugin, header.bifrost_plugin },
         .{ abi.Packet, header.bifrost_packet },
+        .{ abi.Text, header.bifrost_text },
+        .{ abi.ChunkRadius, header.bifrost_chunk_radius },
         .{ abi.Command, header.bifrost_command },
         .{ abi.TaskResult, header.bifrost_task_result },
         .{ abi.CommandInfo, header.bifrost_command_info },
@@ -265,8 +267,11 @@ test "the C header matches the Zig ABI" {
     try expectConstants(abi.Direction, "BIFROST_DIRECTION_");
     try expectConstants(abi.PacketPhase, "BIFROST_PHASE_");
     try expectConstants(abi.PacketAction, "BIFROST_PACKET_");
+    try expectConstants(abi.PacketType, "BIFROST_PACKET_TYPE_");
+    try expectConstants(abi.TextType, "BIFROST_TEXT_");
     try expectConstants(abi.CommandPermission, "BIFROST_PERMISSION_");
     try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .validated = true })), header.BIFROST_PACKET_VALIDATED);
+    try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .fields = true })), header.BIFROST_PACKET_FIELDS);
     try std.testing.expectEqual(abi.version, header.BIFROST_ABI_VERSION);
     try std.testing.expectEqual(abi.no_backend, header.BIFROST_NO_BACKEND);
     try std.testing.expectEqual(abi.no_worker, header.BIFROST_NO_WORKER);
@@ -310,7 +315,7 @@ test "a packaged C plugin built from the header loads, gets its event, shuts dow
 
     var expected: [128]u64 = undefined;
     var len: usize = 0;
-    inline for (.{ abi.Str, abi.Player, abi.Event, abi.TransferDecision, abi.Packet, abi.Command, abi.CommandInfo, abi.TaskResult, abi.Host, abi.Plugin }) |T| {
+    inline for (.{ abi.Str, abi.Player, abi.Event, abi.TransferDecision, abi.Packet, abi.Text, abi.ChunkRadius, abi.Command, abi.CommandInfo, abi.TaskResult, abi.Host, abi.Plugin }) |T| {
         expected[len] = @sizeOf(T);
         len += 1;
         inline for (comptime std.meta.fieldNames(T)) |field| {
@@ -556,6 +561,163 @@ test "a canceled container close is still cleaned up during transfer" {
     try rig.waitFor(.transfers_committed, 1);
     try rig.expectOn(&rig.b);
     try std.testing.expectEqual(@as(usize, 1), rig.player.received(.container_close));
+}
+
+const Fields = struct {
+    var failures: std.atomic.Value(u32) = .init(0);
+    var observed: std.atomic.Value(u32) = .init(0);
+    var radius: std.atomic.Value(i32) = .init(0);
+
+    fn init(api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("fields");
+        plugin.plugin_version = .of("1");
+        plugin.capabilities = .{ .packets = true };
+        const status = api.subscribe_packet(api.context, .from_player, 9, .in_game, .{ .fields = true }, editText, @constCast(api));
+        if (status != .ok) return status;
+        return api.subscribe_packet(api.context, .from_player, 69, .any, .{ .fields = true, .validated = true }, editRadius, @constCast(api));
+    }
+
+    fn observer(api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("fields-observer");
+        plugin.plugin_version = .of("1");
+        plugin.capabilities = .{ .packets = true };
+        return api.subscribe_packet(api.context, .from_player, 9, .in_game, .{ .fields = true, .validated = true }, readText, @constCast(api));
+    }
+
+    fn apiFrom(user: ?*anyopaque) *const abi.Host {
+        return @ptrCast(@alignCast(user.?));
+    }
+
+    fn editText(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const api = apiFrom(user);
+        var text: abi.Text = undefined;
+        if (api.decode_packet(api.context, packet, .text, &text, @sizeOf(abi.Text)) != .ok) {
+            _ = failures.fetchAdd(1, .release);
+            return .pass;
+        }
+        if (std.mem.eql(u8, text.message.slice(), "blocked")) return .cancel;
+        text.message = .of("changed");
+        if (api.encode_packet(api.context, packet, .text, &text, @sizeOf(abi.Text)) != .ok) {
+            _ = failures.fetchAdd(1, .release);
+            return .pass;
+        }
+        return .replace;
+    }
+
+    fn readText(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const api = apiFrom(user);
+        var text: abi.Text = undefined;
+        if (api.decode_packet(api.context, packet, .text, &text, @sizeOf(abi.Text)) != .ok or !std.mem.eql(u8, text.message.slice(), "changed")) _ = failures.fetchAdd(1, .release);
+        _ = observed.fetchAdd(1, .release);
+        return .pass;
+    }
+
+    fn editRadius(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const api = apiFrom(user);
+        var value: abi.ChunkRadius = undefined;
+        if (api.decode_packet(api.context, packet, .chunk_radius, &value, @sizeOf(abi.ChunkRadius)) != .ok) {
+            _ = failures.fetchAdd(1, .release);
+            return .pass;
+        }
+        value.radius = 6;
+        if (api.encode_packet(api.context, packet, .chunk_radius, &value, @sizeOf(abi.ChunkRadius)) != .ok) {
+            _ = failures.fetchAdd(1, .release);
+            return .pass;
+        }
+        radius.store(value.radius, .release);
+        return .replace;
+    }
+};
+
+fn sendTextPair(player: *managed.Player, original: []const u8, expected: []const u8) !void {
+    var buffers: [2][128]u8 = undefined;
+    const blocked = try managed.typedPacket(&buffers[0], .{ .text = .{ .localize = false, .body = .{ .message_only = .{ .message_type = .raw, .message = "blocked" } }, .senders_xuid = "", .platform_id = "", .filtered_message = null } });
+    const text = try managed.typedPacket(&buffers[1], .{ .text = .{ .localize = false, .body = .{ .author_and_message = .{ .message_type = .chat, .player_name = "Steve", .message = original } }, .senders_xuid = "123", .platform_id = "platform", .filtered_message = "filtered" } });
+    try player.send(&.{ blocked, text });
+    var packets = try player.receive();
+    defer packets.deinit();
+    const packet = packets.next() orelse return error.NoPacket;
+    const decoded = (try player.session.decodePacket(packet)).value.typed.text;
+    try std.testing.expectEqualStrings(expected, decoded.body.author_and_message.message);
+    try std.testing.expectEqualStrings("Steve", decoded.body.author_and_message.player_name);
+    try std.testing.expectEqualStrings("123", decoded.senders_xuid);
+    try std.testing.expectEqualStrings("platform", decoded.platform_id);
+    try std.testing.expectEqualStrings("filtered", decoded.filtered_message.?);
+    try std.testing.expect(packets.next() == null);
+}
+
+test "typed plugin modifications cross the managed transport and survive transfers" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    Fields.failures.store(0, .release);
+    Fields.observed.store(0, .release);
+    Fields.radius.store(0, .release);
+    try plugins.add(Fields.init, null);
+    try plugins.add(Fields.observer, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    try std.testing.expectEqual(@as(i32, 6), Fields.radius.load(.acquire));
+    try sendTextPair(rig.player, "original", "changed");
+    try std.testing.expectEqual(@as(u32, 1), Fields.observed.load(.acquire));
+    try rig.transfer(1);
+    try rig.waitFor(.transfers_committed, 1);
+    try rig.expectOn(&rig.b);
+    try sendTextPair(rig.player, "original", "changed");
+    try std.testing.expectEqual(@as(u32, 2), Fields.observed.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), Fields.failures.load(.acquire));
+}
+
+fn sendFilteredPackets(player: *managed.Player, backend: *managed.Backend) !void {
+    var buffers: [4][2048]u8 = undefined;
+    const negative = try managed.typedPacket(&buffers[0], .{ .request_chunk_radius = .{ .chunk_radius = -1, .max_chunk_radius = 64 } });
+    const radius = try managed.typedPacket(&buffers[1], .{ .request_chunk_radius = .{ .chunk_radius = 32, .max_chunk_radius = 64 } });
+    const long_message: [513]u8 = @splat('x');
+    const oversized = try managed.typedPacket(&buffers[2], .{ .text = .{ .localize = false, .body = .{ .author_and_message = .{ .message_type = .chat, .player_name = "Steve", .message = &long_message } }, .senders_xuid = "", .platform_id = "", .filtered_message = null } });
+    const chat = try managed.typedPacket(&buffers[3], .{ .text = .{ .localize = false, .body = .{ .author_and_message = .{ .message_type = .chat, .player_name = "spoofed", .message = "hello Bedrock" } }, .senders_xuid = "123", .platform_id = "platform", .filtered_message = "filtered" } });
+    try player.send(&.{ negative, radius, oversized, chat });
+    var received: usize = 0;
+    while (received < 2) {
+        var packets = try player.receive();
+        defer packets.deinit();
+        while (packets.next()) |packet| {
+            const decoded = (try player.session.decodePacket(packet)).value.typed;
+            switch (received) {
+                0 => {
+                    try std.testing.expectEqual(@as(i32, 12), decoded.chunk_radius_updated.chunk_radius);
+                    try std.testing.expectEqual(@as(u32, 12), backend.requested_max_radius.load(.acquire));
+                },
+                1 => {
+                    const text = decoded.text;
+                    try std.testing.expectEqualStrings("hello Bedrock", text.body.author_and_message.message);
+                    try std.testing.expectEqualStrings("Steve", text.body.author_and_message.player_name);
+                    try std.testing.expectEqualStrings("123", text.senders_xuid);
+                    try std.testing.expectEqualStrings("platform", text.platform_id);
+                    try std.testing.expectEqualStrings("filtered", text.filtered_message.?);
+                },
+                else => return error.UnexpectedPacket,
+            }
+            received += 1;
+        }
+    }
+}
+
+test "the C++ packet example enforces Bedrock limits and player context across transfers" {
+    var packages: Packages = try .init();
+    defer packages.deinit();
+    const path = try packages.add("PacketFilter", "PacketFilter", "1.0.0", "Typed packets", test_options.packet_filter);
+    defer gpa.free(path);
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    try packages.load(&plugins, "PacketFilter");
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    try sendFilteredPackets(rig.player, &rig.a);
+    try rig.transfer(1);
+    try rig.waitFor(.transfers_committed, 1);
+    try rig.expectOn(&rig.b);
+    try sendFilteredPackets(rig.player, &rig.b);
 }
 
 test "passthrough refuses packet subscriptions" {

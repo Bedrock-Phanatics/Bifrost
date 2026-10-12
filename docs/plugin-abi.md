@@ -106,6 +106,46 @@ spawned with no player (`id` 0) finishes with `OK` on the task thread itself. Ta
 - **Commands** get the lowercase `name` and the trimmed `args`. A plugin command replaces a backend command with the
   same name, both in autocomplete and when run.
 
+### Typed packet fields
+
+Check `BIFROST_HOST_HAS(host, decode_packet)` and `BIFROST_HOST_HAS(host, encode_packet)` before using the
+extension. ABI version 1 and the existing packet layout are unchanged. Subscribe with `BIFROST_PACKET_FIELDS`
+to enable these functions for that callback; this flag does not decode the packet automatically. Raw access,
+replacement and cancellation continue to work as before.
+
+| type | output | fields |
+|---|---|---|
+| `BIFROST_PACKET_TYPE_TEXT` | `bifrost_text` | all twelve message types, source, message, localization, XUID, platform ID, optional filtered message, and up to four parameters |
+| `BIFROST_PACKET_TYPE_CHUNK_RADIUS` | `bifrost_chunk_radius` | signed radius and unsigned maximum radius |
+
+`decode_packet(context, packet, type, out, capacity)` fills the matching structure. Pass the current callback's
+packet pointer and correctly aligned storage of at least `sizeof` that structure. Strings borrow the current
+packet and expire when the callback returns; copy them into plugin-owned memory to keep them. Output storage
+must not overlap the input packet or replacement buffer. Unsupported packet types remain available as raw bytes.
+
+The first requested decode uses protocol-zig with the managed session's existing limits and phase/direction
+checks. Its success or failure is shared across listeners on that packet. Validated subscriptions reuse this
+decode, and an accepted replacement supplies a new decoded version. Rejected replacements preserve the current
+version. The cache lives only in the worker's dispatch stack, with no allocation or global lock. These accessors
+use the same `Current` protocol profile as the managed session; they do not assume a different client version.
+
+`encode_packet(context, packet, type, data, size)` encodes the matching structure into the host's replacement
+buffer and sets `replacement_len`. Return `BIFROST_PACKET_REPLACE` to apply it. Fields are checked and the encoded
+packet remains staged until the callback returns; decoding again in that callback still reads its input.
+The size is measured before writing. Failure preserves the previous replacement bytes and length. Strings and the
+input structure must not overlap the output buffer. The packet ID and both sub-client indices are preserved;
+the dispatch still validates the bytes after the callback returns. The replacement limit remains 64 KiB.
+
+Both functions return `WRONG_THREAD` outside a fields-enabled callback or for another plugin's context,
+`STALE_HANDLE` for a different packet pointer, `UNSUPPORTED` for an unsupported type or mismatching packet ID,
+and `INVALID_ARGUMENT` for malformed data, insufficient storage, bad alignment, aliasing, or an invalid session
+phase. Native code must provide valid memory for every pointer and declared length.
+
+The Zig SDK exposes `host.decodePacket(packet, sdk.Text)` and `host.encodePacket(packet, text)`, also accepting
+`sdk.ChunkRadius`. Older hosts return `error.Unsupported` without reading missing function pointers.
+[`PacketFilter.cpp`](../examples/packets/PacketFilter.cpp) demonstrates raw access, lazy decoding, cancellation,
+and typed text replacement in C++23.
+
 ### Command permissions
 
 `permission` only decides whether a client lists the command in autocomplete. Bifrost never enforces it: any

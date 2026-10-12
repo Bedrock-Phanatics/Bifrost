@@ -10,6 +10,7 @@ const bench_plugins = @import("plugins.zig");
 const bench_ids = @import("runtime_ids.zig");
 const bench_tasks = @import("tasks.zig");
 const bench_handles = @import("handles.zig");
+const bench_decoded = @import("decoded.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -25,11 +26,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|ids|tasks|handles|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|decode|ids|tasks|handles|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "ids", "tasks", "handles", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "decode", "ids", "tasks", "handles", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -56,6 +57,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--proxy-exe") and i + 1 < args.len) {
             i += 1;
             proxy_exe = args[i];
+        } else if (std.mem.eql(u8, arg, "packet-dispatch")) {
+            try selected.append(gpa, arg);
         } else if (for (all_scenarios) |name| {
             if (std.mem.eql(u8, arg, name)) break true;
         } else false) {
@@ -107,6 +110,12 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "managed")) try managedScenario(&env);
         if (std.mem.eql(u8, name, "deflate")) try deflateScenario(&env);
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
+        if (std.mem.eql(u8, name, "packet-dispatch")) try packetDispatch(&env);
+        if (std.mem.eql(u8, name, "decode")) {
+            const results = try bench_decoded.run(env.gpa, env.io, env.quick);
+            try env.out.print("\n## Native packet codec\n\nText packets, seven samples; shared is one decode for ten readers. No allocator is passed to the codec.\n\n| case | ns per packet |\n|---|---|\n", .{});
+            for (results) |result| try env.out.print("| {t} | {d:.1} |\n", .{ result.case, result.ns_per_packet });
+        }
         if (std.mem.eql(u8, name, "ids")) try idsScenario(&env);
         if (std.mem.eql(u8, name, "tasks")) try tasksScenario(&env);
         if (std.mem.eql(u8, name, "handles")) try handlesScenario(&env);
@@ -177,7 +186,7 @@ fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
         config.session_mode = .managed;
         options = .{ .auth = .{ .verify = &keys }, .proxy_key = managed.proxyKey(), .plugins = &plugins };
         const setup = bench_plugins.parse(args[3]["managed+".len..]) orelse return error.InvalidArguments;
-        try bench_plugins.load(&plugins, setup, bench_plugins.relay_packet_id);
+        try bench_plugins.load(&plugins, init.io, setup, bench_plugins.relay_packet_id);
     }
 
     // Same runtime setup as the real binary
@@ -772,7 +781,7 @@ fn handlesScenario(env: *Env) !void {
 
 const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot, .phase_miss, .one_replace };
 
-fn pluginsScenario(env: *Env) !void {
+fn packetDispatch(env: *Env) !void {
     const dispatch = try bench_plugins.dispatch(env.gpa, env.io, env.quick);
     try env.out.print(
         \\
@@ -780,7 +789,9 @@ fn pluginsScenario(env: *Env) !void {
         \\
         \\Per-packet work a managed relay adds for plugins, in-process: the table check, and the callbacks when someone
         \\subscribed. The stream alternates a text packet (the hot packet here) and a 64 B raw packet. Callbacks do
-        \\nothing, so the cost is dispatch, timing and metrics. Decoded subscribers get the packet only after a full decode.
+        \\nothing; typed listeners read or modify fields. Costs include dispatch, timing and metrics. Validated
+        \\subscribers get the packet only after a full decode.
+        \\The chat cases use matching packets and a named player handle; the C++ filter includes the name lookup.
         \\
         \\| setup | ns per packet | added ns | ns per callback | budget |
         \\|---|---|---|---|---|
@@ -796,6 +807,10 @@ fn pluginsScenario(env: *Env) !void {
             if (cost <= budget) "ok" else "OVER", budget,
         });
     }
+}
+
+fn pluginsScenario(env: *Env) !void {
+    try packetDispatch(env);
 
     var results: [plugin_relays.len][2]RelayResult = undefined;
     var heaps: [plugin_relays.len][2]u64 = undefined;

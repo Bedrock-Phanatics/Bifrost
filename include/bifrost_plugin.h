@@ -129,6 +129,7 @@ enum {
 };
 
 #define BIFROST_PACKET_VALIDATED (UINT32_C(1) << 0)
+#define BIFROST_PACKET_FIELDS (UINT32_C(1) << 1)
 
 typedef uint32_t bifrost_packet_action;
 enum {
@@ -151,6 +152,35 @@ typedef struct bifrost_packet {
 } bifrost_packet;
 
 typedef bifrost_packet_action (*bifrost_packet_fn)(void *user, bifrost_packet *packet) BIFROST_NOEXCEPT;
+
+typedef uint32_t bifrost_packet_type;
+enum { BIFROST_PACKET_TYPE_TEXT = 1, BIFROST_PACKET_TYPE_CHUNK_RADIUS = 2 };
+typedef uint32_t bifrost_text_type;
+enum {
+    BIFROST_TEXT_RAW = 0, BIFROST_TEXT_CHAT = 1, BIFROST_TEXT_TRANSLATE = 2,
+    BIFROST_TEXT_POPUP = 3, BIFROST_TEXT_JUKEBOX_POPUP = 4, BIFROST_TEXT_TIP = 5,
+    BIFROST_TEXT_SYSTEM_MESSAGE = 6, BIFROST_TEXT_WHISPER = 7, BIFROST_TEXT_ANNOUNCEMENT = 8,
+    BIFROST_TEXT_TEXT_OBJECT_WHISPER = 9, BIFROST_TEXT_TEXT_OBJECT = 10, BIFROST_TEXT_TEXT_OBJECT_ANNOUNCEMENT = 11,
+};
+
+/* Strings borrow the current packet until the callback returns. These layouts are frozen. */
+typedef struct bifrost_text {
+    bifrost_text_type message_type;
+    uint32_t localize;
+    uint32_t has_filtered_message;
+    uint32_t parameter_count;
+    bifrost_str source;
+    bifrost_str message;
+    bifrost_str xuid;
+    bifrost_str platform_id;
+    bifrost_str filtered_message;
+    bifrost_str parameters[4];
+} bifrost_text;
+
+typedef struct bifrost_chunk_radius {
+    int32_t radius;
+    uint32_t max_radius;
+} bifrost_chunk_radius;
 
 typedef struct bifrost_command {
     uint32_t struct_size;
@@ -216,6 +246,10 @@ typedef struct bifrost_host {
     bifrost_status (*register_command_info)(void *context, const bifrost_command_info *info) BIFROST_NOEXCEPT;
     /* Check BIFROST_HOST_HAS(host, set_description) first */
     bifrost_status (*set_description)(void *context, bifrost_str description) BIFROST_NOEXCEPT;
+    /* Check BIFROST_HOST_HAS and subscribe with BIFROST_PACKET_FIELDS. Use the callback's packet pointer. */
+    bifrost_status (*decode_packet)(void *context, const bifrost_packet *packet, bifrost_packet_type type, void *out, size_t capacity) BIFROST_NOEXCEPT;
+    /* Writes replacement and replacement_len; return BIFROST_PACKET_REPLACE to apply it. */
+    bifrost_status (*encode_packet)(void *context, bifrost_packet *packet, bifrost_packet_type type, const void *data, size_t size) BIFROST_NOEXCEPT;
 } bifrost_host;
 
 /* Older hosts have a shorter table, so use this instead of sizeof */

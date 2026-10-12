@@ -261,6 +261,16 @@ const Checker = struct {
     managed: *Managed,
     to_player: bool,
 
+    pub fn permits(self: Checker, packet_type: abi.PacketType) bool {
+        const kind = Packets.Decoded.kind(packet_type) orelse return false;
+        return self.managed.player.state.permits(Current.features, if (self.to_player) .server else .client, kind);
+    }
+
+    pub fn decode(self: Checker, bytes: []const u8, packet_type: abi.PacketType) Packets.Decoded.Error!Packets.Decoded.Value {
+        if (!self.permits(packet_type)) return error.InvalidArgument;
+        return Packets.Decoded.decode(bytes, packet_type, protocolLimits());
+    }
+
     pub fn valid(self: Checker, bytes: []const u8) bool {
         const header = protocol.packet.decode(bytes, .{ .max_packet_bytes = limits.max_packet_bytes }) catch return false;
         const kind = Current.packetKind(header.header.packet_id);
@@ -643,4 +653,19 @@ test "player milestones and container tracking use the delivered packet" {
     const closed = try encodeTyped(&buffer, .{ .container_close = .{ .container_id = 1, .container_type = 0, .server_initiated_close = false } });
     try std.testing.expectEqual(@as(?bedwire.State, null), try managed.sentToBackend(.container_close, closed));
     try std.testing.expectEqual(null, managed.client_state.container);
+}
+
+test "typed plugin fields respect session phase and packet direction" {
+    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = undefined, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    var checker: Checker = .{ .managed = &managed, .to_player = false };
+    managed.player.state = .resource_packs;
+    try std.testing.expect(!checker.permits(.text));
+    managed.player.state = .spawn_ready;
+    try std.testing.expect(checker.permits(.text) and checker.permits(.chunk_radius));
+    checker.to_player = true;
+    try std.testing.expect(checker.permits(.text) and !checker.permits(.chunk_radius));
+    managed.player.state = .in_game;
+    try std.testing.expect(checker.permits(.chunk_radius));
+    managed.player.state = .disconnected;
+    try std.testing.expect(!checker.permits(.text));
 }

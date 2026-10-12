@@ -76,7 +76,8 @@ the plugin reports (Bifrost logs both when a mismatch refuses it). Load order is
 ## A C++23 plugin
 
 [`examples/greeter/Greeter.cpp`](../examples/greeter/Greeter.cpp) is a complete plugin. `zig build` builds it and
-the Zig example into ready-to-copy packages under `zig-out/plugins/`. By hand, from the repository root:
+the Zig and C++ packet-filter examples into ready-to-copy packages under `zig-out/plugins/`.
+By hand, from the repository root:
 
 ```sh
 # Linux
@@ -89,3 +90,21 @@ zig c++ -std=c++23 -shared -Iinclude examples/greeter/Greeter.cpp -o plugins/Gre
 ```
 
 then put the `plugin.toml` above next to it, with `library` set to the file you built.
+
+## Packet filtering
+
+[`examples/packets/PacketFilter.cpp`](../examples/packets/PacketFilter.cpp) is a C++23 native plugin that drops
+client chat over 512 bytes, replaces chat authors with the player name Bifrost reports, and caps requested and
+maximum chunk radius at 12. Negative radius requests are canceled. Change the two constants to suit the server;
+these are example policies, not Bedrock protocol limits.
+
+The plugin subscribes to client Text in-game and RequestChunkRadius in any permitted phase. It decodes fields
+through the host API and only re-encodes packets that need changes. Message bodies and other text fields are
+preserved. Failed decoding, player-name lookup or encoding cancels the packet. Bifrost validates packet headers,
+direction, phase and size limits, and applies its normal compression/encryption and transfer handling.
+
+The plugin has no owned state, heap allocation or shutdown work. Each callback uses stack storage and borrowed
+packet fields; the callback's host pointer remains valid for the plugin's lifetime. Only changed packets use the
+replacement buffer. The `packet-dispatch` benchmark measures raw-text and chat pass paths, including the actual
+player-name lookup. This example limits client requests; backend view-distance policy remains the backend's
+responsibility.

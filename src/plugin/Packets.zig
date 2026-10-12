@@ -2,6 +2,7 @@ const std = @import("std");
 const protocol = @import("bedwire").protocol;
 const abi = @import("abi.zig");
 const Work = @import("Work.zig");
+pub const Decoded = @import("Decoded.zig");
 
 const log = std.log.scoped(.plugin);
 
@@ -39,6 +40,8 @@ pub const Subscriber = struct {
     user: ?*anyopaque,
     phase: abi.PacketPhase,
     validated: bool,
+    fields: bool = false,
+    context: ?*anyopaque = null,
     name: []const u8,
     metrics: []Metrics,
 };
@@ -54,6 +57,8 @@ const Range = struct {
     len: u32 = 0,
     before_game: bool = false,
     in_game: bool = false,
+    fields_before_game: bool = false,
+    fields_in_game: bool = false,
 };
 
 pub const Table = struct {
@@ -86,6 +91,8 @@ pub const Table = struct {
             range.len += 1;
             range.before_game = range.before_game or item.subscriber.phase != .in_game;
             range.in_game = range.in_game or item.subscriber.phase != .before_game;
+            range.fields_before_game = range.fields_before_game or (item.subscriber.fields and item.subscriber.phase != .in_game);
+            range.fields_in_game = range.fields_in_game or (item.subscriber.fields and item.subscriber.phase != .before_game);
             table.in_game = table.in_game or range.in_game;
         };
         return table;
@@ -115,6 +122,12 @@ pub const Result = union(enum) {
 // The replacement lives in scratch until the next run
 pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch: []u8, checker: anytype) Result {
     const range = table.ranges[id];
+    const fields = if (call.in_game) range.fields_in_game else range.fields_before_game;
+    return if (fields) dispatch(true, table, call, id, bytes, scratch, checker) else dispatch(false, table, call, id, bytes, scratch, checker);
+}
+
+fn dispatch(comptime fields: bool, table: *const Table, call: Call, id: u10, bytes: []const u8, scratch: []u8, checker: anytype) Result {
+    const range = table.ranges[id];
     if (range.len == 0) return .pass;
     std.debug.assert(scratch.len >= scratch_bytes);
     const outer = Work.enter();
@@ -123,6 +136,21 @@ pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch:
     var current = bytes;
     var valid: ?bool = null;
     var next_half: usize = 0;
+    var cache: Cache = .{};
+    const decoded_type = if (fields) supportedType(id) else null;
+    const Thunk = struct {
+        fn decode(context: *const anyopaque, input: []const u8, packet_type: abi.PacketType) Decoded.Error!Decoded.Value {
+            const value: *const @TypeOf(checker) = @ptrCast(@alignCast(context));
+            if (comptime @hasDecl(@TypeOf(checker), "decode")) return value.decode(input, packet_type);
+            return error.Unsupported;
+        }
+
+        fn permits(context: *const anyopaque, packet_type: abi.PacketType) bool {
+            const value: *const @TypeOf(checker) = @ptrCast(@alignCast(context));
+            if (comptime @hasDecl(@TypeOf(checker), "permits")) return value.permits(packet_type);
+            return false;
+        }
+    };
     // One clock read ends a callback and starts the next, unless validation ran in between
     var clock: ?u64 = null;
     for (table.subscribers[range.start..][0..range.len]) |*subscriber| {
@@ -133,7 +161,7 @@ pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch:
         }
         if (subscriber.validated) {
             if (valid == null) {
-                valid = checker.valid(current);
+                valid = if (decoded_type) |kind| cache.load(Thunk.decode, &checker, current, kind) == .ok else checker.valid(current);
                 clock = null;
             }
             if (!valid.?) continue;
@@ -148,8 +176,10 @@ pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch:
             .replacement = out.ptr,
             .replacement_capacity = out.len,
         };
+        var access: Access = undefined;
+        if (fields and subscriber.fields) access = .{ .packet = &packet, .context = subscriber.context, .bytes = current, .out = out, .packet_type = decoded_type, .cache = &cache, .decoder = Thunk.decode, .permits = Thunk.permits, .decoder_context = &checker };
         const started = clock orelse now(call.io);
-        const action = subscriber.callback(subscriber.user, &packet);
+        const action = if (fields and subscriber.fields) access.call(subscriber) else subscriber.callback(subscriber.user, &packet);
         const ended = now(call.io);
         clock = ended;
         const elapsed = ended -| started;
@@ -166,10 +196,17 @@ pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch:
                 clock = null;
                 const len = packet.replacement_len;
                 const header = if (len != 0 and len <= out.len) packetHeader(out[0..len]) else null;
-                if (header == null or header.? & (id_count - 1) != id or header != packetHeader(bytes) or !checker.valid(out[0..len])) {
+                if (header == null or header.? & (id_count - 1) != id or header != packetHeader(bytes)) {
                     metrics.add(.errors, 1);
                     continue;
                 }
+                var replacement_cache: Cache = .{};
+                const replacement_valid = if (decoded_type) |kind| replacement_cache.load(Thunk.decode, &checker, out[0..len], kind) == .ok else checker.valid(out[0..len]);
+                if (!replacement_valid) {
+                    metrics.add(.errors, 1);
+                    continue;
+                }
+                if (fields) cache = replacement_cache;
                 current = out[0..len];
                 valid = true;
                 next_half ^= 1;
@@ -178,6 +215,86 @@ pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch:
         }
     }
     return if (current.ptr == bytes.ptr) .pass else .{ .replace = current };
+}
+
+const DecodeFn = *const fn (*const anyopaque, []const u8, abi.PacketType) Decoded.Error!Decoded.Value;
+const Cache = struct {
+    status: ?abi.Status = null,
+    value: Decoded.Value = undefined,
+
+    fn load(self: *Cache, decoder: DecodeFn, context: *const anyopaque, bytes: []const u8, packet_type: abi.PacketType) abi.Status {
+        if (self.status) |status| return status;
+        self.value = decoder(context, bytes, packet_type) catch |err| {
+            self.status = statusOf(err);
+            return self.status.?;
+        };
+        self.status = .ok;
+        return .ok;
+    }
+};
+
+const Access = struct {
+    packet: *abi.Packet,
+    context: ?*anyopaque,
+    bytes: []const u8,
+    out: []u8,
+    packet_type: ?abi.PacketType,
+    cache: *Cache,
+    decoder: DecodeFn,
+    permits: *const fn (*const anyopaque, abi.PacketType) bool,
+    decoder_context: *const anyopaque,
+
+    fn call(self: *Access, subscriber: *const Subscriber) abi.PacketAction {
+        const outer = active;
+        active = self;
+        defer active = outer;
+        return subscriber.callback(subscriber.user, self.packet);
+    }
+};
+
+threadlocal var active: ?*Access = null;
+
+fn supportedType(id: u10) ?abi.PacketType {
+    return switch (protocol.Current.packetKind(id) orelse return null) {
+        .text => .text,
+        .request_chunk_radius => .chunk_radius,
+        else => null,
+    };
+}
+
+fn statusOf(err: Decoded.Error) abi.Status {
+    return switch (err) {
+        error.Unsupported => .unsupported,
+        error.InvalidArgument => .invalid_argument,
+    };
+}
+
+pub fn decodePacket(context: *anyopaque, packet: ?*const abi.Packet, packet_type: abi.PacketType, out: ?*anyopaque, capacity: usize) callconv(.c) abi.Status {
+    const access = active orelse return .wrong_thread;
+    if (access.context != context) return .wrong_thread;
+    if (packet == null or packet != access.packet) return .stale_handle;
+    if (access.packet_type != packet_type) return .unsupported;
+    const target = out orelse return .invalid_argument;
+    if (capacity < Decoded.size(packet_type) or !Decoded.aligned(packet_type, target)) return .invalid_argument;
+    if (Decoded.overlaps(target, Decoded.size(packet_type), access.bytes) or Decoded.overlaps(target, Decoded.size(packet_type), access.out)) return .invalid_argument;
+    if (!access.permits(access.decoder_context, packet_type)) return .invalid_argument;
+    const status = access.cache.load(access.decoder, access.decoder_context, access.bytes, packet_type);
+    if (status == .ok) Decoded.copy(access.cache.value, target);
+    return status;
+}
+
+pub fn encodePacket(context: *anyopaque, packet: ?*abi.Packet, packet_type: abi.PacketType, data: ?*const anyopaque, size: usize) callconv(.c) abi.Status {
+    const access = active orelse return .wrong_thread;
+    if (access.context != context) return .wrong_thread;
+    if (packet == null or packet != access.packet) return .stale_handle;
+    if (access.packet_type != packet_type) return .unsupported;
+    const source = data orelse return .invalid_argument;
+    if (size < Decoded.size(packet_type) or !Decoded.aligned(packet_type, source)) return .invalid_argument;
+    if (!access.permits(access.decoder_context, packet_type)) return .invalid_argument;
+    const header = protocol.packet.decode(access.bytes, .{ .max_packet_bytes = @max(access.bytes.len, 1) }) catch return .invalid_argument;
+    const len = Decoded.encode(header.header, packet_type, source, access.out) catch |err| return statusOf(err);
+    access.packet.replacement_len = len;
+    return .ok;
 }
 
 pub fn packetId(bytes: []const u8) ?u10 {
@@ -500,4 +617,194 @@ test "replacement chains preserve split-screen headers at the capacity boundary"
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, result[bytes.len..]);
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, Script.take());
     try testing.expectEqual(@as(u64, 0), metrics[0].errors.load(.monotonic));
+}
+
+const DecodeProbe = struct {
+    mode: enum { read, replace, corrupt, pass, cancel } = .read,
+    expected: []const u8 = "original",
+    status: abi.Status = .ok,
+    failed: bool = false,
+    saved: ?*const abi.Packet = null,
+
+    fn onPacket(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const self: *DecodeProbe = @ptrCast(@alignCast(user.?));
+        self.saved = packet;
+        if (self.mode == .pass) return .pass;
+        var text: abi.Text = .{ .message = .of("untouched") };
+        const result = decodePacket(self, packet, .text, &text, @sizeOf(abi.Text));
+        if (result != self.status) self.failed = true;
+        if (result == .ok and !std.mem.eql(u8, text.message.slice(), self.expected)) self.failed = true;
+        if (result != .ok and !std.mem.eql(u8, text.message.slice(), "untouched")) self.failed = true;
+        var copied = packet.*;
+        if (decodePacket(self, &copied, .text, &text, @sizeOf(abi.Text)) != .stale_handle) self.failed = true;
+        if (decodePacket(@ptrFromInt(1), packet, .text, &text, @sizeOf(abi.Text)) != .wrong_thread) self.failed = true;
+        if (decodePacket(self, packet, .chunk_radius, &text, @sizeOf(abi.Text)) != .unsupported) self.failed = true;
+        if (decodePacket(self, packet, .text, &text, 1) != .invalid_argument) self.failed = true;
+        if (decodePacket(self, packet, .text, packet.replacement.?, packet.replacement_capacity) != .invalid_argument) self.failed = true;
+        switch (self.mode) {
+            .read => return .pass,
+            .cancel => return .cancel,
+            .replace => {
+                text = .{ .message = .of("changed") };
+                // ABI metadata written by a plugin is not the host's source of truth.
+                packet.bytes = .{};
+                packet.replacement = null;
+                packet.replacement_capacity = 0;
+                if (encodePacket(self, packet, .text, &text, @sizeOf(abi.Text)) != .ok) self.failed = true;
+                return .replace;
+            },
+            .corrupt => {
+                packet.replacement.?[0] = 9;
+                packet.replacement.?[1] = 0xff;
+                packet.replacement_len = 2;
+                return .replace;
+            },
+            .pass => unreachable,
+        }
+    }
+};
+
+const DecodeChecker = struct {
+    calls: *u32,
+    allowed: bool = true,
+
+    pub fn permits(self: DecodeChecker, _: abi.PacketType) bool {
+        return self.allowed;
+    }
+    pub fn decode(self: DecodeChecker, bytes: []const u8, packet_type: abi.PacketType) Decoded.Error!Decoded.Value {
+        self.calls.* += 1;
+        if (!self.allowed) return error.InvalidArgument;
+        return Decoded.decode(bytes, packet_type, .{});
+    }
+    pub fn valid(self: DecodeChecker, bytes: []const u8) bool {
+        _ = self.decode(bytes, .text) catch return false;
+        return true;
+    }
+};
+
+fn decodedRegistration(probe: *DecodeProbe, validated: bool, metrics: []Metrics) Registration {
+    return .{ .direction = .from_player, .id = 9, .subscriber = .{ .callback = DecodeProbe.onPacket, .user = probe, .context = probe, .phase = .any, .validated = validated, .fields = true, .name = "decoded", .metrics = metrics } };
+}
+
+test "native fields are lazy, shared with validation, refreshed by replacement and callback scoped" {
+    const gpa = testing.allocator;
+    var metrics: [1]Metrics = .{.{}};
+    var probes: [5]DecodeProbe = .{ .{ .mode = .pass }, .{}, .{ .mode = .replace }, .{ .expected = "changed" }, .{ .expected = "changed", .mode = .cancel } };
+    var registrations: [5]Registration = undefined;
+    for (&registrations, &probes, 0..) |*registration, *probe, i| registration.* = decodedRegistration(probe, i == 1 or i == 3, &metrics);
+    var table: Table = try .build(gpa, .from_player, &registrations);
+    defer table.deinit(gpa);
+    const scratch = try gpa.alloc(u8, scratch_bytes);
+    defer gpa.free(scratch);
+    var buffer: [64]u8 = undefined;
+    const text: abi.Text = .{ .message = .of("original") };
+    const bytes = buffer[0..try Decoded.encode(.{ .packet_id = 9 }, .text, &text, &buffer)];
+    const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+    var checks: u32 = 0;
+    try testing.expectEqual(Result.cancel, runBytes(&table, call, bytes, scratch, DecodeChecker{ .calls = &checks }));
+    try testing.expectEqual(@as(u32, 2), checks);
+    for (probes) |probe| try testing.expect(!probe.failed);
+    var out: abi.Text = undefined;
+    try testing.expectEqual(abi.Status.wrong_thread, decodePacket(&probes[4], probes[4].saved, .text, &out, @sizeOf(abi.Text)));
+
+    table.ranges[9].len = 1;
+    checks = 0;
+    try testing.expectEqual(Result.pass, runBytes(&table, call, bytes, scratch, DecodeChecker{ .calls = &checks }));
+    try testing.expectEqual(@as(u32, 0), checks);
+}
+
+test "invalid native replacements preserve decoded fields and malformed decodes are cached" {
+    const gpa = testing.allocator;
+    var metrics: [1]Metrics = .{.{}};
+    var probes: [3]DecodeProbe = .{ .{}, .{ .mode = .corrupt }, .{} };
+    var registrations: [3]Registration = undefined;
+    for (&registrations, &probes) |*registration, *probe| registration.* = decodedRegistration(probe, false, &metrics);
+    var table: Table = try .build(gpa, .from_player, &registrations);
+    defer table.deinit(gpa);
+    const scratch = try gpa.alloc(u8, scratch_bytes);
+    defer gpa.free(scratch);
+    var buffer: [64]u8 = undefined;
+    const text: abi.Text = .{ .message = .of("original") };
+    const bytes = buffer[0..try Decoded.encode(.{ .packet_id = 9 }, .text, &text, &buffer)];
+    const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+    var checks: u32 = 0;
+    try testing.expectEqual(Result.pass, runBytes(&table, call, bytes, scratch, DecodeChecker{ .calls = &checks }));
+    try testing.expectEqual(@as(u32, 2), checks);
+    for (probes) |probe| try testing.expect(!probe.failed);
+    try testing.expectEqual(@as(u64, 1), metrics[0].errors.load(.monotonic));
+
+    probes[1].mode = .read;
+    for (&probes) |*probe| probe.status = .invalid_argument;
+    checks = 0;
+    try testing.expectEqual(Result.pass, runBytes(&table, call, &.{ 9, 0xff }, scratch, DecodeChecker{ .calls = &checks }));
+    try testing.expectEqual(@as(u32, 1), checks);
+    for (probes) |probe| try testing.expect(!probe.failed);
+    checks = 0;
+    try testing.expectEqual(Result.pass, runBytes(&table, call, bytes, scratch, DecodeChecker{ .calls = &checks, .allowed = false }));
+    try testing.expectEqual(@as(u32, 0), checks);
+    for (probes) |probe| try testing.expect(!probe.failed);
+}
+
+test "native decode state stays local to concurrent workers" {
+    const Parallel = struct {
+        failed: [2]bool = @splat(false),
+        checks: [2]u32 = @splat(0),
+
+        fn read(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            var text: abi.Text = undefined;
+            const expected = if (packet.worker == 0) "first" else "second";
+            if (decodePacket(self, packet, .text, &text, @sizeOf(abi.Text)) != .ok or !std.mem.eql(u8, text.message.slice(), expected)) self.failed[packet.worker] = true;
+            return .pass;
+        }
+
+        fn runWorker(self: *@This(), table: *const Table, worker: u32, bytes: []const u8, scratch: []u8) void {
+            const call: Call = .{ .io = testing.io, .worker = worker, .player = .{ .id = worker + 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+            for (0..1000) |_| if (runBytes(table, call, bytes, scratch, DecodeChecker{ .calls = &self.checks[worker] }) != .pass) {
+                self.failed[worker] = true;
+            };
+            var text: abi.Text = undefined;
+            if (decodePacket(self, null, .text, &text, @sizeOf(abi.Text)) != .wrong_thread) self.failed[worker] = true;
+        }
+    };
+    var parallel: Parallel = .{};
+    var metrics: [2]Metrics = .{ .{}, .{} };
+    var table: Table = try .build(testing.allocator, .from_player, &.{.{ .direction = .from_player, .id = 9, .subscriber = .{ .callback = Parallel.read, .user = &parallel, .context = &parallel, .phase = .any, .validated = false, .fields = true, .name = "parallel", .metrics = &metrics } }});
+    defer table.deinit(testing.allocator);
+    const scratch = try testing.allocator.alloc(u8, 2 * scratch_bytes);
+    defer testing.allocator.free(scratch);
+    var buffers: [2][64]u8 = undefined;
+    var threads: [2]?std.Thread = @splat(null);
+    defer for (threads) |thread| if (thread) |running| running.join();
+    for (&threads, &buffers, 0..) |*thread, *buffer, i| {
+        const text: abi.Text = .{ .message = .of(if (i == 0) "first" else "second") };
+        const bytes = buffer[0..try Decoded.encode(.{ .packet_id = 9 }, .text, &text, buffer)];
+        thread.* = try std.Thread.spawn(.{}, Parallel.runWorker, .{ &parallel, &table, @as(u32, @intCast(i)), bytes, scratch[i * scratch_bytes ..][0..scratch_bytes] });
+    }
+    for (&threads) |*thread| {
+        thread.*.?.join();
+        thread.* = null;
+    }
+    for (parallel.failed, parallel.checks, &metrics) |failed, checks, *metric| {
+        try testing.expect(!failed);
+        try testing.expectEqual(@as(u32, 1000), checks);
+        try testing.expectEqual(@as(u64, 1000), metric.calls.load(.monotonic));
+    }
+}
+
+test "fields subscriptions in another phase keep the raw validation path" {
+    var metrics: [1]Metrics = .{.{}};
+    var probe: DecodeProbe = .{ .mode = .pass };
+    var registration = decodedRegistration(&probe, false, &metrics);
+    registration.subscriber.phase = .before_game;
+    var table: Table = try .build(testing.allocator, .from_player, &.{ registration, .{ .direction = .from_player, .id = 9, .subscriber = phased(Script.pass, 1, .in_game, true, &metrics) } });
+    defer table.deinit(testing.allocator);
+    const scratch = try testing.allocator.alloc(u8, scratch_bytes);
+    defer testing.allocator.free(scratch);
+    const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+    var checks: u32 = 0;
+    Script.log_len = 0;
+    try testing.expectEqual(Result.pass, runBytes(&table, call, &.{ 9, 0 }, scratch, Counted{ .calls = &checks }));
+    try testing.expectEqualSlices(u8, &.{1}, Script.take());
+    try testing.expectEqual(@as(u32, 1), checks);
 }

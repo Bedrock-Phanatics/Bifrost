@@ -337,3 +337,80 @@ ReleaseSafe and ReleaseFast, using the testing allocator. Formatting, whitespace
 proxy and native examples build passed. The regression cases cover all 16384 valid headers, malformed varints,
 replacement validation reuse, split-screen routing, the 64 KiB replacement boundary, spawn cancellation, and
 container cleanup after cancellation and transfer.
+
+## Lazy native packet fields
+
+Recorded 2026-10-12 on the same Windows x86_64 machine, 12 logical CPUs, Zig 0.17.0, ReleaseFast.
+Before adding the dispatch cache, the codec prototype measured ten independent text decodes at 797.5 ns/packet
+and one decode shared by ten readers at 106.6 ns/packet. That comparison justified a dispatch-local cache.
+
+Final command: `zig build bench -Doptimize=ReleaseFast -- packet-dispatch decode --quick`, with other Bifrost
+builds and tests stopped. Each dispatch result is the median of seven samples of 200 x 4096 packets, alternating
+text and unknown raw packets. Typed listeners only run on the text half. The native codec uses seven samples of
+100 x 4096 text packets with varying messages. The output sink consumes only encoded bytes, not unused scratch.
+
+| dispatch setup | ns/packet | added ns/callback |
+|---|---|---|
+| one raw listener | 31.0 | 60.8 |
+| one validated listener | 54.4 | 107.7 |
+| ten raw listeners on the hot ID | 158.3 | 31.5 |
+| one listener reading lazy fields | 87.0 | 172.8 |
+| ten independent decoders | 572.8 | 114.4 |
+| ten listeners sharing fields | 329.3 | 65.7 |
+| raw replacement | 60.0 | 118.9 |
+| typed text modification | 188.0 | 374.9 |
+
+Sharing fields reduces the ten-reader dispatch cost from 572.8 to 329.3 ns/packet in this workload. Typed
+modification costs more than raw replacement and exceeds the existing 200 ns/callback replacement budget;
+it remains optional. Raw dispatch was 30.0 ns/packet in the previous batch and 31.0 here; validated dispatch
+was 53.6 and 54.4. These small differences do not establish a regression or speedup. No-subscription and
+phase-mismatch paths remain about 0.5 to 0.6 ns/packet.
+
+| codec-only case | ns/packet |
+|---|---|
+| raw read | 1.1 |
+| one lazy decode | 90.7 |
+| ten independent decodes | 901.7 |
+| one decode, ten readers | 126.5 |
+| raw copy | 4.4 |
+| decode and typed re-encode | 196.9 |
+
+The codec takes no allocator. Decoded strings borrow packet memory, and the cache and candidate replacement
+view live on the dispatch stack. There is no retained decode cache or global lock. The subscription stores one
+additional host-context pointer; the per-ID table's phase flags fit its existing padding. Accepted replacements
+keep their existing arena copy. Windows CPU/RSS and Linux network-worker behavior remain unmeasured here.
+
+Verification: full ReleaseSafe tests passed (220 passed, three platform skips); after the final phase-filter
+refinement, all 76 plugin tests passed in Debug, ReleaseSafe and ReleaseFast. Tests include every text variant,
+signed numeric boundaries, malformed input, output aliasing and transactional failures, old-host SDK behavior,
+C/C++ ABI layouts, cached failures, replacement refresh, callback scope, and concurrent worker-local dispatch.
+Managed transport tests verify cancellation and edits through compression/encryption, again after a transfer,
+and exercise the loaded C++23 example. ReleaseSafe proxy/example builds and formatting checks passed.
+
+## C++ packet filter
+
+Recorded 2026-10-12 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast.
+Command: `zig build bench -Doptimize=ReleaseFast -- packet-dispatch --quick`, with other Bifrost builds and
+tests stopped during measurement. Each result is the median of seven samples of 200 x 4096 packets, alternating
+text and an unknown 64 B raw packet. Chat cases use matching chat packets and a valid named player handle.
+
+| dispatch setup | ns/packet | added ns/callback |
+|---|---|---|
+| one raw listener | 28.8 | 57.1 |
+| C++ filter passing raw text | 86.2 | 172.0 |
+| native listener reading chat fields | 91.8 | 183.1 |
+| C++ chat filter with player-name lookup | 93.9 | 187.4 |
+
+Both filter pass paths meet the existing 200 ns/callback budget. These measurements include dispatch, timing,
+metrics, decoding and the filter's policy checks; chat includes the real host name lookup. They do not measure
+author correction, radius modification or multi-worker name-lookup contention. The plugin owns no heap state,
+copies no message bodies on its pass path, and only encodes accepted field changes into the supplied replacement
+buffer. Bifrost still copies accepted replacements into its existing batch arena. Windows CPU/RSS were not measured.
+
+Verification: all 26 plugin integration tests passed in ReleaseSafe; 25 packet unit/integration tests passed in
+Debug and ReleaseFast. The native C++ checks passed in all three modes, including the 512/513-byte boundary,
+author correction, unchanged raw text, radius limits, stale handles, failed decoding/encoding, old-host rejection
+and two concurrent callers. The loaded-plugin transport test checks cancellation, preserved fields and radius
+caps through compression/encryption, again after transfer. Windows and Linux ReleaseSafe package builds passed;
+the Windows package was restored afterward. Formatting and whitespace checks passed. Linux runtime behavior
+and Linux network-worker performance remain unverified for this example.

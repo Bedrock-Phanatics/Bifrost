@@ -6,6 +6,8 @@ pub const Event = abi.Event;
 pub const EventKind = abi.EventKind;
 pub const TransferDecision = abi.TransferDecision;
 pub const Packet = abi.Packet;
+pub const Text = abi.Text;
+pub const ChunkRadius = abi.ChunkRadius;
 pub const Handler = fn (event: *const Event, decision: ?*TransferDecision) void;
 pub const PacketHandler = fn (packet: *Packet) abi.PacketAction;
 pub const Command = abi.Command;
@@ -37,12 +39,26 @@ pub const Host = struct {
     }
 
     pub fn onPacket(self: Host, direction: abi.Direction, id: u10, phase: abi.PacketPhase, flags: abi.PacketFlags, comptime handler: PacketHandler) Error!void {
+        if (flags.fields and !self.raw.has(.decode_packet)) return error.Unsupported;
         const Trampoline = struct {
             fn call(_: ?*anyopaque, packet: *Packet) callconv(.c) abi.PacketAction {
                 return handler(packet);
             }
         };
         try check(self.raw.subscribe_packet(self.raw.context, direction, id, phase, flags, Trampoline.call, null));
+    }
+
+    pub fn decodePacket(self: Host, packet: *const Packet, comptime T: type) Error!T {
+        if (!self.raw.has(.decode_packet)) return error.Unsupported;
+        var result: T = undefined;
+        try check(self.raw.decode_packet(self.raw.context, packet, packetType(T), &result, @sizeOf(T)));
+        return result;
+    }
+
+    pub fn encodePacket(self: Host, packet: *Packet, value: anytype) Error!void {
+        if (!self.raw.has(.encode_packet)) return error.Unsupported;
+        const T = @TypeOf(value);
+        try check(self.raw.encode_packet(self.raw.context, packet, packetType(T), &value, @sizeOf(T)));
     }
 
     pub fn command(self: Host, name: []const u8, comptime handler: CommandHandler) Error!void {
@@ -113,6 +129,10 @@ pub const Host = struct {
         return name.slice();
     }
 };
+
+fn packetType(comptime T: type) abi.PacketType {
+    return if (T == Text) .text else if (T == ChunkRadius) .chunk_radius else @compileError("unsupported native packet fields");
+}
 
 pub fn exportPlugin(comptime Plugin: type) void {
     @export(entry(Plugin), .{ .name = abi.entrypoint });
