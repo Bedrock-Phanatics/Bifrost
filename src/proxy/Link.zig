@@ -59,7 +59,6 @@ id: u64 = 0,
 player: abi.Player = .{},
 announced: bool = false,
 watch: Watch(raknet.Client) = .{},
-node: std.DoublyLinkedList.Node = .{},
 // Can't free the link while it's still on the ready stack
 queued: std.atomic.Value(bool) = .init(false),
 next_ready: ?*Link = null,

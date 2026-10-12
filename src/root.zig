@@ -24,6 +24,7 @@ pub const loadProxyKey = @import("session/proxy_key.zig").load;
 pub const proxyKeyText = @import("session/proxy_key.zig").publicText;
 
 test {
+    _ = Proxy;
     _ = Config;
     _ = loader;
     _ = Admission;

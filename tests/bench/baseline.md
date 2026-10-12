@@ -511,3 +511,36 @@ The lifecycle regression checks two connect/disconnect cycles and exact quota eq
 It passed in Debug, ReleaseSafe and ReleaseFast. The full ReleaseSafe suite passed 231 tests with three platform
 skips, and both Linux ReleaseFast benchmark binaries compiled. Linux runtime and multi-worker network behavior
 were not exercised in this batch. Formatting and whitespace checks passed.
+
+## Worker link index
+
+Recorded 2026-10-12 on Windows x86_64, Zig 0.17.0, ReleaseFast, with other builds and tests stopped.
+Command before and after: `zig build bench -Doptimize=ReleaseFast -- links --quick`. Each result is the median
+of seven samples of 65,536 calls through `Proxy.packet`, after 4,096 warmup calls. Both runs use the same seeded
+uniform sequence of live IDs and contiguous Link allocations. Links have no managed session: the measurement
+covers worker lookup and the unsupported check, excluding queue validation, copying, compression, encryption,
+and network delivery. The benchmark rejects missing links and any allocation during lookup.
+
+| live links | list ns/lookup | index ns/lookup | index lookups/s | index heap B |
+|---|---|---|---|---|
+| 1 | 3.6 | 4.1 | 242,725,926 | 272 |
+| 64 | 46.8 | 9.2 | 109,063,072 | 2,052 |
+| 512 | 401.4 | 8.2 | 122,337,129 | 16,644 |
+| 4,096 | 3,627.5 | 11.0 | 90,757,513 | 131,332 |
+
+The worker now owns one standard-library array hash map instead of an intrusive linked list. Packet delivery,
+messages, and transfer requests share its lookup. The table adds the gross heap shown above; Link allocations
+are excluded, and their intrusive list node has been removed. Capacity grows with peak live links, is reused
+across disconnects, and is freed on proxy destruction. No locks or allocations were added to lookup. These are
+lookup microbenchmarks, not injection transport throughput; the one-link result does not establish an improvement.
+
+Registration reserves table capacity before callbacks or asynchronous connection work. Internal IDs are consumed
+before callbacks, including on failed connections, and exhaustion returns an error instead of wrapping. This
+prevents an old queued transfer request from finding a later player under a reused ID. The ID regression failed
+with the former update order and passed with the fix.
+
+The three worker regression tests passed in Debug, ReleaseSafe, and ReleaseFast. They cover rejected connections,
+ID exhaustion, lookup after table growth/removal and address reuse, and cleanup at every allocation failure during
+registration. The full ReleaseSafe suite passed 234 tests with three platform skips, including existing managed
+injection, transfer, disconnect, and shutdown checks. Native and Linux ReleaseFast benchmark binaries compiled;
+Linux runtime and multi-worker network behavior were not tested. Formatting and whitespace checks passed.

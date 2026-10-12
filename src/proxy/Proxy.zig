@@ -14,7 +14,7 @@ const advertisement = @import("../protocol/advertisement.zig");
 const Admission = @import("Admission.zig");
 const Backend = @import("../backend/Backend.zig");
 const Transfer = @import("../transfer/Transfer.zig");
-const Link = @import("Link.zig");
+pub const Link = @import("Link.zig");
 const Plugins = @import("../plugin/Plugins.zig");
 const abi = @import("../plugin/abi.zig");
 const Scheduler = @import("Scheduler.zig");
@@ -39,7 +39,7 @@ own_admission: Admission,
 observer_pool: bedwire.BufferPool,
 managed: ?Managed.Shared,
 env: Link.Env,
-links: std.DoublyLinkedList = .{},
+links: std.AutoArrayHashMapUnmanaged(u64, *Link) = .empty,
 listener_watch: Watch(raknet.Server) = .{},
 listener_busy: bool = false,
 listener_failures: u8 = 0,
@@ -146,6 +146,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
 
 pub fn destroy(self: *Proxy) void {
     self.closeAll();
+    self.links.deinit(self.gpa);
     if (self.managed) |*shared| shared.deinit(self.gpa);
     self.own_admission.deinit();
     self.observer_pool.deinit();
@@ -203,12 +204,7 @@ pub fn message(self: *Proxy, link_id: u64, text: []const u8) void {
 }
 
 fn findLink(self: *Proxy, id: u64) ?*Link {
-    var it = self.links.first;
-    while (it) |node| : (it = node.next) {
-        const link: *Link = @fieldParentPtr("node", node);
-        if (link.id == id) return link;
-    }
-    return null;
+    return self.links.get(id);
 }
 
 pub fn packet(self: *Proxy, link_id: u64, target: abi.PacketTarget, bytes: []const u8) abi.Status {
@@ -299,7 +295,8 @@ fn serviceReady(self: *Proxy) error{Canceled}!void {
         link.queued.store(false, .release);
         try link.service();
         if (link.isFinished() and !link.queued.load(.acquire)) {
-            self.links.remove(&link.node);
+            const removed = self.links.swapRemove(link.id);
+            std.debug.assert(removed);
             link.destroy();
             self.stats.bump(.links_closed, 1);
         }
@@ -319,15 +316,16 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
 fn accept(self: *Proxy, session: *raknet.Session) !void {
     try self.admission.enter(self.io, session.address);
     errdefer self.admission.leave(self.io, session.address);
+    try self.links.ensureUnusedCapacity(self.gpa, 1);
     const link = try Link.create(&self.env, session);
     errdefer link.destroy();
-    link.id = self.next_player + 1;
+    link.id = std.math.add(u64, self.next_player, 1) catch return error.PlayerIdExhausted;
+    self.next_player = link.id;
     link.player = self.env.events.connected(.{ .context = self, .worker = self.env.events.worker, .link = link.id, .transfer = routeTransfer }, session.address);
     if (link.managed) |managed| managed.plugin_player = link.player;
 
     try link.connect();
-    self.next_player += 1;
-    self.links.append(&link.node);
+    self.links.putAssumeCapacityNoClobber(link.id, link);
     session.setUserData(link);
     self.stats.bump(.sessions_accepted, 1);
 }
@@ -356,8 +354,8 @@ fn closeAll(self: *Proxy) void {
     defer @atomicStore(u64, &self.stats.session_memory_bytes, self.listener.session_quota.used_bytes, .monotonic);
     self.listener_watch.cancel(self.io);
     self.listener.close();
-    while (self.links.popFirst()) |node| {
-        const link: *Link = @fieldParentPtr("node", node);
+    while (self.links.pop()) |entry| {
+        const link = entry.value;
         // The session outlives the link until listener.destroy()
         if (link.session) |session| {
             session.setUserData(null);
@@ -368,4 +366,68 @@ fn closeAll(self: *Proxy) void {
         self.stats.bump(.links_closed, 1);
     }
     self.scheduler.ready.store(null, .monotonic);
+}
+
+test "worker link IDs are retired after failed connections and never wrap" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var config: Config = .{ .bind = .{ .ip4 = .loopback(0) }, .max_players = 2 };
+    try config.addBackend(null, .{ .ip4 = .loopback(9) });
+    var health: Health = .init(config.backends(), 1000, 100);
+    health.markFailed(.of(0));
+    const proxy = try Proxy.create(gpa, io, config, .{ .health = &health });
+    defer proxy.destroy();
+    var session: raknet.Session = undefined;
+    session.address = .{ .ip4 = .loopback(1) };
+    for (1..3) |id| {
+        try std.testing.expectError(error.NoBackendAvailable, proxy.accept(&session));
+        try std.testing.expectEqual(id, proxy.next_player);
+        try std.testing.expectEqual(@as(usize, 0), proxy.links.count());
+        try std.testing.expectEqual(@as(u32, 0), proxy.admission.active.load(.monotonic));
+    }
+    proxy.next_player = std.math.maxInt(u64);
+    try std.testing.expectError(error.PlayerIdExhausted, proxy.accept(&session));
+    try std.testing.expectEqual(std.math.maxInt(u64), proxy.next_player);
+    try std.testing.expectEqual(@as(u32, 0), proxy.admission.active.load(.monotonic));
+}
+
+test "worker link lookup rejects retired IDs after index growth" {
+    var proxy: Proxy = undefined;
+    proxy.links = .empty;
+    defer proxy.links.deinit(std.testing.allocator);
+    var links: [64]Link = undefined;
+    for (&links, 0..) |*link, i| {
+        link.id = (i + 1) * 97;
+        link.managed = null;
+        try proxy.links.putNoClobber(std.testing.allocator, link.id, link);
+    }
+    for (&links) |link| try std.testing.expectEqual(abi.Status.unsupported, proxy.packet(link.id, .player, ""));
+    const retired = links[16].id;
+    try std.testing.expect(proxy.links.swapRemove(retired));
+    links[16].id = 100000;
+    try proxy.links.putNoClobber(std.testing.allocator, links[16].id, &links[16]);
+    try std.testing.expectEqual(abi.Status.stale_handle, proxy.packet(retired, .player, ""));
+    try std.testing.expectEqual(abi.Status.stale_handle, proxy.packet(0, .player, ""));
+    for (&links) |link| try std.testing.expectEqual(abi.Status.unsupported, proxy.packet(link.id, .player, ""));
+    while (proxy.links.pop()) |entry| try std.testing.expectEqual(abi.Status.stale_handle, proxy.packet(entry.key, .player, ""));
+}
+
+test "worker link registration cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var config: Config = .{ .bind = .{ .ip4 = .loopback(0) }, .max_players = 2 };
+            try config.addBackend(null, .{ .ip4 = .loopback(9) });
+            var health: Health = .init(config.backends(), 1000, 100);
+            health.markFailed(.of(0));
+            const proxy = try Proxy.create(gpa, std.testing.io, config, .{ .health = &health });
+            defer proxy.destroy();
+            var session: raknet.Session = undefined;
+            session.address = .{ .ip4 = .loopback(1) };
+            if (proxy.accept(&session)) |_| return error.ExpectedRejection else |err| {
+                if (err != error.NoBackendAvailable) return err;
+            }
+            try std.testing.expectEqual(@as(u32, 0), proxy.admission.active.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 0), proxy.links.count());
+        }
+    }.run, .{});
 }
