@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 /* Plugins run in-process, so a crash takes the proxy down. Callbacks run on several workers at once; never block.
-   From your own threads only log, counts, names, send_message and post work, the rest return WRONG_THREAD.
+   From your own threads log, counts, names, send_message, send_packet and post work; callback-only calls return WRONG_THREAD.
    Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns.
    The full contract is in docs/plugin-abi.md. */
 
@@ -222,6 +222,10 @@ typedef struct bifrost_task_result {
 
 typedef void (*bifrost_task_done_fn)(void *user, const bifrost_task_result *result) BIFROST_NOEXCEPT;
 
+typedef uint32_t bifrost_packet_target;
+#define BIFROST_PACKET_TO_PLAYER ((bifrost_packet_target)0)
+#define BIFROST_PACKET_TO_BACKEND ((bifrost_packet_target)1)
+
 typedef void (*bifrost_event_fn)(void *user, const bifrost_event *event, bifrost_transfer_decision *decision) BIFROST_NOEXCEPT;
 
 typedef struct bifrost_host {
@@ -250,6 +254,10 @@ typedef struct bifrost_host {
     bifrost_status (*decode_packet)(void *context, const bifrost_packet *packet, bifrost_packet_type type, void *out, size_t capacity) BIFROST_NOEXCEPT;
     /* Writes replacement and replacement_len; return BIFROST_PACKET_REPLACE to apply it. */
     bifrost_status (*encode_packet)(void *context, bifrost_packet *packet, bifrost_packet_type type, const void *data, size_t size) BIFROST_NOEXCEPT;
+    /* Copies a complete Bedrock packet. OK means queued; optional done reports delivery.
+       Thread-safe, bypasses listeners. Text in either direction; RequestChunkRadius to backend.
+       In-game only, main sub-client only, <= 65536 bytes. Check BIFROST_HOST_HAS first. */
+    bifrost_status (*send_packet)(void *context, bifrost_player player, bifrost_packet_target target, bifrost_str bytes, bifrost_task_done_fn done, void *user) BIFROST_NOEXCEPT;
 } bifrost_host;
 
 /* Older hosts have a shorter table, so use this instead of sizeof */

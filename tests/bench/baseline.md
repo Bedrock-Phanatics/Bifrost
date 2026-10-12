@@ -414,3 +414,41 @@ and two concurrent callers. The loaded-plugin transport test checks cancellation
 caps through compression/encryption, again after transfer. Windows and Linux ReleaseSafe package builds passed;
 the Windows package was restored afterward. Formatting and whitespace checks passed. Linux runtime behavior
 and Linux network-worker performance remain unverified for this example.
+
+## Native packet injection
+
+Recorded 2026-10-12 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast.
+Command: `zig build bench -Doptimize=ReleaseFast -- injection packet-dispatch --quick`, with other Bifrost builds
+and tests stopped. Injection results are medians of seven samples of 500 batches of 32 Text packets, after one
+warmup batch. They include strict decoding, copying, queue insertion, drain and free, plus allocation accounting.
+The sink performs no session lookup, compression, encryption or network work; these are queue throughput figures.
+
+| packet bytes | ns/packet | packets/s | allocations/packet | queued heap for 32 | retained heap after drain |
+|---|---|---|---|---|---|
+| 32 | 131.0 | 7,633,588 | 1 | 4,096 B | 0 B |
+| 1,024 | 193.6 | 5,165,956 | 1 | 35,840 B | 0 B |
+| 16,384 | 884.2 | 1,130,966 | 1 | 527,360 B | 0 B |
+| 65,536 | 2,898.9 | 344,961 | 1 | 2,100,224 B | 0 B |
+
+Each queued packet has one allocation containing 96 B of metadata and an exact-size payload. Queue arrays and
+plugin/handle storage are allocated before the timed loop and excluded from the heap deltas. The copied-payload
+budget is 4 MiB globally, and injections share the existing 1024-item bound with messages and posts. Counters stay
+reserved until the allocation is freed. Retained heap is requested live memory, not allocator pages or process RSS.
+
+The same isolated run measured raw dispatch at 27.1 ns/packet, the C++ raw-text filter at 74.3 and the C++ chat
+filter at 79.8 (159.1 added ns/callback). The previous raw result was 28.8 and chat was 93.9; these differences
+do not establish a speedup. Both filter pass paths remain within their 200 ns/callback budget. Typed modification
+remains above that budget at 333.7 added ns/callback. The raw dispatch implementation is unchanged.
+
+Verification: the final full ReleaseSafe suite passed 229 tests with three platform skips. The 18 packet unit
+tests and 15 packet integration tests passed in Debug, ReleaseSafe and ReleaseFast, along with native C++ checks.
+Coverage includes copied-buffer lifetime, FIFO sends, stale/reused handles, route invalidation, transfer rejection,
+initialization publication, byte/count exhaustion, allocation failure, shutdown cleanup, deferred completion chains,
+four submitter threads and two worker queues, malformed/truncated input, and the 64 KiB boundary. The managed
+transport test delivers packets to player and backend, verifies listener bypass and compressed/encrypted maximum-size
+delivery, and checks both injected radius fields replay to the new backend after transfer. C/C++ ABI layout checks,
+old-host SDK rejection, formatting, whitespace checks, and Windows/Linux ReleaseSafe builds passed.
+
+Linux runtime behavior, injection transport throughput, lookup scaling, multi-worker network throughput, process
+CPU/RSS and allocator page retention were not measured. The supported injection set is Text in both directions and
+RequestChunkRadius to the backend; other packet kinds remain unsupported.

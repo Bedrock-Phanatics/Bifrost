@@ -7,6 +7,7 @@ pub const Handles = @import("Handles.zig");
 pub const Packets = @import("Packets.zig");
 const Pool = @import("Pool.zig");
 const Work = @import("Work.zig");
+const injection = @import("injection.zig");
 const sdk = @import("sdk.zig");
 const Notify = @import("../net/Notify.zig");
 
@@ -26,6 +27,7 @@ pub const Options = struct {
     max_tasks: u32 = 128,
     max_tasks_per_plugin: u32 = 32,
     max_messages: u32 = 1024,
+    max_injection_bytes: u32 = 4 * 1024 * 1024,
 };
 
 pub const Totals = struct {
@@ -97,6 +99,7 @@ const Loaded = struct {
     metadata: Metadata = .{},
     metrics: []Packets.Metrics = &.{},
     outstanding: std.atomic.Value(u32) = .init(0),
+    ready: std.atomic.Value(bool) = .init(false),
 
     fn label(self: *const Loaded) []const u8 {
         return self.metadata.name();
@@ -122,6 +125,7 @@ queues: []Work.Queue,
 pool: ?*Pool = null,
 outstanding: std.atomic.Value(u32) = .init(0),
 messages: std.atomic.Value(u32) = .init(0),
+injection_bytes: std.atomic.Value(u32) = .init(0),
 
 pub fn init(gpa: std.mem.Allocator, backends: []const Backend, options: Options) !Plugins {
     if (options.task_threads == 0 or options.task_threads > Pool.max_threads) return error.InvalidOptions;
@@ -249,6 +253,7 @@ pub fn load(self: *Plugins, entry: abi.InitFn, library: ?Library, manifest: ?*co
     for (self.pending_commands.items, names) |item, name| self.commands.putAssumeCapacityNoClobber(name, item.command);
     for (self.pending.items) |item| self.subscribers[@backingInt(item.kind)].appendAssumeCapacity(item.subscriber);
     self.loaded.appendAssumeCapacity(loaded);
+    loaded.ready.store(true, .release);
     if (meta.package.len != 0) {
         log.info("loaded plugin {s} {s} from {s}: {s}", .{ meta.name(), meta.version(), meta.package, meta.description() });
     } else if (meta.description_len == 0) {
@@ -268,6 +273,7 @@ pub fn isLoaded(self: *const Plugins, name: []const u8) bool {
 }
 
 pub fn unload(self: *Plugins) void {
+    self.stopping.store(true, .release);
     const outer = Work.enter();
     defer Work.hosted = outer;
     if (self.pool) |pool| {
@@ -348,6 +354,16 @@ fn settle(self: *Plugins, item: Work.Item, owner: ?Owner, sink: anytype) void {
             sink.message(route.link, message.text[0..message.len]);
         },
         .task => |task| self.finish(task, self.liveStatus(task.then.player, owner), owner),
+        .packet => |packet| {
+            defer {
+                const length: u32 = @intCast(packet.len);
+                packet.destroy(self.gpa);
+                _ = self.injection_bytes.fetchSub(length, .acq_rel);
+                Work.release(&self.messages);
+            }
+            const status = self.deliverPacket(packet, owner, sink);
+            if (packet.then) |*then| self.complete(then, status, owner);
+        },
         .post => |post| {
             defer {
                 self.gpa.destroy(post);
@@ -356,6 +372,14 @@ fn settle(self: *Plugins, item: Work.Item, owner: ?Owner, sink: anytype) void {
             self.complete(post, self.liveStatus(post.player, owner), owner);
         },
     }
+}
+
+fn deliverPacket(self: *Plugins, packet: *Work.Injection, owner: ?Owner, sink: anytype) abi.Status {
+    if (self.stopping.load(.acquire) or owner == null) return .canceled;
+    const route = self.handles.route(packet.player) orelse return .stale_handle;
+    if (route.worker != owner.?.worker or route.epoch != packet.epoch) return .canceled;
+    if (@TypeOf(sink) == @TypeOf(null)) return .unsupported;
+    return sink.packet(route.link, packet.target, packet.bytes());
 }
 
 fn liveStatus(self: *Plugins, player: abi.Player, owner: ?Owner) abi.Status {
@@ -490,6 +514,7 @@ fn hostFor(loaded: *Loaded) abi.Host {
         .set_description = hostSetDescription,
         .decode_packet = Packets.decodePacket,
         .encode_packet = Packets.encodePacket,
+        .send_packet = hostSendPacket,
     };
 }
 
@@ -660,6 +685,36 @@ fn hostPost(context: *anyopaque, player: abi.Player, callback: ?abi.TaskDoneFn, 
     owner.gpa.destroy(post);
     Work.release(&owner.messages);
     return .unsupported;
+}
+
+fn hostSendPacket(context: *anyopaque, player: abi.Player, target: abi.PacketTarget, bytes: abi.Str, callback: ?abi.TaskDoneFn, user: ?*anyopaque) callconv(.c) abi.Status {
+    const loaded = from(context);
+    const owner = loaded.owner;
+    if (!owner.options.packets or !loaded.ready.load(.acquire)) return .unsupported;
+    if (!loaded.plugin.capabilities.packets) return .unsupported;
+    if (owner.stopping.load(.acquire)) return .canceled;
+    if (bytes.ptr == null or bytes.len == 0 or bytes.len > injection.max_packet_bytes) return .invalid_argument;
+    const status = injection.validate(target, bytes.slice());
+    if (status != .ok) return status;
+    const route = owner.handles.route(player) orelse return .stale_handle;
+    if (route.worker >= owner.queues.len) return .invalid_argument;
+    if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
+    const length: u32 = @intCast(bytes.len);
+    if (!Work.reserveBytes(&owner.injection_bytes, owner.options.max_injection_bytes, length)) {
+        Work.release(&owner.messages);
+        return .busy;
+    }
+    const then: ?Work.Done = if (callback) |done| .{ .done = done, .user = user, .player = player, .name = loaded.label(), .metrics = loaded.metrics } else null;
+    const packet = Work.Injection.create(owner.gpa, player, target, route.epoch, bytes.slice(), then) catch {
+        _ = owner.injection_bytes.fetchSub(length, .acq_rel);
+        Work.release(&owner.messages);
+        return .failed;
+    };
+    if (owner.queues[route.worker].post(.{ .packet = packet })) return .ok;
+    packet.destroy(owner.gpa);
+    _ = owner.injection_bytes.fetchSub(length, .acq_rel);
+    Work.release(&owner.messages);
+    return .canceled;
 }
 
 fn hostWorkerCount(context: *anyopaque) callconv(.c) u32 {
@@ -1042,6 +1097,224 @@ test "posts are bounded, go stale with the player and are settled once at unload
     plugins.deinit();
     try testing.expectEqual(@as(u32, 3), delivery.stale.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), delivery.ok.load(.monotonic));
+}
+
+const InjectProbe = struct {
+    delivered: usize = 0,
+    completed: usize = 0,
+    statuses: [8]abi.Status = undefined,
+    lengths: [8]usize = undefined,
+    targets: [8]abi.PacketTarget = undefined,
+    last: [128]u8 = undefined,
+    status: abi.Status = .ok,
+
+    pub fn message(_: *InjectProbe, _: u64, _: []const u8) void {}
+
+    pub fn packet(self: *InjectProbe, _: u64, target: abi.PacketTarget, bytes: []const u8) abi.Status {
+        self.lengths[self.delivered] = bytes.len;
+        self.targets[self.delivered] = target;
+        @memcpy(self.last[0..bytes.len], bytes);
+        self.delivered += 1;
+        return self.status;
+    }
+
+    fn done(user: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        const self: *InjectProbe = @ptrCast(@alignCast(user.?));
+        self.statuses[self.completed] = result.status;
+        self.completed += 1;
+    }
+};
+
+test "packet injection copies, preserves FIFO, bounds bytes and reports delivery" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .max_messages = 2, .max_injection_bytes = 16 });
+    defer plugins.deinit();
+    try plugins.add(Probe.doubled, null);
+    const host = Probe.seen_host.?;
+    var sink: InjectProbe = .{};
+    const player = try plugins.handles.acquire(testing.allocator, .{ .context = &sink, .link = 7, .transfer = routedTransfer });
+    var bytes = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+    const expected = bytes;
+    try testing.expectEqual(abi.Status.ok, host.send_packet(host.context, player, .player, .of(&bytes), InjectProbe.done, &sink));
+    @memset(&bytes, 0);
+    try testing.expectEqual(abi.Status.busy, host.send_packet(host.context, player, .backend, .of(&expected), null, null));
+    plugins.drain(0, testing.io, &sink);
+    try testing.expectEqualSlices(u8, &expected, sink.last[0..expected.len]);
+    try testing.expectEqual(abi.Status.ok, sink.statuses[0]);
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), plugins.injection_bytes.load(.monotonic));
+
+    const radius = [_]u8{ 69, 16, 12 };
+    try testing.expectEqual(abi.Status.ok, host.send_packet(host.context, player, .backend, .of(&radius), InjectProbe.done, &sink));
+    try testing.expectEqual(abi.Status.ok, host.send_packet(host.context, player, .player, .of(&expected), InjectProbe.done, &sink));
+    try testing.expectEqual(abi.Status.busy, host.send_packet(host.context, player, .player, .of(&expected), null, null));
+    sink.status = .too_late;
+    plugins.drain(0, testing.io, &sink);
+    try testing.expectEqual(abi.PacketTarget.backend, sink.targets[1]);
+    try testing.expectEqual(abi.PacketTarget.player, sink.targets[2]);
+    try testing.expectEqual(abi.Status.too_late, sink.statuses[1]);
+    try testing.expectEqual(abi.Status.too_late, sink.statuses[2]);
+}
+
+test "packet injection rejects stale routes and transfers and cancels on shutdown" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(Probe.doubled, null);
+    const host = Probe.seen_host.?;
+    var sink: InjectProbe = .{};
+    var player = try plugins.handles.acquire(testing.allocator, .{ .context = &sink, .link = 7, .transfer = routedTransfer });
+    const bytes = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+    try testing.expectEqual(abi.Status.ok, host.send_packet(host.context, player, .player, .of(&bytes), InjectProbe.done, &sink));
+    plugins.handles.invalidatePackets(player);
+    plugins.drain(0, testing.io, &sink);
+    try testing.expectEqual(abi.Status.canceled, sink.statuses[0]);
+    try testing.expectEqual(abi.Status.ok, host.send_packet(host.context, player, .backend, .of(&bytes), InjectProbe.done, &sink));
+    plugins.handles.release(player);
+    player = try plugins.handles.acquire(testing.allocator, .{ .context = &sink, .link = 8, .transfer = routedTransfer });
+    plugins.drain(0, testing.io, &sink);
+    try testing.expectEqual(abi.Status.stale_handle, sink.statuses[1]);
+    try testing.expectEqual(abi.Status.ok, host.send_packet(host.context, player, .player, .of(&bytes), InjectProbe.done, &sink));
+    plugins.queues[0].close();
+    try testing.expectEqual(abi.Status.canceled, host.send_packet(host.context, player, .player, .of(&bytes), null, null));
+    plugins.unload();
+    try testing.expectEqual(abi.Status.canceled, sink.statuses[2]);
+    try testing.expectEqual(@as(usize, 0), sink.delivered);
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), plugins.injection_bytes.load(.monotonic));
+}
+
+fn injectMany(host: abi.Host, players: [2]abi.Player, deliveries: *[2]Delivery, errors: *std.atomic.Value(u32)) void {
+    const bytes = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+    for (0..250) |i| {
+        while (true) {
+            const status = host.send_packet(host.context, players[i % 2], .player, .of(&bytes), Delivery.done, &deliveries[i % 2]);
+            if (status == .busy) {
+                std.Thread.yield() catch {};
+                continue;
+            }
+            if (status != .ok) _ = errors.fetchAdd(1, .monotonic);
+            break;
+        }
+    }
+}
+
+test "packet injection from many threads completes on the owning workers" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .workers = 2, .max_messages = 32 });
+    defer plugins.deinit();
+    try plugins.add(Probe.doubled, null);
+    const host = Probe.seen_host.?;
+    const Sink = struct {
+        link: u64,
+        calls: usize = 0,
+        misplaced: usize = 0,
+        pub fn message(_: *@This(), _: u64, _: []const u8) void {}
+        pub fn packet(self: *@This(), link: u64, _: abi.PacketTarget, _: []const u8) abi.Status {
+            self.calls += 1;
+            if (link != self.link) self.misplaced += 1;
+            return .ok;
+        }
+    };
+    var sinks: [2]Sink = .{ .{ .link = 1 }, .{ .link = 2 } };
+    const players: [2]abi.Player = .{
+        try plugins.handles.acquire(testing.allocator, .{ .context = &sinks[0], .worker = 0, .link = 1, .transfer = routedTransfer }),
+        try plugins.handles.acquire(testing.allocator, .{ .context = &sinks[1], .worker = 1, .link = 2, .transfer = routedTransfer }),
+    };
+    var deliveries: [2]Delivery = .{ .{ .worker = 0 }, .{ .worker = 1 } };
+    var errors: std.atomic.Value(u32) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, injectMany, .{ host, players, &deliveries, &errors });
+    while (deliveries[0].ok.load(.monotonic) + deliveries[1].ok.load(.monotonic) + errors.load(.monotonic) < 1000) {
+        plugins.drain(0, testing.io, &sinks[0]);
+        plugins.drain(1, testing.io, &sinks[1]);
+        std.Thread.yield() catch {};
+    }
+    for (threads) |thread| thread.join();
+    try testing.expectEqual(@as(u32, 0), errors.load(.monotonic));
+    for (sinks, &deliveries) |sink, *delivery| {
+        try testing.expectEqual(@as(usize, 500), sink.calls);
+        try testing.expectEqual(@as(usize, 0), sink.misplaced);
+        try testing.expectEqual(@as(u32, 0), delivery.misplaced.load(.monotonic));
+    }
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), plugins.injection_bytes.load(.monotonic));
+}
+
+test "packet injection allocation failure releases reservations and old SDK hosts are rejected" {
+    Probe.reset();
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    var plugins: Plugins = try .init(failing.allocator(), &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(Probe.doubled, null);
+    var host = Probe.seen_host.?;
+    var sink: InjectProbe = .{};
+    const player = try plugins.handles.acquire(plugins.gpa, .{ .context = &sink, .link = 7, .transfer = routedTransfer });
+    const bytes = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+    failing.fail_index = failing.alloc_index;
+    try testing.expectEqual(abi.Status.failed, host.send_packet(host.context, player, .player, .of(&bytes), InjectProbe.done, &sink));
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), plugins.injection_bytes.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), sink.completed);
+    host.struct_size = @offsetOf(abi.Host, "send_packet");
+    try testing.expectError(error.Unsupported, (sdk.Host{ .raw = &host }).sendPacket(player, .player, &bytes, null, null));
+}
+
+test "packet injection requires capability and defers completion submissions to a later drain" {
+    Probe.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(Probe.first, null);
+    const first = Probe.seen_host.?;
+    const bytes = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+    try testing.expectEqual(abi.Status.unsupported, first.send_packet(first.context, .{}, .player, .of(&bytes), null, null));
+    try plugins.add(Probe.doubled, null);
+    const host = Probe.seen_host.?;
+    const Chain = struct {
+        host: abi.Host,
+        player: abi.Player = .{},
+        completions: usize = 0,
+        calls: usize = 0,
+        status: abi.Status = .ok,
+        pub fn message(_: *@This(), _: u64, _: []const u8) void {}
+        pub fn packet(self: *@This(), _: u64, _: abi.PacketTarget, _: []const u8) abi.Status {
+            self.calls += 1;
+            return .ok;
+        }
+        fn done(user: ?*anyopaque, _: *const abi.TaskResult) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            self.completions += 1;
+            if (self.completions == 1) self.status = self.host.send_packet(self.host.context, self.player, .player, .of(&bytes), done, self);
+        }
+    };
+    var chain: Chain = .{ .host = host };
+    chain.player = try plugins.handles.acquire(testing.allocator, .{ .context = &chain, .link = 1, .transfer = routedTransfer });
+    try testing.expectEqual(abi.Status.ok, host.send_packet(host.context, chain.player, .player, .of(&bytes), Chain.done, &chain));
+    plugins.drain(0, testing.io, &chain);
+    try testing.expectEqual(abi.Status.ok, chain.status);
+    try testing.expectEqual(@as(usize, 1), chain.completions);
+    try testing.expectEqual(@as(usize, 1), chain.calls);
+    plugins.drain(0, testing.io, &chain);
+    try testing.expectEqual(@as(usize, 2), chain.completions);
+    try testing.expectEqual(@as(usize, 2), chain.calls);
+    plugins.options.packets = false;
+    try testing.expectEqual(abi.Status.unsupported, host.send_packet(host.context, chain.player, .player, .of(&bytes), null, null));
+}
+
+test "packet injection stays unavailable until plugin initialization commits" {
+    const Init = struct {
+        fn call(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+            plugin.name = .of("init-injection");
+            plugin.plugin_version = .of("1");
+            plugin.capabilities.packets = true;
+            const bytes = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+            return if (host.send_packet(host.context, .{}, .player, .of(&bytes), null, null) == .unsupported) .ok else .failed;
+        }
+    };
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(Init.call, null);
+    try testing.expect(plugins.loaded.items[0].ready.load(.acquire));
 }
 
 const Tasker = struct {

@@ -348,6 +348,7 @@ pub const Backend = struct {
     handshakes: std.atomic.Value(u32) = .init(0),
     chunk_requests: std.atomic.Value(u32) = .init(0),
     requested_max_radius: std.atomic.Value(u32) = .init(0),
+    requested_radius: std.atomic.Value(i32) = .init(0),
     spawns: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
     sub_chunk_requests: std.atomic.Value(u32) = .init(0),
@@ -712,6 +713,7 @@ pub const Backend = struct {
             },
             .request_chunk_radius => {
                 const request = (try session.decodePacket(packet)).value.typed.request_chunk_radius;
+                self.requested_radius.store(request.chunk_radius, .release);
                 self.requested_max_radius.store(request.max_chunk_radius, .release);
                 if (session.state == .in_game) {
                     try sendFrame(session, carrier, &.{try typedPacket(&buffer, .{ .chunk_radius_updated = .{ .chunk_radius = request.chunk_radius } })});

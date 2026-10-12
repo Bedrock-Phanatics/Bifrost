@@ -11,6 +11,7 @@ const bench_ids = @import("runtime_ids.zig");
 const bench_tasks = @import("tasks.zig");
 const bench_handles = @import("handles.zig");
 const bench_decoded = @import("decoded.zig");
+const bench_injection = @import("injection.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -26,11 +27,11 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|decode|ids|tasks|handles|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|injection|decode|ids|tasks|handles|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "decode", "ids", "tasks", "handles", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "decode", "injection", "ids", "tasks", "handles", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -111,6 +112,11 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "deflate")) try deflateScenario(&env);
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
         if (std.mem.eql(u8, name, "packet-dispatch")) try packetDispatch(&env);
+        if (std.mem.eql(u8, name, "injection")) {
+            const results = try bench_injection.run(env.gpa, env.io, env.quick);
+            try env.out.print("\n## Packet injection queue\n\nText packets, batches of 32, median of seven samples. Includes validation, copy, queue, drain and free with allocation accounting; sink does no transport work.\n\n| packet bytes | ns per packet | packets/s | allocations per packet | queued heap for 32 | retained heap after drain |\n|---|---|---|---|---|---|\n", .{});
+            for (results) |result| try env.out.print("| {d} | {d:.1} | {d:.0} | {d:.1} | {d} | {d} |\n", .{ result.bytes, result.ns_per_packet, std.time.ns_per_s / result.ns_per_packet, result.allocations_per_packet, result.queued_heap, result.retained_heap });
+        }
         if (std.mem.eql(u8, name, "decode")) {
             const results = try bench_decoded.run(env.gpa, env.io, env.quick);
             try env.out.print("\n## Native packet codec\n\nText packets, seven samples; shared is one decode for ten readers. No allocator is passed to the codec.\n\n| case | ns per packet |\n|---|---|\n", .{});

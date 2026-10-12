@@ -38,6 +38,31 @@ pub const Item = union(enum) {
     task: *Task,
     message: *Message,
     post: *Done,
+    packet: *Injection,
+};
+
+pub const Injection = struct {
+    player: abi.Player,
+    target: abi.PacketTarget,
+    epoch: u64,
+    len: usize,
+    then: ?Done,
+
+    pub fn create(gpa: std.mem.Allocator, player: abi.Player, target: abi.PacketTarget, epoch: u64, data: []const u8, then: ?Done) !*Injection {
+        const allocation = try gpa.alignedAlloc(u8, .of(Injection), @sizeOf(Injection) + data.len);
+        const self: *Injection = @ptrCast(allocation.ptr);
+        self.* = .{ .player = player, .target = target, .epoch = epoch, .len = data.len, .then = then };
+        @memcpy(self.bytes(), data);
+        return self;
+    }
+
+    pub fn bytes(self: *Injection) []u8 {
+        return (@as([*]u8, @ptrCast(self)) + @sizeOf(Injection))[0..self.len];
+    }
+
+    pub fn destroy(self: *Injection, gpa: std.mem.Allocator) void {
+        gpa.free(@as([*]align(@alignOf(Injection)) u8, @ptrCast(self))[0 .. @sizeOf(Injection) + self.len]);
+    }
 };
 
 // Anyone can post, only the owning worker takes
@@ -95,9 +120,13 @@ pub const Queue = struct {
 };
 
 pub fn reserve(counter: *std.atomic.Value(u32), limit: u32) bool {
+    return reserveBytes(counter, limit, 1);
+}
+
+pub fn reserveBytes(counter: *std.atomic.Value(u32), limit: u32, size: u32) bool {
     var current = counter.load(.monotonic);
-    while (current < limit) {
-        current = counter.cmpxchgWeak(current, current + 1, .acq_rel, .monotonic) orelse return true;
+    while (size <= limit and current <= limit - size) {
+        current = counter.cmpxchgWeak(current, current + size, .acq_rel, .monotonic) orelse return true;
     }
     return false;
 }

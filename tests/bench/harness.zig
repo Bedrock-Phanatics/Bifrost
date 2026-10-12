@@ -119,6 +119,7 @@ fn readProc(io: std.Io, path: []const u8, buffer: []u8) []const u8 {
 pub const CountingAllocator = struct {
     backing: std.mem.Allocator,
     live: std.atomic.Value(u64) = .init(0),
+    allocations: std.atomic.Value(u64) = .init(0),
 
     pub fn allocator(self: *CountingAllocator) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -127,6 +128,7 @@ pub const CountingAllocator = struct {
     fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *CountingAllocator = @ptrCast(@alignCast(context));
         const result = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        _ = self.allocations.fetchAdd(1, .monotonic);
         _ = self.live.fetchAdd(len, .monotonic);
         return result;
     }

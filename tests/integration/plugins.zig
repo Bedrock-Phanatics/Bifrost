@@ -677,18 +677,28 @@ fn sendFilteredPackets(player: *managed.Player, backend: *managed.Backend) !void
     const chat = try managed.typedPacket(&buffers[3], .{ .text = .{ .localize = false, .body = .{ .author_and_message = .{ .message_type = .chat, .player_name = "spoofed", .message = "hello Bedrock" } }, .senders_xuid = "123", .platform_id = "platform", .filtered_message = "filtered" } });
     try player.send(&.{ negative, radius, oversized, chat });
     var received: usize = 0;
-    while (received < 2) {
+    var saw_radius = false;
+    var saw_chat = false;
+    var saw_warning = false;
+    while (received < 3) {
         var packets = try player.receive();
         defer packets.deinit();
         while (packets.next()) |packet| {
             const decoded = (try player.session.decodePacket(packet)).value.typed;
-            switch (received) {
-                0 => {
-                    try std.testing.expectEqual(@as(i32, 12), decoded.chunk_radius_updated.chunk_radius);
+            switch (decoded) {
+                .chunk_radius_updated => |updated| {
+                    try std.testing.expect(!saw_radius);
+                    saw_radius = true;
+                    try std.testing.expectEqual(@as(i32, 12), updated.chunk_radius);
                     try std.testing.expectEqual(@as(u32, 12), backend.requested_max_radius.load(.acquire));
                 },
-                1 => {
-                    const text = decoded.text;
+                .text => |text| if (text.body == .message_only) {
+                    try std.testing.expect(!saw_warning);
+                    saw_warning = true;
+                    try std.testing.expectEqualStrings("Chat messages are limited to 512 bytes.", text.body.message_only.message);
+                } else {
+                    try std.testing.expect(!saw_chat);
+                    saw_chat = true;
                     try std.testing.expectEqualStrings("hello Bedrock", text.body.author_and_message.message);
                     try std.testing.expectEqualStrings("Steve", text.body.author_and_message.player_name);
                     try std.testing.expectEqualStrings("123", text.senders_xuid);
@@ -700,6 +710,7 @@ fn sendFilteredPackets(player: *managed.Player, backend: *managed.Backend) !void
             received += 1;
         }
     }
+    try std.testing.expect(saw_radius and saw_chat and saw_warning);
 }
 
 test "the C++ packet example enforces Bedrock limits and player context across transfers" {
@@ -718,6 +729,156 @@ test "the C++ packet example enforces Bedrock limits and player context across t
     try rig.waitFor(.transfers_committed, 1);
     try rig.expectOn(&rig.b);
     try sendFilteredPackets(rig.player, &rig.b);
+}
+
+const Injector = struct {
+    var completed: std.atomic.Value(u32) = .init(0);
+    var failed: std.atomic.Value(u32) = .init(0);
+    var pregame: std.atomic.Value(i32) = .init(-1);
+    var from_player: std.atomic.Value(u32) = .init(0);
+    var from_backend: std.atomic.Value(u32) = .init(0);
+    var transfer_status: std.atomic.Value(i32) = .init(-1);
+
+    fn init(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        completed.store(0, .release);
+        failed.store(0, .release);
+        pregame.store(-1, .release);
+        from_player.store(0, .release);
+        from_backend.store(0, .release);
+        transfer_status.store(-1, .release);
+        const status = Recorder.init(host, plugin);
+        if (status != .ok) return status;
+        plugin.capabilities.packets = true;
+        const event = host.subscribe(host.context, .player_authenticated, onAuthenticated, null);
+        if (event != .ok) return event;
+        const transfer = host.subscribe(host.context, .transfer_requested, onTransfer, null);
+        if (transfer != .ok) return transfer;
+        for ([_]abi.Direction{ .from_player, .from_backend }) |direction| {
+            const subscribed = host.subscribe_packet(host.context, direction, 9, .any, .{}, onPacket, null);
+            if (subscribed != .ok) return subscribed;
+        }
+        return .ok;
+    }
+
+    fn onAuthenticated(_: ?*anyopaque, event: *const abi.Event, _: ?*abi.TransferDecision) callconv(.c) void {
+        const host = Recorder.host.?;
+        const bytes = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+        const status = host.send_packet(host.context, event.player, .player, .of(&bytes), beforeGame, null);
+        if (status != .ok) pregame.store(@backingInt(status), .release);
+    }
+
+    fn beforeGame(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        pregame.store(@backingInt(result.status), .release);
+    }
+
+    fn onTransfer(_: ?*anyopaque, event: *const abi.Event, _: ?*abi.TransferDecision) callconv(.c) void {
+        const host = Recorder.host.?;
+        const bytes = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+        const status = host.send_packet(host.context, event.player, .backend, .of(&bytes), duringTransfer, null);
+        if (status != .ok) transfer_status.store(@backingInt(status), .release);
+    }
+
+    fn duringTransfer(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        transfer_status.store(@backingInt(result.status), .release);
+    }
+
+    fn onPacket(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const counter = if (packet.direction == .from_player) &from_player else &from_backend;
+        _ = counter.fetchAdd(1, .monotonic);
+        return .pass;
+    }
+
+    fn done(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        if (result.status != .ok or result.worker != 0) _ = failed.fetchAdd(1, .monotonic);
+        _ = completed.fetchAdd(1, .release);
+    }
+
+    fn wait() !void {
+        for (0..500) |_| {
+            if (completed.load(.acquire) == 3) return;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.WaitTimedOut;
+    }
+};
+
+fn injectPackets(rig: *Rig) !void {
+    const host = Recorder.host.?;
+    var buffers: [3][128]u8 = undefined;
+    const messages = [_][]const u8{ "to player", "to backend" };
+    for (messages, buffers[0..2], [_]abi.PacketTarget{ .player, .backend }) |message, *buffer, target| {
+        const packet = try managed.typedPacket(buffer, .{ .text = .{
+            .localize = false,
+            .body = .{ .message_only = .{ .message_type = .raw, .message = message } },
+            .senders_xuid = "",
+            .platform_id = "",
+            .filtered_message = null,
+        } });
+        try std.testing.expectEqual(abi.Status.ok, host.send_packet(host.context, Recorder.handle(), target, .of(packet), Injector.done, null));
+        @memset(buffer, 0);
+    }
+    const radius = try managed.typedPacket(&buffers[2], .{ .request_chunk_radius = .{ .chunk_radius = 10, .max_chunk_radius = 11 } });
+    try std.testing.expectEqual(abi.Status.ok, host.send_packet(host.context, Recorder.handle(), .backend, .of(radius), Injector.done, null));
+    var received: usize = 0;
+    while (received < 3) {
+        var packets = try rig.player.receive();
+        defer packets.deinit();
+        while (packets.next()) |packet| {
+            const decoded = (try rig.player.session.decodePacket(packet)).value.typed;
+            switch (received) {
+                0, 1 => try std.testing.expectEqualStrings(messages[received], decoded.text.body.message_only.message),
+                2 => try std.testing.expectEqual(@as(i32, 10), decoded.chunk_radius_updated.chunk_radius),
+                else => return error.UnexpectedPacket,
+            }
+            received += 1;
+        }
+    }
+    try Injector.wait();
+    try std.testing.expectEqual(@as(u32, 0), Injector.failed.load(.acquire));
+
+    const message: [65526]u8 = @splat('x');
+    var buffer: [65536]u8 = undefined;
+    const large = try managed.typedPacket(&buffer, .{ .text = .{
+        .localize = false,
+        .body = .{ .message_only = .{ .message_type = .raw, .message = &message } },
+        .senders_xuid = "",
+        .platform_id = "",
+        .filtered_message = null,
+    } });
+    try std.testing.expectEqual(buffer.len, large.len);
+    try std.testing.expectEqual(abi.Status.ok, host.send_packet(host.context, Recorder.handle(), .player, .of(large), null, null));
+    @memset(&buffer, 0);
+    var packets = try rig.player.receive();
+    defer packets.deinit();
+    const packet = packets.next() orelse return error.MissingPacket;
+    const text = (try rig.player.session.decodePacket(packet)).value.typed.text;
+    try std.testing.expectEqualStrings(&message, text.body.message_only.message);
+    try std.testing.expect(packets.next() == null);
+}
+
+test "packet injection uses managed transport, skips listeners and preserves radius across transfers" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    Recorder.reset();
+    try plugins.add(Injector.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    try std.testing.expectEqual(@as(i32, @backingInt(abi.Status.too_late)), Injector.pregame.load(.acquire));
+    try injectPackets(&rig);
+    try std.testing.expectEqual(@as(u32, 0), Injector.from_player.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), Injector.from_backend.load(.acquire));
+    try rig.transfer(1);
+    try rig.waitFor(.transfers_committed, 1);
+    try rig.expectOn(&rig.b);
+    const status = Injector.transfer_status.load(.acquire);
+    try std.testing.expect(status == @backingInt(abi.Status.busy) or status == @backingInt(abi.Status.canceled));
+    try std.testing.expectEqual(@as(i32, 10), rig.b.requested_radius.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 11), rig.b.requested_max_radius.load(.acquire));
+    Injector.completed.store(0, .release);
+    try injectPackets(&rig);
+    try std.testing.expectEqual(@as(u32, 0), Injector.from_player.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), Injector.from_backend.load(.acquire));
 }
 
 test "passthrough refuses packet subscriptions" {

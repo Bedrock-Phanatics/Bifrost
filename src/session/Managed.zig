@@ -292,6 +292,20 @@ pub fn sendText(self: *Managed, ends: Ends, text: []const u8) !void {
     } })});
 }
 
+pub fn inject(self: *Managed, ends: Ends, target: abi.PacketTarget, packet: []const u8) !void {
+    if (!self.inGame() or self.hold != null or self.syncing) return error.NotInGame;
+    // Only Text and RequestChunkRadius reach here; neither contains entity IDs.
+    switch (target) {
+        .player => try self.sendToPlayer(ends, &.{packet}),
+        .backend => {
+            try self.upstream.send(self.upstreamContext(ends, ends.backend orelse return error.BackendClosed), &.{packet});
+            const kind = Current.packetKind((try protocol.packet.decode(packet, protocolLimits())).header.packet_id);
+            _ = try self.sentToBackend(kind, packet);
+        },
+        else => return error.InvalidTarget,
+    }
+}
+
 pub fn sendOutbox(self: *Managed, ends: Ends, outbox: *const Outbox) !void {
     var start: usize = 0;
     while (start < outbox.count()) {

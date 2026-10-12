@@ -28,7 +28,15 @@ private:
         if (host->decode_packet(host->context, packet, BIFROST_PACKET_TYPE_TEXT, &text, sizeof(text)) != BIFROST_STATUS_OK)
             return BIFROST_PACKET_CANCEL;
         if (text.message_type != BIFROST_TEXT_CHAT) return BIFROST_PACKET_PASS;
-        if (text.message.len > maxChatBytes) return BIFROST_PACKET_CANCEL;
+        if (text.message.len > maxChatBytes) {
+            text = {};
+            text.message_type = BIFROST_TEXT_RAW;
+            text.message = toStr("Chat messages are limited to 512 bytes.");
+            if (host->encode_packet(host->context, packet, BIFROST_PACKET_TYPE_TEXT, &text, sizeof(text)) == BIFROST_STATUS_OK)
+                (void)host->send_packet(host->context, packet->player, BIFROST_PACKET_TO_PLAYER,
+                    {packet->replacement, packet->replacement_len}, nullptr, nullptr);
+            return BIFROST_PACKET_CANCEL;
+        }
 
         uint8_t name[64];
         size_t length = 0;
@@ -57,7 +65,7 @@ private:
 }
 
 extern "C" BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin) noexcept {
-    if (host->abi_version != BIFROST_ABI_VERSION || !BIFROST_HOST_HAS(host, encode_packet)) return BIFROST_STATUS_INCOMPATIBLE;
+    if (host->abi_version != BIFROST_ABI_VERSION || !BIFROST_HOST_HAS(host, send_packet)) return BIFROST_STATUS_INCOMPATIBLE;
     plugin->name = toStr("PacketFilter");
     plugin->plugin_version = toStr("1.0.0");
     plugin->capabilities = BIFROST_CAPABILITY_PACKETS;

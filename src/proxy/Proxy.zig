@@ -211,6 +211,11 @@ fn findLink(self: *Proxy, id: u64) ?*Link {
     return null;
 }
 
+pub fn packet(self: *Proxy, link_id: u64, target: abi.PacketTarget, bytes: []const u8) abi.Status {
+    const link = self.findLink(link_id) orelse return .stale_handle;
+    return link.sendPacket(target, bytes);
+}
+
 fn routeTransfer(context: *anyopaque, link: u64, backend: u32) abi.Status {
     const self: *Proxy = @ptrCast(@alignCast(context));
     self.requestTransfer(link, .of(backend)) catch return .busy;

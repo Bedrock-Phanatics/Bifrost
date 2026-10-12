@@ -195,6 +195,8 @@ pub const TaskResult = extern struct {
 
 pub const TaskDoneFn = *const fn (user: ?*anyopaque, result: *const TaskResult) callconv(.c) void;
 
+pub const PacketTarget = enum(u32) { player, backend, _ };
+
 pub const EventFn = *const fn (user: ?*anyopaque, event: *const Event, decision: ?*TransferDecision) callconv(.c) void;
 
 pub const Host = extern struct {
@@ -221,6 +223,7 @@ pub const Host = extern struct {
     set_description: *const fn (context: *anyopaque, description: Str) callconv(.c) Status,
     decode_packet: *const fn (context: *anyopaque, packet: ?*const Packet, packet_type: PacketType, out: ?*anyopaque, capacity: usize) callconv(.c) Status,
     encode_packet: *const fn (context: *anyopaque, packet: ?*Packet, packet_type: PacketType, data: ?*const anyopaque, size: usize) callconv(.c) Status,
+    send_packet: *const fn (context: *anyopaque, player: Player, target: PacketTarget, bytes: Str, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
 
     pub fn has(self: *const Host, comptime field: std.meta.FieldEnum(Host)) bool {
         const name = @tagName(field);

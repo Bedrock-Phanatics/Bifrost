@@ -12,6 +12,7 @@ thread_local bifrost_chunk_radius radius;
 thread_local std::string encodedMessage;
 thread_local std::string encodedSource;
 thread_local bifrost_chunk_radius encodedRadius;
+thread_local std::string injectedMessage;
 
 struct Host {
     bifrost_packet_fn callbacks[2]{};
@@ -55,18 +56,25 @@ struct Host {
             }
             return BIFROST_STATUS_OK;
         };
-        result.encode_packet = [](void *context, bifrost_packet *, bifrost_packet_type type, const void *data, size_t size) noexcept -> bifrost_status {
+        result.encode_packet = [](void *context, bifrost_packet *packet, bifrost_packet_type type, const void *data, size_t size) noexcept -> bifrost_status {
             const auto status = static_cast<Host *>(context)->encodeStatus;
             if (status != BIFROST_STATUS_OK) return status;
             if (type == BIFROST_PACKET_TYPE_TEXT) {
                 CHECK(size == sizeof(text));
                 const auto &value = *static_cast<const bifrost_text *>(data);
                 encodedMessage.assign(reinterpret_cast<const char *>(value.message.ptr), value.message.len);
-                encodedSource.assign(reinterpret_cast<const char *>(value.source.ptr), value.source.len);
+                encodedSource.assign(value.source.len == 0 ? "" : reinterpret_cast<const char *>(value.source.ptr), value.source.len);
+                packet->replacement = reinterpret_cast<uint8_t *>(encodedMessage.data());
+                packet->replacement_len = encodedMessage.size();
             } else {
                 CHECK(type == BIFROST_PACKET_TYPE_CHUNK_RADIUS && size == sizeof(radius));
                 encodedRadius = *static_cast<const bifrost_chunk_radius *>(data);
             }
+            return BIFROST_STATUS_OK;
+        };
+        result.send_packet = [](void *, bifrost_player, bifrost_packet_target target, bifrost_str bytes, bifrost_task_done_fn done, void *) noexcept -> bifrost_status {
+            CHECK(target == BIFROST_PACKET_TO_PLAYER && done == nullptr);
+            injectedMessage.assign(reinterpret_cast<const char *>(bytes.ptr), bytes.len);
             return BIFROST_STATUS_OK;
         };
         return result;
@@ -100,6 +108,7 @@ int main() {
             message.push_back('x');
             text.message = toStr(message);
             CHECK(host.run(0, player) == BIFROST_PACKET_CANCEL);
+            CHECK(injectedMessage == "Chat messages are limited to 512 bytes.");
             text.message_type = BIFROST_TEXT_RAW;
             CHECK(host.run(0, player) == BIFROST_PACKET_PASS);
             radius = {8, 12};

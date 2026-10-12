@@ -8,6 +8,7 @@ pub const max_name_len = 64;
 pub const Route = struct {
     context: *anyopaque,
     worker: u32 = 0,
+    epoch: u64 = 0,
     link: u64,
     transfer: *const fn (context: *anyopaque, link: u64, backend: u32) abi.Status,
 };
@@ -76,6 +77,13 @@ pub fn route(self: *Handles, player: abi.Player) ?Route {
     defer self.leave();
     _, const slot = self.find(player) orelse return null;
     return slot.route;
+}
+
+pub fn invalidatePackets(self: *Handles, player: abi.Player) void {
+    self.enter();
+    defer self.leave();
+    _, const slot = self.find(player) orelse return;
+    slot.route.?.epoch +%= 1;
 }
 
 fn find(self: *Handles, player: abi.Player) ?struct { u32, *Slot } {

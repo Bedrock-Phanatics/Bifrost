@@ -125,6 +125,7 @@ BIFROST_EXPORT size_t bifrost_fixture_layout(uint64_t *out, size_t capacity) {
     FIELD(bifrost_host, set_description);
     FIELD(bifrost_host, decode_packet);
     FIELD(bifrost_host, encode_packet);
+    FIELD(bifrost_host, send_packet);
     SIZE(bifrost_plugin);
     FIELD(bifrost_plugin, struct_size);
     FIELD(bifrost_plugin, abi_version);

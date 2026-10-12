@@ -136,6 +136,20 @@ pub fn sendMessage(self: *Link, text: []const u8) !void {
     try managed.sendText(self.ends(session), text);
 }
 
+pub fn sendPacket(self: *Link, target: abi.PacketTarget, bytes: []const u8) abi.Status {
+    const managed = self.managed orelse return .unsupported;
+    const session = self.session orelse return .stale_handle;
+    if (self.transfer != null) return .busy;
+    if (self.backend == null or self.backend_closing or self.backend_error != null or !managed.inGame()) return .too_late;
+    managed.inject(self.ends(session), target, bytes) catch |err| {
+        if (err == error.NotInGame) return .too_late;
+        self.fail(err);
+        return .failed;
+    };
+    self.env.scheduler.schedule(self);
+    return .ok;
+}
+
 fn announce(self: *Link, identity: bedwire.Identity) void {
     self.announced = true;
     self.env.events.authenticated(self.player, identity.display_name, identity.xuid);

@@ -51,18 +51,21 @@ pub fn disconnected(self: Events, player: *abi.Player) void {
 
 pub fn backendSelected(self: Events, player: abi.Player, backend: usize) void {
     const plugins = self.live(player) orelse return;
+    plugins.handles.invalidatePackets(player);
     plugins.emit(&.{ .kind = .backend_selected, .player = player, .backend = @intCast(backend) }, null);
 }
 
 pub fn transferRequested(self: Events, player: abi.Player, from: usize, to: usize) abi.TransferDecision {
     var decision: abi.TransferDecision = .{};
     const plugins = self.live(player) orelse return decision;
+    plugins.handles.invalidatePackets(player);
     plugins.emit(&.{ .kind = .transfer_requested, .player = player, .from_backend = @intCast(from), .backend = @intCast(to) }, &decision);
     return decision;
 }
 
 pub fn transferEnded(self: Events, player: abi.Player, from: usize, to: usize, failure: abi.TransferFailure) void {
     const plugins = self.live(player) orelse return;
+    plugins.handles.invalidatePackets(player);
     plugins.emit(&.{
         .kind = if (failure == .none) .transfer_completed else .transfer_failed,
         .player = player,

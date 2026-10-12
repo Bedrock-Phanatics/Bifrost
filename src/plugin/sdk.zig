@@ -8,6 +8,7 @@ pub const TransferDecision = abi.TransferDecision;
 pub const Packet = abi.Packet;
 pub const Text = abi.Text;
 pub const ChunkRadius = abi.ChunkRadius;
+pub const PacketTarget = abi.PacketTarget;
 pub const Handler = fn (event: *const Event, decision: ?*TransferDecision) void;
 pub const PacketHandler = fn (packet: *Packet) abi.PacketAction;
 pub const Command = abi.Command;
@@ -94,6 +95,11 @@ pub const Host = struct {
 
     pub fn message(self: Host, player: Player, text: []const u8) Error!void {
         try check(self.raw.send_message(self.raw.context, player, .of(text)));
+    }
+
+    pub fn sendPacket(self: Host, player: Player, target: PacketTarget, bytes: []const u8, done: ?abi.TaskDoneFn, user: ?*anyopaque) Error!void {
+        if (!self.raw.has(.send_packet)) return error.Unsupported;
+        try check(self.raw.send_packet(self.raw.context, player, target, .of(bytes), done, user));
     }
 
     pub fn post(self: Host, player: Player, comptime done: fn (user: ?*anyopaque, result: *const TaskResult) void, user: ?*anyopaque) Error!void {
