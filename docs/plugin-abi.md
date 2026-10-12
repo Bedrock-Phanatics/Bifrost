@@ -24,7 +24,8 @@ startup. Bifrost refuses a plugin whose `abi_version` differs from `BIFROST_ABI_
 smaller than it knows, or that asks for a capability bit it doesn't know. It also refuses one that subscribes to
 events, hooks packets or registers commands without declaring `EVENTS`, `PACKETS` or `COMMANDS`, and `spawn_task`
 returns `UNSUPPORTED` without `TASKS`. Whatever a refused plugin registered is dropped with it. `spawn_task` and
-`post` also return `UNSUPPORTED` during `bifrost_plugin_init`, so no work can outlive a plugin that is then refused.
+`post` also return `UNSUPPORTED` until initialization, metadata validation and registration all succeed, including
+from `shutdown` when loading fails, so no queued callback can outlive a refused plugin.
 
 `name` (up to 64 bytes) and `plugin_version` (up to 64 bytes) are required and must be printable UTF-8: no control
 characters, and no `NULL` pointer with a non-zero length. A plugin can also call `set_description` with up to 256
