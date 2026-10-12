@@ -50,7 +50,7 @@ never inside it.
 
 | host function | where it may be called |
 |---|---|
-| `log`, `worker_count`, `backend_count`, `backend_name`, `player_name`, `send_message`, `post` | any thread |
+| `log`, `worker_count`, `backend_count`, `backend_name`, `player_name`, `send_message`, `send_packet`, `post` | any thread |
 | `transfer`, `spawn_task` | inside a callback Bifrost is running |
 | `subscribe`, `subscribe_packet`, `register_command`, `register_command_info`, `set_description` | inside `bifrost_plugin_init` |
 
@@ -144,7 +144,44 @@ phase. Native code must provide valid memory for every pointer and declared leng
 The Zig SDK exposes `host.decodePacket(packet, sdk.Text)` and `host.encodePacket(packet, text)`, also accepting
 `sdk.ChunkRadius`. Older hosts return `error.Unsupported` without reading missing function pointers.
 [`PacketFilter.cpp`](../examples/packets/PacketFilter.cpp) demonstrates raw access, lazy decoding, cancellation,
-and typed text replacement in C++23.
+typed text replacement and packet injection in C++23.
+
+### Packet injection
+
+Check `BIFROST_HOST_HAS(host, send_packet)` before calling
+`send_packet(context, player, target, bytes, done, user)`. The Zig SDK exposes
+`host.sendPacket(player, target, bytes, done, user)`. `target` is `BIFROST_PACKET_TO_PLAYER` or
+`BIFROST_PACKET_TO_BACKEND`, meaning that player's current backend connection. This requires `PACKETS` and
+managed mode, and is available from worker callbacks, task threads and plugin-owned threads after initialization.
+
+`bytes` is one complete packet with its canonical Bedrock header, at most 65536 bytes. Only Text in either
+direction and nonnegative RequestChunkRadius to the backend are supported. Both sub-client indices must be zero.
+Validation uses the managed session's `Current` protocol profile. Unsupported IDs, login/handshake/resource-pack
+packets and world/entity packets are refused. The supported packets contain no entity IDs to translate; backend
+radius injection also updates the radius Bifrost replays during transfers. Use protocol-zig to encode raw packets in Zig, or encode modified
+fields into a callback's replacement buffer in C++ before submitting it. Input bytes are copied before return.
+
+`OK` means accepted into the owning worker's FIFO queue, not delivered to the peer. A supplied `done` runs once
+with a `bifrost_task_result`: `OK` means the normal reliable-ordered channel-0 send accepted the packet;
+`STALE_HANDLE` means the player disconnected; `CANCELED` means a backend selection or transfer changed the route,
+the queue closed, or shutdown started; `BUSY` means a transfer is active; `TOO_LATE` means the session is not in
+game; `FAILED` means encoding or transport failed. Shutdown completions run before plugin shutdown with
+`worker == BIFROST_NO_WORKER`. Keep callback state alive until completion. Rejected submissions never call `done`.
+
+Submission returns `INVALID_ARGUMENT` for malformed packets, invalid targets or sizes, `UNSUPPORTED` for an
+unsupported packet, missing capability, passthrough mode or initialization, `STALE_HANDLE` for an expired player,
+`CANCELED` during shutdown or on a closed queue, `FAILED` on allocation failure, or `BUSY` when either bound is
+full. Injections share the 1024-item limit with messages and posts and have a separate 4 MiB copied-payload budget;
+reserved bytes and queue items are released on every delivery and failure path. Metadata is bounded by item count.
+
+The worker drains a snapshot of the queue after transfer requests and before its next network service. Calls
+accepted in queue order send in that order, after the current callback/batch has finished. Concurrent submitters
+have no ordering guarantee before queue insertion. A transfer cancels queued packets even if it is rejected or
+rolls back, so an old submission cannot reach a different backend. Delivery checks the live handle and route again.
+Injections use the session's normal batching, compression, encryption and reliable ordered transport and bypass
+packet listeners in both directions. There is no synchronous listener recursion. A completion may submit another
+packet; it waits for a later drain and remains subject to the same bounds. Responses from the backend traverse
+packet listeners normally.
 
 ### Command permissions
 

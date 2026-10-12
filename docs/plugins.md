@@ -98,13 +98,16 @@ client chat over 512 bytes, replaces chat authors with the player name Bifrost r
 maximum chunk radius at 12. Negative radius requests are canceled. Change the two constants to suit the server;
 these are example policies, not Bedrock protocol limits.
 
+Oversized chat also queues a raw Text warning to the player through `send_packet`. The warning bypasses packet
+listeners and is sent after the current callback finishes; a full queue simply drops the warning.
+
 The plugin subscribes to client Text in-game and RequestChunkRadius in any permitted phase. It decodes fields
-through the host API and only re-encodes packets that need changes. Message bodies and other text fields are
+through the host API and re-encodes changed packets and chat warnings. Forwarded message bodies and other text fields are
 preserved. Failed decoding, player-name lookup or encoding cancels the packet. Bifrost validates packet headers,
 direction, phase and size limits, and applies its normal compression/encryption and transfer handling.
 
 The plugin has no owned state, heap allocation or shutdown work. Each callback uses stack storage and borrowed
-packet fields; the callback's host pointer remains valid for the plugin's lifetime. Only changed packets use the
+packet fields; the callback's host pointer remains valid for the plugin's lifetime. Changed packets and warnings use the
 replacement buffer. The `packet-dispatch` benchmark measures raw-text and chat pass paths, including the actual
 player-name lookup. This example limits client requests; backend view-distance policy remains the backend's
 responsibility.
