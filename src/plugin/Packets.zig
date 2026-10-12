@@ -1,4 +1,5 @@
 const std = @import("std");
+const protocol = @import("bedwire").protocol;
 const abi = @import("abi.zig");
 const Work = @import("Work.zig");
 
@@ -164,7 +165,8 @@ pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch:
             .replace => {
                 clock = null;
                 const len = packet.replacement_len;
-                if (len == 0 or len > out.len or packetId(out[0..len]) != id or !checker.valid(out[0..len])) {
+                const header = if (len != 0 and len <= out.len) packetHeader(out[0..len]) else null;
+                if (header == null or header.? & (id_count - 1) != id or header != packetHeader(bytes) or !checker.valid(out[0..len])) {
                     metrics.add(.errors, 1);
                     continue;
                 }
@@ -179,12 +181,12 @@ pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch:
 }
 
 pub fn packetId(bytes: []const u8) ?u10 {
-    var value: u32 = 0;
-    for (bytes[0..@min(bytes.len, 5)], 0..) |byte, i| {
-        value |= @as(u32, byte & 0x7f) << @intCast(7 * i);
-        if (byte & 0x80 == 0) return @intCast(value & (id_count - 1));
-    }
-    return null;
+    return @intCast((packetHeader(bytes) orelse return null) & (id_count - 1));
+}
+
+fn packetHeader(bytes: []const u8) ?u14 {
+    const envelope = protocol.packet.decode(bytes, .{ .max_packet_bytes = @max(bytes.len, 1) }) catch return null;
+    return @bitCast(envelope.header);
 }
 
 pub fn warnSlow(metrics: *Metrics, name: []const u8, elapsed_ns: u64, io: std.Io, comptime what: []const u8, args: anytype) void {
@@ -199,6 +201,20 @@ pub fn now(io: std.Io) u64 {
 }
 
 const testing = std.testing;
+
+test "packet ids use canonical bounded protocol headers" {
+    var buffer: [8]u8 = undefined;
+    for (0..0x4000) |value| {
+        var writer = protocol.Writer.init(&buffer);
+        try writer.writeVarU32(@intCast(value));
+        try testing.expectEqual(@as(?u10, @intCast(value & (id_count - 1))), packetId(writer.written()));
+    }
+    const malformed = [_][]const u8{
+        &.{},                   &.{0x80},                           &.{ 0x85, 0x00 },                   &.{ 0x80, 0x80, 0x01 },
+        &.{ 0xff, 0xff, 0x7f }, &.{ 0x85, 0x80, 0x80, 0x80, 0x10 }, &.{ 0xff, 0xff, 0xff, 0xff, 0xff },
+    };
+    for (malformed) |bytes| try testing.expectEqual(@as(?u10, null), packetId(bytes));
+}
 
 const AllValid = struct {
     fn valid(_: AllValid, bytes: []const u8) bool {
@@ -245,6 +261,18 @@ const Script = struct {
 
     fn unterminated(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
         return write(user, packet, &.{0x85});
+    }
+
+    fn noncanonical(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        return write(user, packet, &.{ 0x85, 0x00, 0xaa });
+    }
+
+    fn overflow(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        return write(user, packet, &.{ 0x85, 0x80, 0x80, 0x80, 0x10, 0xaa });
+    }
+
+    fn reroute(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        return write(user, packet, &.{ 0x85, 0x08, 0xaa });
     }
 
     fn empty(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
@@ -425,4 +453,51 @@ test "subscribers run only in their phase, and validation is decoded once per pa
     var before: Table = try .build(gpa, .from_player, &.{.{ .direction = .from_player, .id = 5, .subscriber = phased(Script.pass, 1, .before_game, false, &metrics) }});
     defer before.deinit(gpa);
     try testing.expect(!before.in_game);
+}
+
+test "invalid replacement headers preserve the packet and its cached validation" {
+    const gpa = testing.allocator;
+    var metrics: [1]Metrics = .{.{}};
+    var table: Table = try .build(gpa, .from_player, &.{
+        .{ .direction = .from_player, .id = 5, .subscriber = phased(Script.pass, 1, .any, true, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.noncanonical, 2, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.overflow, 3, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.reroute, 4, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = phased(Script.pass, 5, .any, true, &metrics) },
+    });
+    defer table.deinit(gpa);
+    const scratch = try gpa.alloc(u8, scratch_bytes);
+    defer gpa.free(scratch);
+    const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+    var checks: u32 = 0;
+    Script.log_len = 0;
+    try testing.expectEqual(Result.pass, runBytes(&table, call, &.{ 0x05, 0xaa }, scratch, Counted{ .calls = &checks }));
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, Script.take());
+    try testing.expectEqual(@as(u32, 1), checks);
+    try testing.expectEqual(@as(u64, 3), metrics[0].errors.load(.monotonic));
+}
+
+test "replacement chains preserve split-screen headers at the capacity boundary" {
+    const gpa = testing.allocator;
+    var metrics: [1]Metrics = .{.{}};
+    var table: Table = try .build(gpa, .from_player, &.{
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.append, 1, &metrics) },
+        .{ .direction = .from_player, .id = 5, .subscriber = testSubscriber(Script.append, 2, &metrics) },
+    });
+    defer table.deinit(gpa);
+    const scratch = try gpa.alloc(u8, scratch_bytes);
+    defer gpa.free(scratch);
+    const bytes = try gpa.alloc(u8, max_replacement - 2);
+    defer gpa.free(bytes);
+    @memset(bytes, 0xaa);
+    bytes[0] = 0x85;
+    bytes[1] = 0x68;
+    const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+    Script.log_len = 0;
+    const result = runBytes(&table, call, bytes, scratch, AllValid{}).replace;
+    try testing.expectEqual(@as(usize, max_replacement), result.len);
+    try testing.expectEqualSlices(u8, bytes, result[0..bytes.len]);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, result[bytes.len..]);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, Script.take());
+    try testing.expectEqual(@as(u64, 0), metrics[0].errors.load(.monotonic));
 }

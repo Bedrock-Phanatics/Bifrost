@@ -295,3 +295,45 @@ Nothing regressed beyond run-to-run noise once the handshake limit was lifted. J
 are about a quarter below the old baseline and churn varies more between rounds; both runs logged thousands of
 kernel UDP drops (`net.core.rmem_max` is 208 KiB here), which likely explains the spread. Second waves of 500
 and 2000 players occasionally join nobody for the same reason.
+
+## Plugin packet header and milestone checks
+
+Recorded 2026-10-12 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast,
+`zig build bench -Doptimize=ReleaseFast -- plugins --quick`. Both builds use the same alternating text/raw
+stream. Dispatch figures are medians of seven samples, each processing 200 x 4096 packets. Relay figures are
+medians of three 500 ms samples after a 300 ms warmup. The final run had no other Bifrost builds or tests running.
+
+| dispatch setup | before, ns/packet | after, ns/packet |
+|---|---|---|
+| no plugins | 0.6 | 0.5 |
+| 10 plugins without packet subscriptions | 0.5 | 0.5 |
+| one raw listener | 33.3 | 30.0 |
+| one validated listener | 56.4 | 53.6 |
+| 10 listeners on different IDs | 64.5 | 58.2 |
+| 10 listeners on the hot ID | 175.8 | 155.8 |
+| before-game listener while in game | 2.3 | 0.5 |
+| one replacement | 64.2 | 57.4 |
+| two chained replacements | 115.3 | 106.7 |
+
+The phase mismatch now skips header parsing by selecting the table once per batch. Other differences do not
+establish a speedup: clock costs and machine load vary between runs. Canonical header validation and preserving
+both sub-client indices stayed within the existing dispatch budgets. Header parsing and phase filtering introduce
+no allocator calls or packet copies; accepted replacements retain their existing arena copy.
+
+| managed relay setup | before, round trips/s | after, round trips/s | before/after p50 us | before/after p99 us |
+|---|---|---|---|---|
+| one raw listener, 1x1 | 2364 | 2346 | 359 / 359 | 654 / 650 |
+| one raw listener, 8x32 | 7502 | 7442 | 28774 / 29621 | 93157 / 92550 |
+| one replacement, 1x1 | 2412 | 2432 | 355 / 352 | 716 / 686 |
+| one replacement, 8x32 | 7998 | 7628 | 28059 / 28687 | 76706 / 81138 |
+
+Heap snapshots were unchanged in every setup: 16.6 MiB for a fresh proxy and 252.5 KiB per joined managed player,
+except 268.5 KiB with subscriptions on 10 different IDs. These are snapshots after joining, before relay load;
+they are not peak-memory measurements. Windows CPU and RSS measurements are unavailable, so reported zeros
+must not be interpreted as measurements. Linux performance remains unverified for this change.
+
+Verification: the 66 plugin unit/integration tests and the delivered-packet milestone regression passed in Debug,
+ReleaseSafe and ReleaseFast, using the testing allocator. Formatting, whitespace checks, and the ReleaseSafe
+proxy and native examples build passed. The regression cases cover all 16384 valid headers, malformed varints,
+replacement validation reuse, split-screen routing, the 64 KiB replacement boundary, spawn cancellation, and
+container cleanup after cancellation and transfer.

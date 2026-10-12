@@ -62,6 +62,7 @@ the proxy down.
 ```sh
 zig build test                        # unit and integration tests
 zig build test -Doptimize=ReleaseSafe
+zig build test -Dtest-filter=plugins  # focus on named tests
 ```
 
 | path | contents |

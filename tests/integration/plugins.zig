@@ -464,6 +464,100 @@ test "proxy state and transfers follow what plugins let through, not what the ot
     try std.testing.expect(!rig.a.cache_supported.load(.acquire) and !rig.b.cache_supported.load(.acquire));
 }
 
+const StateHook = struct {
+    var block_spawn: std.atomic.Value(bool) = .init(false);
+    var before_game: std.atomic.Value(u32) = .init(0);
+    var in_game: std.atomic.Value(u32) = .init(0);
+
+    fn init(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+        plugin.name = .of("state-hook");
+        plugin.plugin_version = .of("1");
+        plugin.capabilities = .{ .packets = true };
+        const Current = bedwire.protocol.Current;
+        const subscriptions = .{
+            .{ Current.packetId(.set_local_player_as_initialised).?, abi.PacketPhase.before_game, spawn },
+            .{ Current.packetId(.container_close).?, abi.PacketPhase.any, cancel },
+            .{ managed.game_packet_id, abi.PacketPhase.before_game, before },
+            .{ managed.game_packet_id, abi.PacketPhase.in_game, after },
+        };
+        inline for (subscriptions) |subscription| {
+            const status = host.subscribe_packet(host.context, .from_player, subscription[0], subscription[1], .{}, subscription[2], null);
+            if (status != .ok) return status;
+        }
+        return .ok;
+    }
+
+    fn spawn(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
+        return if (block_spawn.load(.acquire)) .cancel else .pass;
+    }
+
+    fn cancel(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
+        return .cancel;
+    }
+
+    fn before(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
+        _ = before_game.fetchAdd(1, .release);
+        return .pass;
+    }
+
+    fn after(_: ?*anyopaque, _: *abi.Packet) callconv(.c) abi.PacketAction {
+        _ = in_game.fetchAdd(1, .release);
+        return .pass;
+    }
+};
+
+test "canceling a spawn milestone preserves the packet listener phase until it is delivered" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    StateHook.block_spawn.store(false, .release);
+    StateHook.before_game.store(0, .release);
+    StateHook.in_game.store(0, .release);
+    try plugins.add(StateHook.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+
+    const next_player = try managed.Player.connect(io, rig.running.address(), 3);
+    rig.player.destroy();
+    rig.player = next_player;
+    try rig.player.login("Steve", "2535400000000001");
+    StateHook.block_spawn.store(true, .release);
+    defer StateHook.block_spawn.store(false, .release);
+    try rig.player.spawn();
+    const before = StateHook.before_game.load(.acquire);
+    const after = StateHook.in_game.load(.acquire);
+    try rig.player.echo("before spawn");
+    try std.testing.expectEqual(before + 1, StateHook.before_game.load(.acquire));
+    try std.testing.expectEqual(after, StateHook.in_game.load(.acquire));
+
+    StateHook.block_spawn.store(false, .release);
+    var buffer: [16]u8 = undefined;
+    try rig.player.send(&.{try managed.typedPacket(&buffer, .{ .set_local_player_as_initialised = .{ .player_id = 1 } })});
+    try rig.player.echo("after spawn");
+    try std.testing.expectEqual(before + 1, StateHook.before_game.load(.acquire));
+    try std.testing.expectEqual(after + 1, StateHook.in_game.load(.acquire));
+}
+
+test "a canceled container close is still cleaned up during transfer" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    StateHook.block_spawn.store(false, .release);
+    try plugins.add(StateHook.init, null);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    var buffer: [16]u8 = undefined;
+    try rig.player.send(&.{try managed.rawPacket(&buffer, managed.game_packet_id, "scene")});
+    try rig.pumpUntil(rig.player, Filter.shown);
+    try std.testing.expectEqual(@as(usize, 1), rig.player.received(.container_open));
+    try rig.player.send(&.{try managed.typedPacket(&buffer, .{ .container_close = .{ .container_id = 3, .container_type = 0, .server_initiated_close = false } })});
+    try rig.expectOn(&rig.a);
+    try rig.transfer(1);
+    try rig.waitFor(.transfers_committed, 1);
+    try rig.expectOn(&rig.b);
+    try std.testing.expectEqual(@as(usize, 1), rig.player.received(.container_close));
+}
+
 test "passthrough refuses packet subscriptions" {
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{ .packets = false });
     defer plugins.deinit();

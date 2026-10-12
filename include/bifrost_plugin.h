@@ -137,7 +137,7 @@ enum {
     BIFROST_PACKET_REPLACE = 2,
 };
 
-/* Whole packets, header included, for both bytes and the replacement */
+/* Whole packets, header included. Replacements preserve the packet ID and both sub-client indices. */
 typedef struct bifrost_packet {
     uint32_t struct_size;
     bifrost_direction direction;

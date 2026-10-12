@@ -179,8 +179,11 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![std.enums.val
         var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{ .slow_callback_ns = std.math.maxInt(u64) });
         defer plugins.deinit();
         try load(&plugins, setup, text_packet_id);
-        const table = plugins.packetTable(.from_player);
+        var table = plugins.packetTable(.from_player);
         const call: Packets.Call = .{ .io = io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+        if (call.in_game) if (table) |hooks| {
+            if (!hooks.in_game) table = null;
+        };
 
         var samples: [7]f64 = undefined;
         for (&samples) |*sample_ns| {

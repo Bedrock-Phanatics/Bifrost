@@ -38,6 +38,7 @@ test {
     _ = @import("content/registries.zig");
     _ = @import("content/packs.zig");
     _ = @import("session/ClientState.zig");
+    _ = Managed;
     _ = @import("transfer/Handoff.zig");
     _ = @import("session/self_id.zig");
     _ = @import("session/commands.zig");

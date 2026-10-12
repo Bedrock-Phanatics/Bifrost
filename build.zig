@@ -136,14 +136,15 @@ fn installPackage(ctx: Context, library: *std.Build.Step.Compile, dir: []const u
 
 fn addTests(ctx: Context, plugin: Plugin) void {
     const b = ctx.b;
-    const unit_tests = b.addTest(.{ .root_module = ctx.bifrost });
+    const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run tests whose names contain this text")) |filter| &.{filter} else &.{};
+    const unit_tests = b.addTest(.{ .root_module = ctx.bifrost, .filters = filters });
     const integration_tests = b.addTest(.{ .root_module = ctx.module("tests/root.zig", &.{
         .{ .name = "bifrost", .module = ctx.bifrost },
         .{ .name = "raknet", .module = ctx.raknet },
         .{ .name = "bedwire", .module = ctx.bedwire },
         .{ .name = "zio", .module = ctx.zio },
         .{ .name = "bifrost_plugin_h", .module = plugin.header },
-    }) });
+    }), .filters = filters });
     integration_tests.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
     const options = b.addOptions();
     options.addOption(bool, "report", b.option(bool, "transfer-report", "Print transfer stress timings and memory") orelse false);

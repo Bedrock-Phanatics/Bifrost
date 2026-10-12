@@ -192,8 +192,12 @@ fn idSwap(self: *const Managed) ?self_id.Swap {
 }
 
 fn newBatch(self: *Managed, ends: Ends, to_player: bool) Batch {
-    const hooks = self.shared.hooks orelse return .{ .managed = self, .ends = ends, .to_player = to_player };
-    return .{ .managed = self, .ends = ends, .to_player = to_player, .table = hooks.plugins.packetTable(if (to_player) .from_backend else .from_player) };
+    var batch: Batch = .{ .managed = self, .ends = ends, .to_player = to_player };
+    const hooks = self.shared.hooks orelse return batch;
+    if (hooks.plugins.packetTable(if (to_player) .from_backend else .from_player)) |table| {
+        if (self.player.state != .in_game or table.in_game) batch.table = table;
+    }
+    return batch;
 }
 
 const Batch = struct {
@@ -300,15 +304,22 @@ fn sentToPlayer(self: *Managed, kind: ?bedwire.PacketKind, packet: []const u8) !
     };
 }
 
-fn sentToBackend(self: *Managed, kind: ?bedwire.PacketKind, packet: []const u8) !void {
-    switch (kind orelse return) {
+fn sentToBackend(self: *Managed, kind: ?bedwire.PacketKind, packet: []const u8) !?bedwire.State {
+    switch (kind orelse return null) {
         .request_chunk_radius => {
             const request = try typed(try decode(packet), .request_chunk_radius);
             self.chunk_radius = .{ .radius = request.chunk_radius, .max = request.max_chunk_radius };
         },
         .client_cache_status => self.cache_supported = (try typed(try decode(packet), .client_cache_status)).is_cache_supported,
+        .container_close => self.client_state.containerClosed(),
+        .resource_pack_client_response => {
+            const response = try typed(try decode(packet), .resource_pack_client_response);
+            return if (response.response == .resource_pack_stack_finished) .waiting_for_start_game else null;
+        },
+        .set_local_player_as_initialised => return if (self.player.state == .spawn_ready) .in_game else null,
         else => {},
     }
+    return null;
 }
 
 fn decode(packet: []const u8) !protocol.BorrowedEnvelope {
@@ -408,12 +419,14 @@ pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
         .logged_in => {
             defer self.early.clear(self.gpa);
             var batch = self.newBatch(ends, false);
+            var next_state: ?bedwire.State = null;
             for (self.early.items()) |bytes| {
                 const kind = Current.packetKind(Packets.packetId(bytes) orelse return error.MalformedBatch);
                 const sent = try batch.add(kind, bytes) orelse continue;
-                try self.sentToBackend(kind, sent);
+                if (try self.sentToBackend(kind, sent)) |state| next_state = state;
             }
             try batch.flush();
+            if (next_state) |state| try self.advance(state);
         },
     }
 }
@@ -476,14 +489,12 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
             .player_auth_input, .move_player => continue,
             else => {},
         };
-        if (packet.kind == .container_close) self.client_state.containerClosed();
-        if (try self.playerMilestone(packet)) |state| next_state = state;
         if (self.upstream.phase != .ready) {
             try self.early.push(self.gpa, packet.bytes);
             continue;
         }
         const sent = try batch.add(packet.kind, packet.bytes) orelse continue;
-        try self.sentToBackend(packet.kind, sent);
+        if (try self.sentToBackend(packet.kind, sent)) |state| next_state = state;
     }
     try batch.flush();
     if (next_state) |state| try self.advance(state);
@@ -531,9 +542,9 @@ fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets
             try hold.push(self.gpa, bytes);
             continue;
         }
-        if (packet.kind == .start_game) start_game = true;
         if (self.player.state == .resource_packs) try self.capturePacks(packet);
-        _ = try batch.add(packet.kind, bytes);
+        _ = try batch.add(packet.kind, bytes) orelse continue;
+        if (packet.kind == .start_game) start_game = true;
     }
     try batch.flush();
     if (start_game) try self.advance(.spawn_ready);
@@ -553,17 +564,6 @@ fn capturePacks(self: *Managed, packet: BackendSession.Packet) !void {
         .resource_packs_info => self.initial_packs.info = try packs.infoHash(try typed(try self.upstream.session.decodePacket(packet), .resource_packs_info)),
         .resource_pack_stack => self.initial_packs.stack = try packs.stackHash(try typed(try self.upstream.session.decodePacket(packet), .resource_pack_stack)),
         else => {},
-    }
-}
-
-fn playerMilestone(self: *Managed, packet: PlayerSession.Packet) !?bedwire.State {
-    switch (packet.kind orelse return null) {
-        .resource_pack_client_response => {
-            const response = try typed(try self.player.decodePacket(packet), .resource_pack_client_response);
-            return if (response.response == .resource_pack_stack_finished) .waiting_for_start_game else null;
-        },
-        .set_local_player_as_initialised => return if (self.player.state == .spawn_ready) .in_game else null,
-        else => return null,
     }
 }
 
@@ -623,4 +623,24 @@ fn clientData(gpa: std.mem.Allocator, login: @FieldType(protocol.typed.Packet, "
     errdefer gpa.free(json);
     decoder.decode(json, encoded) catch return error.InvalidClaims;
     return json;
+}
+
+test "player milestones and container tracking use the delivered packet" {
+    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = undefined, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    managed.player.state = .resource_packs;
+    var buffer: [32]u8 = undefined;
+    const downloading = try encodeTyped(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .downloading_finished = "" } } });
+    try std.testing.expectEqual(@as(?bedwire.State, null), try managed.sentToBackend(.resource_pack_client_response, downloading));
+    const finished = try encodeTyped(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .resource_pack_stack_finished = "" } } });
+    try std.testing.expectEqual(@as(?bedwire.State, .waiting_for_start_game), try managed.sentToBackend(.resource_pack_client_response, finished));
+    try std.testing.expectError(error.EndOfStream, managed.sentToBackend(.resource_pack_client_response, finished[0..1]));
+
+    const spawned = try encodeTyped(&buffer, .{ .set_local_player_as_initialised = .{ .player_id = 1 } });
+    try std.testing.expectEqual(@as(?bedwire.State, null), try managed.sentToBackend(.set_local_player_as_initialised, spawned));
+    managed.player.state = .spawn_ready;
+    try std.testing.expectEqual(@as(?bedwire.State, .in_game), try managed.sentToBackend(.set_local_player_as_initialised, spawned));
+    managed.client_state.container = .{ .id = 1, .kind = 0 };
+    const closed = try encodeTyped(&buffer, .{ .container_close = .{ .container_id = 1, .container_type = 0, .server_initiated_close = false } });
+    try std.testing.expectEqual(@as(?bedwire.State, null), try managed.sentToBackend(.container_close, closed));
+    try std.testing.expectEqual(null, managed.client_state.container);
 }
