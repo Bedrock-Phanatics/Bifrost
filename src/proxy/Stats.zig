@@ -34,6 +34,7 @@ managed_relayed_bytes: u64 = 0,
 managed_decoded_batches: u64 = 0,
 managed_decoded_bytes: u64 = 0,
 managed_relay_incompatible: u64 = 0,
+session_memory_bytes: u64 = 0,
 
 // Only the worker writes these, so a plain atomic store is enough
 pub fn bump(self: *Stats, comptime field: std.meta.FieldEnum(Stats), amount: u64) void {

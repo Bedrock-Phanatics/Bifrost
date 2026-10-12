@@ -494,3 +494,20 @@ binaries. The driver stops and joins its proxy worker task if stats collection o
 platform counters propagate an error; unsupported injection CPU/resident fields print `null`. Formatting and
 whitespace checks passed. Linux runtime counters, macOS counters, injection network throughput and callback tail
 latency remain unmeasured in this batch.
+
+## Session memory snapshots
+
+The benchmark now reads session memory from Bifrost's atomic stats. Each owning worker publishes its listener
+quota after a turn and during shutdown; the previous atomic read raced with RakNet's non-atomic quota writes.
+Session and total heap samples can represent different instants. This change adds no locks or allocations.
+
+On Windows x86_64, `zig build bench -Doptimize=ReleaseFast -- connections --quick` completed both waves at
+100 and 500 players with every player joined. Session memory was 86.4 KiB/player at both sizes. Three reconnect
+churn rounds had zero failed operations and the same 4,657,709 B live heap after each round. These figures do not
+establish a throughput improvement or prove the absence of all leaks; retained allocator pages and listener table
+capacity remain distinct from live per-player allocations.
+
+The lifecycle regression checks two connect/disconnect cycles and exact quota equality after worker shutdown.
+It passed in Debug, ReleaseSafe and ReleaseFast. The full ReleaseSafe suite passed 231 tests with three platform
+skips, and both Linux ReleaseFast benchmark binaries compiled. Linux runtime and multi-worker network behavior
+were not exercised in this batch. Formatting and whitespace checks passed.

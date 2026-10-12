@@ -120,6 +120,33 @@ test "create cleans up after allocation failures" {
     }.run, .{});
 }
 
+test "session memory snapshots follow worker-owned allocations" {
+    var backend: Backend = undefined;
+    try backend.start(io, .{});
+    defer backend.deinit();
+    var running: Running = undefined;
+    try running.start(io, try fixtures.config(&.{backend.address()}), .{});
+    defer running.deinit();
+
+    for (0..2) |round| {
+        var player: Player = try .connect(io, running.address());
+        defer player.deinit();
+        try player.roundTrip("\xfehello");
+        const held = running.proxy.stats.snapshot().session_memory_bytes;
+        try std.testing.expect(held > 0);
+        player.client.close();
+        try player.awaitClosed();
+        try running.waitForStat(.links_closed, round + 1);
+        for (0..500) |_| {
+            if (running.proxy.stats.snapshot().session_memory_bytes < held) break;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        } else return error.WaitTimedOut;
+    }
+
+    running.stop();
+    try std.testing.expectEqual(running.proxy.listener.session_quota.used_bytes, running.stats().session_memory_bytes);
+}
+
 test "a leaving player's last packets still reach the backend" {
     var backend: Backend = undefined;
     try backend.start(io, .{});

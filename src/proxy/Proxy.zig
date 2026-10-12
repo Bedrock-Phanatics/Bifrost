@@ -240,6 +240,7 @@ pub fn run(self: *Proxy) void {
 }
 
 fn turn(self: *Proxy) void {
+    defer @atomicStore(u64, &self.stats.session_memory_bytes, self.listener.session_quota.used_bytes, .monotonic);
     self.listener_watch.arm(self.io, self.listener, self.scheduler.wakeNotify()) catch |err| {
         log.err("listener watch failed: {t}", .{err});
         return self.stop();
@@ -352,6 +353,7 @@ fn onDisconnected(context: *anyopaque, session: *raknet.Session) void {
 }
 
 fn closeAll(self: *Proxy) void {
+    defer @atomicStore(u64, &self.stats.session_memory_bytes, self.listener.session_quota.used_bytes, .monotonic);
     self.listener_watch.cancel(self.io);
     self.listener.close();
     while (self.links.popFirst()) |node| {

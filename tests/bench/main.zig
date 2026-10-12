@@ -246,14 +246,13 @@ fn snapshot(io: std.Io, workers: *bifrost.Workers, heap: *const harness.Counting
         .handshakes = totals.handshakes_observed,
         .gave_up = totals.observer_gave_up,
         .heap_bytes = heap.live.load(.monotonic),
+        .session_bytes = totals.session_memory_bytes,
         .relayed = totals.managed_relayed_batches,
         .decoded = totals.managed_decoded_batches,
         .workers = workers.proxies.len,
     };
     for (workers.proxies, 0..) |proxy, i| {
         result.per_worker[i] = proxy.stats.snapshot().sessions_accepted;
-        // Racy read of a worker-owned counter, fine for a stats sample
-        result.session_bytes += @atomicLoad(usize, &proxy.listener.session_quota.used_bytes, .monotonic);
     }
     return result;
 }
@@ -1138,7 +1137,8 @@ fn connectionsScenario(env: *Env) !void {
     try env.out.print(
         \\
         \\Memory per held player, first wave vs the fresh proxy. Heap is live bytes through Bifrost's allocator; RakNet session
-        \\is the listener's session quota; the rest of the heap is the backend RakNet client, Link, Tap and pending queue.
+        \\is the listener's session quota, published after each worker turn; the rest of the heap is the backend RakNet client,
+        \\Link, Tap and pending queue. Heap and session samples can represent different instants.
         \\RSS stays near its peak after players leave because the allocator keeps freed pages; heap after leave shows what is
         \\really still allocated.
         \\
