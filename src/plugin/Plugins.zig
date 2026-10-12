@@ -525,11 +525,12 @@ fn from(context: *anyopaque) *Loaded {
 fn hostLog(context: *anyopaque, level: abi.LogLevel, message: abi.Str) callconv(.c) void {
     const loaded = from(context);
     const text = message.slice();
+    const name = if (loaded.ready.load(.acquire)) loaded.label() else "";
     switch (level) {
-        .err => log.err("{s}: {s}", .{ loaded.label(), text }),
-        .warn => log.warn("{s}: {s}", .{ loaded.label(), text }),
-        .info => log.info("{s}: {s}", .{ loaded.label(), text }),
-        else => log.debug("{s}: {s}", .{ loaded.label(), text }),
+        .err => log.err("{s}: {s}", .{ name, text }),
+        .warn => log.warn("{s}: {s}", .{ name, text }),
+        .info => log.info("{s}: {s}", .{ name, text }),
+        else => log.debug("{s}: {s}", .{ name, text }),
     }
 }
 
@@ -622,7 +623,7 @@ fn hostSpawnTask(context: *anyopaque, player: abi.Player, run: ?abi.TaskFn, done
     const loaded = from(context);
     const owner = loaded.owner;
     if (!Work.hosted) return .wrong_thread;
-    if (!loaded.plugin.capabilities.tasks or owner.initializing.load(.acquire) == loaded) return .unsupported;
+    if (!loaded.ready.load(.acquire) or !loaded.plugin.capabilities.tasks) return .unsupported;
     const pool = owner.pool orelse return .unsupported;
     const run_fn = run orelse return .invalid_argument;
     const done_fn = done orelse return .invalid_argument;
@@ -672,7 +673,7 @@ fn hostPost(context: *anyopaque, player: abi.Player, callback: ?abi.TaskDoneFn, 
     const loaded = from(context);
     const owner = loaded.owner;
     const done = callback orelse return .invalid_argument;
-    if (owner.initializing.load(.acquire) == loaded) return .unsupported;
+    if (!loaded.ready.load(.acquire)) return .unsupported;
     const route = owner.handles.route(player) orelse return .stale_handle;
     if (route.worker >= owner.queues.len) return .invalid_argument;
     if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
@@ -748,6 +749,67 @@ fn hostTransfer(context: *anyopaque, player: abi.Player, backend: u32) callconv(
 }
 
 const testing = std.testing;
+
+test "a rejected plugin cannot queue callbacks during load cleanup" {
+    const Rejected = struct {
+        var current: *@This() = undefined;
+        host: abi.Host = undefined,
+        player: abi.Player,
+        status: abi.Status = .failed,
+        task_status: abi.Status = .failed,
+        shutdowns: usize = 0,
+        callbacks: usize = 0,
+
+        fn init(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+            current.host = host.*;
+            host.log(host.context, .warn, .of("logging before publication"));
+            plugin.abi_version = abi.version + 1;
+            plugin.name = .of("rejected-post");
+            plugin.plugin_version = .of("1");
+            plugin.capabilities.tasks = true;
+            plugin.state = current;
+            plugin.shutdown = stop;
+            return .ok;
+        }
+
+        fn stop(state: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(state.?));
+            self.shutdowns += 1;
+            self.status = self.host.post(self.host.context, self.player, done, self);
+            self.task_status = self.host.spawn_task(self.host.context, self.player, null, null, self);
+            self.host.log(self.host.context, .warn, .of("logging during rejected-load cleanup"));
+        }
+
+        fn done(state: ?*anyopaque, _: *const abi.TaskResult) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(state.?));
+            self.callbacks += 1;
+        }
+    };
+    const outer = Work.enter();
+    defer Work.hosted = outer;
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .task_threads = 1 });
+    defer plugins.deinit();
+    try plugins.startPool();
+    var context: u8 = 0;
+    var rejected: Rejected = .{ .player = try plugins.handles.acquire(testing.allocator, .{ .context = &context, .link = 1, .transfer = routedTransfer }) };
+    Rejected.current = &rejected;
+    try testing.expectError(error.IncompatiblePlugin, plugins.add(Rejected.init, null));
+    try testing.expectEqual(@as(usize, 1), rejected.shutdowns);
+    try testing.expectEqual(abi.Status.unsupported, rejected.status);
+    try testing.expectEqual(abi.Status.unsupported, rejected.task_status);
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), plugins.loaded.items.len);
+    try testing.expectEqual(@as(?*Loaded, null), plugins.initializing.load(.acquire));
+    plugins.drain(0, testing.io, null);
+    try testing.expectEqual(@as(usize, 0), rejected.callbacks);
+    Probe.reset();
+    try plugins.add(Probe.first, null);
+    const host = Probe.seen_host.?;
+    host.log(host.context, .warn, .of("logging after publication"));
+    try testing.expectEqual(abi.Status.ok, host.post(host.context, rejected.player, Rejected.done, &rejected));
+    plugins.drain(0, testing.io, null);
+    try testing.expectEqual(@as(usize, 1), rejected.callbacks);
+}
 
 const Probe = struct {
     var shutdowns: [32]u8 = undefined;
