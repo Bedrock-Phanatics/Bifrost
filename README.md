@@ -41,11 +41,13 @@ Bifrost answers each target's pack negotiation itself. `"match"` also refuses ta
 
 ## Plugins
 
-Native plugins are shared libraries listed under `[[plugin]] path = "..."`. They load at startup, in order, and
+Native plugins are compiled shared libraries, each in its own package directory under `plugins/` with a
+`plugin.toml` naming it ([`docs/plugins.md`](docs/plugins.md)). They load at startup in directory name order and
 unload in reverse once every worker has stopped. A plugin exports `bifrost_plugin_init` and talks to Bifrost only
 through the C ABI in [`include/bifrost_plugin.h`](include/bifrost_plugin.h); Zig plugins can use the `bifrost_plugin`
-module instead. [`examples/maintenance.zig`](examples/maintenance.zig) is built with `zig build` and keeps players
-off any backend named `maintenance`.
+module instead. `zig build` packages two examples into `zig-out/plugins/`:
+[`examples/maintenance.zig`](examples/maintenance.zig) keeps players off any backend named `maintenance`, and
+[`examples/greeter/Greeter.cpp`](examples/greeter/Greeter.cpp) is a C++23 plugin that logs a welcome.
 
 Plugins get lifecycle and transfer events, can cancel or redirect a transfer before it starts, and can request
 transfers themselves. In managed mode they can also hook individual packets (pass, cancel or replace), register
@@ -65,7 +67,7 @@ zig build test -Doptimize=ReleaseSafe
 | path | contents |
 |---|---|
 | `src/` | the proxy, one folder per subsystem |
-| `include/`, `examples/` | the plugin C header and an example plugin |
+| `include/`, `examples/` | the plugin C header and example plugins |
 | `tests/integration/` | end-to-end tests against real RakNet peers |
 | `tests/support/` | fake players, backends and fixtures shared by tests and benchmarks |
 | `tests/bench/` | the benchmark suite and its baseline |

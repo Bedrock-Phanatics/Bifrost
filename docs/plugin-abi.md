@@ -16,7 +16,8 @@ an exception that escapes anyway calls `std::terminate` instead of unwinding thr
 
 ## Loading
 
-`bifrost_plugin_init(host, plugin)` is called once, on the main thread, before any player connects. Fill in
+Plugins are loaded from packages: a directory with a `plugin.toml` and the compiled library, described in
+[`plugins.md`](plugins.md). `bifrost_plugin_init(host, plugin)` is called once, on the main thread, before any player connects. Fill in
 `plugin` (`name`, `plugin_version`, `capabilities`, optionally `state` and `shutdown`) and register everything you
 need; subscriptions and commands can't be added later. Returning anything but `OK` unloads the plugin and fails
 startup. Bifrost refuses a plugin whose `abi_version` differs from `BIFROST_ABI_VERSION`, whose `struct_size` is
@@ -28,7 +29,9 @@ returns `UNSUPPORTED` without `TASKS`. Whatever a refused plugin registered is d
 `name` (up to 64 bytes) and `plugin_version` (up to 64 bytes) are required and must be printable UTF-8: no control
 characters, and no `NULL` pointer with a non-zero length. A plugin can also call `set_description` with up to 256
 bytes of the same. Bifrost checks and copies all three when `bifrost_plugin_init` returns, so they only have to stay
-valid until then, and logs them as the plugin loads.
+valid until then, and logs them as the plugin loads. `name` and `plugin_version` must equal the package's
+`plugin.toml` exactly, and its `description` replaces whatever `set_description` set. Two plugins can't share a name,
+ignoring ASCII case.
 
 `shutdown(state)` runs once, after every worker has stopped and every task has finished or been canceled, newest
 plugin first. Stop any threads you started before it returns; Bifrost unloads the library right after. It also

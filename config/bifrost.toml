@@ -47,5 +47,8 @@ address = "127.0.0.1:19133"
 name = "survival"
 address = "127.0.0.1:19134"
 
-# [[plugin]]
-# path = "plugins/libexample.so"
+[plugins]
+# One directory per plugin, holding its plugin.toml and compiled library; see docs/plugins.md
+directory = "plugins"
+# Package directories to skip
+# disabled = ["Maintenance"]
