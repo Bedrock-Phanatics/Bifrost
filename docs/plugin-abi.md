@@ -38,6 +38,10 @@ ignoring ASCII case.
 plugin first. Stop any threads you started before it returns; Bifrost unloads the library right after. It also
 runs if `bifrost_plugin_init` returned `OK` and Bifrost then refused the plugin, but never after a failed init.
 
+Once shutdown begins, valid new messages, posts and tasks return `UNSUPPORTED`; valid packet submissions return `CANCELED`.
+Calls already in progress can still be queued and are settled during teardown. When embedding Bifrost, stop and
+join workers, unload plugins, then destroy workers before deinitializing the plugin runtime and its I/O runtime.
+
 ## Threads
 
 Callbacks run on Bifrost's worker threads, several at once, so they must be quick and thread-safe. Never block in
@@ -83,7 +87,7 @@ of memory.
 | `player_name(player, out, capacity, len)` | copies up to `capacity` bytes of the name and sets `len` to its full length | `STALE_HANDLE` after the player left (before authentication the name is empty); `INVALID_ARGUMENT` for no `len` or no `out` with a capacity |
 | `transfer(player, backend)` | asks to move a player; the outcome arrives as `TRANSFER_COMPLETED` or `TRANSFER_FAILED` | `INVALID_ARGUMENT` for an unknown backend; `STALE_HANDLE`; `BUSY` when the worker's transfer mailbox is full |
 | `worker_count()` | number of workers | none |
-| `spawn_task(player, run, done, user)` | runs `run` on a shared task thread, then `done` once | `UNSUPPORTED` without `TASKS` or during init; `INVALID_ARGUMENT` for no `run` or `done`; `BUSY` past 128 tasks in total or 32 per plugin |
+| `spawn_task(player, run, done, user)` | runs `run` on a shared task thread, then `done` once | `UNSUPPORTED` without `TASKS`, during init or while shutting down; `INVALID_ARGUMENT` for no `run` or `done`; `BUSY` past 128 tasks in total or 32 per plugin |
 | `send_message(player, text)` | sends the player a chat message, managed mode only | `UNSUPPORTED` in passthrough or while shutting down; `INVALID_ARGUMENT` for empty, over 1024 bytes or not UTF-8; `STALE_HANDLE`; `BUSY` past 1024 queued messages and posts |
 | `post(player, done, user)` | runs `done` once on the player's worker | `INVALID_ARGUMENT` for no `done`; `STALE_HANDLE`; `BUSY` as for `send_message`; `UNSUPPORTED` during init or while shutting down |
 

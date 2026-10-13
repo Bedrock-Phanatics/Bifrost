@@ -623,7 +623,7 @@ fn hostSpawnTask(context: *anyopaque, player: abi.Player, run: ?abi.TaskFn, done
     const loaded = from(context);
     const owner = loaded.owner;
     if (!Work.hosted) return .wrong_thread;
-    if (!loaded.ready.load(.acquire) or !loaded.plugin.capabilities.tasks) return .unsupported;
+    if (!loaded.ready.load(.acquire) or owner.stopping.load(.acquire) or !loaded.plugin.capabilities.tasks) return .unsupported;
     const pool = owner.pool orelse return .unsupported;
     const run_fn = run orelse return .invalid_argument;
     const done_fn = done orelse return .invalid_argument;
@@ -651,7 +651,7 @@ fn hostSpawnTask(context: *anyopaque, player: abi.Player, run: ?abi.TaskFn, done
 
 fn hostSendMessage(context: *anyopaque, player: abi.Player, text: abi.Str) callconv(.c) abi.Status {
     const owner = from(context).owner;
-    if (!owner.options.packets) return .unsupported;
+    if (!owner.options.packets or owner.stopping.load(.acquire)) return .unsupported;
     const bytes = text.slice();
     if (bytes.len == 0 or bytes.len > Work.max_message_bytes or !std.unicode.utf8ValidateSlice(bytes)) return .invalid_argument;
     const route = owner.handles.route(player) orelse return .stale_handle;
@@ -673,7 +673,7 @@ fn hostPost(context: *anyopaque, player: abi.Player, callback: ?abi.TaskDoneFn, 
     const loaded = from(context);
     const owner = loaded.owner;
     const done = callback orelse return .invalid_argument;
-    if (!loaded.ready.load(.acquire)) return .unsupported;
+    if (!loaded.ready.load(.acquire) or owner.stopping.load(.acquire)) return .unsupported;
     const route = owner.handles.route(player) orelse return .stale_handle;
     if (route.worker >= owner.queues.len) return .invalid_argument;
     if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
@@ -1435,7 +1435,7 @@ const Tasker = struct {
 };
 
 fn taskPlayer(plugins: *Plugins) !abi.Player {
-    return plugins.handles.acquire(testing.allocator, .{ .context = plugins, .link = 1, .transfer = routedTransfer });
+    return plugins.handles.acquire(plugins.gpa, .{ .context = plugins, .link = 1, .transfer = routedTransfer });
 }
 
 test "tasks respect the per-plugin and global limits and finish on the player's worker" {
@@ -1510,6 +1510,35 @@ test "a task whose player leaves reports a stale handle" {
 fn openAfterStop(pool: *Pool) void {
     while (!pool.stopping.load(.acquire)) std.Thread.yield() catch {};
     Tasker.gate.store(true, .release);
+}
+
+test "shutdown rejects new plugin work before queues close" {
+    Tasker.reset();
+    const outer = Work.enter();
+    defer Work.hosted = outer;
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    var plugins: Plugins = try .init(failing.allocator(), &.{}, .{ .task_threads = 1 });
+    defer plugins.deinit();
+    try plugins.add(Tasker.init, null);
+    const player = try taskPlayer(&plugins);
+    const host = Tasker.host.?;
+    const Events = @import("Events.zig");
+    (Events{ .plugins = &plugins }).proxyStopping();
+    try testing.expect(!plugins.queues[0].closed);
+    failing.fail_index = failing.alloc_index;
+
+    const statuses = [_]abi.Status{
+        host.send_message(host.context, player, .of("bye")),
+        host.post(host.context, player, Tasker.done, null),
+        Tasker.spawn(host, player),
+    };
+    for (statuses) |status| try testing.expectEqual(abi.Status.unsupported, status);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), plugins.outstanding.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), plugins.queues[0].take().len);
+    try testing.expectEqual(@as(u32, 0), Tasker.started.load(.acquire));
+    for (&Tasker.results) |*counter| try testing.expectEqual(@as(u32, 0), counter.load(.acquire));
 }
 
 test "shutdown finishes running tasks, cancels queued ones and calls every done once" {

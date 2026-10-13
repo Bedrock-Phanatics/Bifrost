@@ -213,6 +213,7 @@ fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
     var heap: harness.CountingAllocator = .{ .backing = init.gpa };
     const workers = try bifrost.Workers.create(heap.allocator(), io, config, options);
     defer workers.destroy();
+    defer plugins.unload();
     var task = try io.concurrent(bifrost.Workers.run, .{workers});
     errdefer {
         workers.stop();
