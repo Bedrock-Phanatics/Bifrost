@@ -388,6 +388,8 @@ fn liveStatus(self: *Plugins, player: abi.Player, owner: ?Owner) abi.Status {
 }
 
 fn complete(self: *Plugins, then: *const Work.Done, status: abi.Status, owner: ?Owner) void {
+    const outer = Work.enter();
+    defer Work.hosted = outer;
     const result: abi.TaskResult = .{ .status = status, .worker = if (owner) |at| at.worker else abi.no_worker, .player = then.player };
     const started = if (owner) |at| Packets.now(at.io) else 0;
     then.done(then.user, &result);
@@ -1469,6 +1471,55 @@ const Tasker = struct {
 
 fn taskPlayer(plugins: *Plugins) !abi.Player {
     return plugins.handles.acquire(plugins.gpa, .{ .context = plugins, .link = 1, .transfer = routedTransfer });
+}
+
+test "task thread completions can queue a follow-up and restore callback scope" {
+    const Chain = struct {
+        host: abi.Host,
+        finished: std.atomic.Value(bool) = .init(false),
+        runs: usize = 0,
+        completions: usize = 0,
+        wrong_run_scope: bool = false,
+        wrong_done_scope: bool = false,
+        wrong_result: bool = false,
+        submitted: abi.Status = .failed,
+
+        fn run(user: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            self.runs += 1;
+            self.wrong_run_scope = self.wrong_run_scope or Work.hosted;
+        }
+
+        fn done(user: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            self.completions += 1;
+            self.wrong_done_scope = self.wrong_done_scope or !Work.hosted;
+            self.wrong_result = self.wrong_result or result.status != .ok or result.worker != abi.no_worker or result.player.id != 0;
+            if (self.completions == 1) {
+                self.submitted = self.host.spawn_task(self.host.context, .{}, run, done, self);
+                if (self.submitted == .ok) return;
+            }
+            self.finished.store(true, .release);
+        }
+    };
+    Tasker.reset();
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .task_threads = 1, .max_tasks = 2, .max_tasks_per_plugin = 2 });
+    defer plugins.deinit();
+    try plugins.add(Tasker.init, null);
+    var chain: Chain = .{ .host = Tasker.host.? };
+    const outer = Work.enter();
+    const status = chain.host.spawn_task(chain.host.context, .{}, Chain.run, Chain.done, &chain);
+    Work.hosted = outer;
+    try testing.expectEqual(abi.Status.ok, status);
+    for (0..500) |_| {
+        if (chain.finished.load(.acquire)) break;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try testing.expect(chain.finished.load(.acquire));
+    try testing.expectEqual(abi.Status.ok, chain.submitted);
+    try testing.expectEqual(@as(usize, 2), chain.runs);
+    try testing.expectEqual(@as(usize, 2), chain.completions);
+    try testing.expect(!chain.wrong_run_scope and !chain.wrong_done_scope and !chain.wrong_result);
 }
 
 test "tasks respect the per-plugin and global limits and finish on the player's worker" {
