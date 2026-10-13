@@ -49,8 +49,8 @@ pub fn release(self: *Handles, player: abi.Player) void {
     defer self.leave();
     const index, const slot = self.find(player) orelse return;
     slot.route = null;
-    slot.generation +%= 1;
-    if (slot.generation == 0) slot.generation = 1;
+    if (slot.generation == std.math.maxInt(u32)) return;
+    slot.generation += 1;
     self.free.appendAssumeCapacity(index);
 }
 
@@ -132,6 +132,39 @@ test "a released handle goes stale even after its slot is reused" {
     try std.testing.expectEqual(@as(u64, 2), handles.route(second).?.link);
     try std.testing.expectEqual(@as(?Route, null), handles.route(.{}));
     try std.testing.expectEqual(@as(?Route, null), handles.route(.{ .id = 99 }));
+}
+
+test "generation exhaustion never revives a released player handle" {
+    const gpa = std.testing.allocator;
+    var handles: Handles = .{};
+    defer handles.deinit(gpa);
+    var context: u8 = 0;
+    const first = try handles.acquire(gpa, .{ .context = &context, .link = 1, .transfer = noTransfer });
+    handles.release(first);
+    handles.slots.items[0].generation = std.math.maxInt(u32) - 1;
+    const penultimate = try handles.acquire(gpa, .{ .context = &context, .link = 2, .transfer = noTransfer });
+    handles.release(penultimate);
+    const last = try handles.acquire(gpa, .{ .context = &context, .link = 3, .transfer = noTransfer });
+    try std.testing.expectEqual(std.math.maxInt(u32), @as(u32, @truncate(last.id >> 32)));
+    handles.setName(last, "Steve");
+    handles.release(last);
+    handles.release(last);
+    const next = try handles.acquire(gpa, .{ .context = &context, .link = 4, .transfer = noTransfer });
+    try std.testing.expect(first.id != next.id);
+    try std.testing.expectEqual(@as(u32, 2), @as(u32, @truncate(next.id)));
+    var name: [max_name_len]u8 = undefined;
+    for ([_]abi.Player{ first, penultimate, last }) |retired| {
+        try std.testing.expect(handles.route(retired) == null);
+        try std.testing.expect(handles.copyName(retired, &name) == null);
+        handles.invalidatePackets(retired);
+    }
+    try std.testing.expectEqual(@as(u64, 4), handles.route(next).?.link);
+    try std.testing.expectEqual(@as(?usize, 0), handles.copyName(next, &name));
+    handles.release(next);
+    const reused = try handles.acquire(gpa, .{ .context = &context, .link = 5, .transfer = noTransfer });
+    try std.testing.expectEqual(@as(u32, @truncate(next.id)), @as(u32, @truncate(reused.id)));
+    try std.testing.expect(handles.route(next) == null and handles.route(first) == null);
+    try std.testing.expectEqual(@as(u64, 5), handles.route(reused).?.link);
 }
 
 test "random acquire and release never resolve a released handle" {
