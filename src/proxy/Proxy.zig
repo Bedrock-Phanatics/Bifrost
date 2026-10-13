@@ -169,10 +169,11 @@ fn onHealthChanged(context: *anyopaque) void {
 }
 
 // Any thread; the player's own worker runs it
-pub fn requestTransfer(self: *Proxy, player: u64, target: Backend.Id) error{MailboxFull}!void {
+pub fn requestTransfer(self: *Proxy, player: u64, target: Backend.Id) error{ MailboxFull, Canceled }!void {
     {
         self.mailbox_mutex.lockUncancelable(self.io);
         defer self.mailbox_mutex.unlock(self.io);
+        if (self.stop_requested.load(.acquire)) return error.Canceled;
         if (self.mailbox_len == mailbox_capacity) return error.MailboxFull;
         self.mailbox[self.mailbox_len] = .{ .player = player, .target = target };
         self.mailbox_len += 1;
@@ -214,7 +215,10 @@ pub fn packet(self: *Proxy, link_id: u64, target: abi.PacketTarget, bytes: []con
 
 fn routeTransfer(context: *anyopaque, link: u64, backend: u32) abi.Status {
     const self: *Proxy = @ptrCast(@alignCast(context));
-    self.requestTransfer(link, .of(backend)) catch return .busy;
+    self.requestTransfer(link, .of(backend)) catch |err| return switch (err) {
+        error.MailboxFull => .busy,
+        error.Canceled => .canceled,
+    };
     return .ok;
 }
 
@@ -366,6 +370,24 @@ fn closeAll(self: *Proxy) void {
         self.stats.bump(.links_closed, 1);
     }
     self.scheduler.ready.store(null, .monotonic);
+}
+
+test "stopped workers reject transfer mailbox submissions without waking" {
+    var config: Config = .{ .bind = .{ .ip4 = .loopback(0) }, .max_players = 2 };
+    try config.addBackend(null, .{ .ip4 = .loopback(9) });
+    const proxy = try Proxy.create(std.testing.allocator, std.testing.io, config, .{});
+    defer proxy.destroy();
+    for (0..mailbox_capacity) |id| try proxy.requestTransfer(id + 1, .of(0));
+    try std.testing.expectError(error.MailboxFull, proxy.requestTransfer(1, .of(0)));
+    proxy.stop();
+    proxy.scheduler.wake.reset();
+    try std.testing.expectError(error.Canceled, proxy.requestTransfer(1, .of(0)));
+    try std.testing.expectEqual(abi.Status.canceled, routeTransfer(proxy, 1, 0));
+    try std.testing.expectEqual(mailbox_capacity, proxy.mailbox_len);
+    proxy.mailbox_len = 0;
+    try std.testing.expectError(error.Canceled, proxy.requestTransfer(1, .of(0)));
+    try std.testing.expectEqual(@as(usize, 0), proxy.mailbox_len);
+    try std.testing.expect(!proxy.scheduler.wake.isSet());
 }
 
 test "worker link IDs are retired after failed connections and never wrap" {

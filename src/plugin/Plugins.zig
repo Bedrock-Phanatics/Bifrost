@@ -742,8 +742,11 @@ fn hostPlayerName(context: *anyopaque, player: abi.Player, out: ?[*]u8, capacity
 }
 
 fn hostTransfer(context: *anyopaque, player: abi.Player, backend: u32) callconv(.c) abi.Status {
-    const owner = from(context).owner;
+    const loaded = from(context);
+    const owner = loaded.owner;
     if (!Work.hosted) return .wrong_thread;
+    if (!loaded.ready.load(.acquire)) return .unsupported;
+    if (owner.stopping.load(.acquire)) return .canceled;
     if (backend >= owner.backends.len) return .invalid_argument;
     const route = owner.handles.route(player) orelse return .stale_handle;
     return route.transfer(route.context, route.link, backend);
@@ -779,11 +782,14 @@ test "a rejected plugin cannot queue callbacks during load cleanup" {
         player: abi.Player,
         status: abi.Status = .failed,
         task_status: abi.Status = .failed,
+        init_transfer_status: abi.Status = .failed,
+        shutdown_transfer_status: abi.Status = .failed,
         shutdowns: usize = 0,
         callbacks: usize = 0,
 
         fn init(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
             current.host = host.*;
+            current.init_transfer_status = host.transfer(host.context, current.player, 0);
             host.log(host.context, .warn, .of("logging before publication"));
             plugin.abi_version = abi.version + 1;
             plugin.name = .of("rejected-post");
@@ -799,6 +805,7 @@ test "a rejected plugin cannot queue callbacks during load cleanup" {
             self.shutdowns += 1;
             self.status = self.host.post(self.host.context, self.player, done, self);
             self.task_status = self.host.spawn_task(self.host.context, self.player, null, null, self);
+            self.shutdown_transfer_status = self.host.transfer(self.host.context, self.player, 0);
             self.host.log(self.host.context, .warn, .of("logging during rejected-load cleanup"));
         }
 
@@ -809,16 +816,20 @@ test "a rejected plugin cannot queue callbacks during load cleanup" {
     };
     const outer = Work.enter();
     defer Work.hosted = outer;
-    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .task_threads = 1 });
+    const backends = [_]Backend{try .init("lobby", .{ .ip4 = .loopback(19133) })};
+    var plugins: Plugins = try .init(testing.allocator, &backends, .{ .task_threads = 1 });
     defer plugins.deinit();
     try plugins.startPool();
-    var context: u8 = 0;
+    var context: [2]u64 = .{ 0, 0 };
     var rejected: Rejected = .{ .player = try plugins.handles.acquire(testing.allocator, .{ .context = &context, .link = 1, .transfer = routedTransfer }) };
     Rejected.current = &rejected;
     try testing.expectError(error.IncompatiblePlugin, plugins.add(Rejected.init, null));
     try testing.expectEqual(@as(usize, 1), rejected.shutdowns);
     try testing.expectEqual(abi.Status.unsupported, rejected.status);
     try testing.expectEqual(abi.Status.unsupported, rejected.task_status);
+    try testing.expectEqual(abi.Status.unsupported, rejected.init_transfer_status);
+    try testing.expectEqual(abi.Status.unsupported, rejected.shutdown_transfer_status);
+    try testing.expectEqual([2]u64{ 0, 0 }, context);
     try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
     try testing.expectEqual(@as(usize, 0), plugins.loaded.items.len);
     try testing.expectEqual(@as(?*Loaded, null), plugins.initializing.load(.acquire));
@@ -1539,10 +1550,12 @@ test "shutdown rejects new plugin work before queues close" {
     const outer = Work.enter();
     defer Work.hosted = outer;
     var failing: testing.FailingAllocator = .init(testing.allocator, .{});
-    var plugins: Plugins = try .init(failing.allocator(), &.{}, .{ .task_threads = 1 });
+    const backends = [_]Backend{try .init("lobby", .{ .ip4 = .loopback(19133) })};
+    var plugins: Plugins = try .init(failing.allocator(), &backends, .{ .task_threads = 1 });
     defer plugins.deinit();
     try plugins.add(Tasker.init, null);
-    const player = try taskPlayer(&plugins);
+    var transfers: [2]u64 = .{ 0, 0 };
+    const player = try plugins.handles.acquire(plugins.gpa, .{ .context = &transfers, .link = 1, .transfer = routedTransfer });
     const host = Tasker.host.?;
     const Events = @import("Events.zig");
     (Events{ .plugins = &plugins }).proxyStopping();
@@ -1555,6 +1568,8 @@ test "shutdown rejects new plugin work before queues close" {
         Tasker.spawn(host, player),
     };
     for (statuses) |status| try testing.expectEqual(abi.Status.unsupported, status);
+    try testing.expectEqual(abi.Status.canceled, host.transfer(host.context, player, 0));
+    try testing.expectEqual([2]u64{ 0, 0 }, transfers);
     try testing.expect(!failing.has_induced_failure);
     try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), plugins.outstanding.load(.monotonic));
