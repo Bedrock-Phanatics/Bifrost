@@ -544,3 +544,28 @@ ID exhaustion, lookup after table growth/removal and address reuse, and cleanup 
 registration. The full ReleaseSafe suite passed 234 tests with three platform skips, including existing managed
 injection, transfer, disconnect, and shutdown checks. Native and Linux ReleaseFast benchmark binaries compiled;
 Linux runtime and multi-worker network behavior were not tested. Formatting and whitespace checks passed.
+
+## Injection scheduler notifications
+
+The injection benchmark now attaches the actual scheduler wake notifier. Each batch checks that the event was
+set, resets it before draining, and verifies the exact delivered count. Earlier injection queue measurements
+omitted notification work. The sink still performs no session lookup, compression, encryption, or network send;
+no worker is suspended on the event, so this does not measure a cross-thread wakeup or its latency.
+
+Recorded 2026-10-12 on Windows x86_64, Zig 0.17.0, ReleaseFast. Command:
+`zig build bench -Doptimize=ReleaseFast -- injection`, with other builds and tests stopped. Wall time is the median
+of seven samples of 5,000 batches of 32. CPU is sampled separately for at least one second per packet size.
+
+| packet bytes | wall ns/packet | CPU ns/packet | packets/s | allocations/packet | queued heap for 32 | retained payload heap |
+|---|---|---|---|---|---|---|
+| 32 | 166.1 | 162.5 | 6,018,680 | 1 | 4,096 B | 0 B |
+| 1,024 | 205.0 | 200.5 | 4,878,376 | 1 | 35,840 B | 0 B |
+| 16,384 | 1,048.2 | 1,044.2 | 954,061 | 1 | 527,360 B | 0 B |
+| 65,536 | 3,058.3 | 3,170.7 | 326,981 | 1 | 2,100,224 B | 0 B |
+
+Notifying only on an empty-to-nonempty queue transition was evaluated and rejected. Its wall times were
+156.6 / 208.7 / 1,052.9 / 2,979.9 ns, while two runs of the existing behavior measured
+151.8 / 243.8 / 1,038.6 / 3,038.2 and 166.1 / 205.0 / 1,048.2 / 3,058.3 ns. These results do not establish a
+consistent speedup. Production queue behavior is unchanged. All four final benchmark cases completed with
+the expected delivery, wake, allocation, and retained-heap checks; formatting and whitespace checks passed.
+Linux compilation/runtime and concurrent notification throughput were not checked in this batch.

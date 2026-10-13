@@ -3,6 +3,7 @@ const bifrost = @import("bifrost");
 const sample = @import("sample");
 const harness = @import("harness.zig");
 const abi = bifrost.plugin_abi;
+const Scheduler = @FieldType(bifrost.Proxy, "scheduler");
 
 pub const Result = struct {
     bytes: usize,
@@ -41,9 +42,11 @@ const Sink = struct {
 
 const batch = 32;
 
-fn enqueue(player: abi.Player, bytes: []const u8) !void {
+fn enqueue(player: abi.Player, bytes: []const u8, scheduler: *Scheduler) !void {
     const api = host.?;
     for (0..batch) |_| if (api.send_packet(api.context, player, .player, .of(bytes), null, null) != .ok) return error.InjectionRejected;
+    if (!scheduler.wake.isSet()) return error.MissingWake;
+    scheduler.wake.reset();
 }
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
@@ -51,6 +54,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
     var plugins: bifrost.Plugins = try .init(heap.allocator(), &.{}, .{});
     defer plugins.deinit();
     try plugins.add(init, null);
+    var scheduler: Scheduler = .{ .io = io };
+    plugins.attachWorker(0, scheduler.wakeNotify());
     var sink: Sink = .{};
     const player = try plugins.handles.acquire(heap.allocator(), .{ .context = &sink, .link = 1, .transfer = noTransfer });
     const baseline = heap.live.load(.monotonic);
@@ -70,7 +75,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
         } });
         if (packet.len != size) return error.InvalidBenchmarkPacket;
         const before = heap.allocations.load(.monotonic);
-        try enqueue(player, packet);
+        try enqueue(player, packet, &scheduler);
         const allocations = heap.allocations.load(.monotonic) - before;
         const queued = heap.live.load(.monotonic) - baseline;
         plugins.drain(0, io, &sink);
@@ -78,7 +83,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
         for (&times) |*elapsed| {
             const started = harness.nowNs(io);
             for (0..rounds) |_| {
-                try enqueue(player, packet);
+                try enqueue(player, packet, &scheduler);
                 plugins.drain(0, io, &sink);
             }
             elapsed.* = harness.nowNs(io) - started;
@@ -92,7 +97,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
             var count: usize = 0;
             while (true) {
                 for (0..64) |_| {
-                    try enqueue(player, packet);
+                    try enqueue(player, packet, &scheduler);
                     plugins.drain(0, io, &sink);
                 }
                 count += 64 * batch;
