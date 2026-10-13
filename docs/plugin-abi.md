@@ -45,12 +45,13 @@ join workers, unload plugins, then destroy workers before deinitializing the plu
 
 ## Threads
 
-Callbacks run on Bifrost's worker threads, several at once, so they must be quick and thread-safe. Never block in
-one; anything slower than `slow_plugin_callback_ms` is logged. Player events, packet hooks, commands and task
-completions for a player always run on that player's worker. `PROXY_STARTED` runs on whichever worker starts first,
+Callbacks may run concurrently, so they must be quick and thread-safe. Never block in
+one; anything slower than `slow_plugin_callback_ms` on a worker is logged. Player events, packet hooks, commands and task
+completions for a live player run on that player's worker. Completions without a live player can run on a task
+thread or the teardown thread and report `BIFROST_NO_WORKER`. `PROXY_STARTED` runs on whichever worker starts first,
 and `PROXY_STOPPING` on whichever thread stops the proxy.
 
-Callbacks for one player never overlap. Bifrost holds no lock while it calls a plugin, so callbacks may call host
+Callbacks for one live player never overlap. Bifrost holds no lock while it calls a plugin, so callbacks may call host
 functions, including ones that queue more work for the same player; that work runs after the callback returns,
 never inside it.
 
@@ -94,8 +95,10 @@ of memory.
 
 `done` from `spawn_task` and `post` always runs exactly once. Its `bifrost_task_result.status` is `OK` on the
 player's worker, `STALE_HANDLE` if the player left or the proxy stopped while it ran, or `CANCELED` if the proxy stopped before `run` started. A task
-spawned with no player (`id` 0) finishes with `OK` on the task thread itself. Task threads run nothing but `run`, so
-`run` may block, but a stuck task holds a thread and delays shutdown.
+spawned with no player (`id` 0) finishes with `OK` on the task thread itself. Its `done` is a Bifrost callback and
+may call `transfer` and `spawn_task`, subject to their usual limits and shutdown checks. The callback scope belongs
+to the current thread and ends when `done` returns. `run` cannot make callback-only calls. Task threads execute `run` and
+completions without a live player. `run` may block, but a stuck task holds a thread and delays shutdown.
 
 ## Callbacks
 
