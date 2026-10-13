@@ -163,6 +163,7 @@ pub fn swapUpstream(self: *Managed, next: Upstream) Upstream {
 
 pub fn deliver(self: *Managed, ends: Ends, packets: []const []const u8) !usize {
     var batch = self.newBatch(ends, true);
+    errdefer batch.discard();
     var skipped: usize = 0;
     for (packets) |packet| {
         const header = protocol.packet.decode(packet, .{ .max_packet_bytes = @max(packet.len, 1) }) catch {
@@ -248,12 +249,16 @@ const Batch = struct {
     }
 
     fn flush(self: *Batch) !void {
-        defer _ = self.managed.shared.translated.reset(.{ .retain_with_limit = 256 * 1024 });
+        defer if (!self.managed.shared.translated.reset(.{ .retain_with_limit = 256 * 1024 })) self.discard();
         if (self.count == 0) return;
         const packets = self.managed.shared.batch[0..self.count];
         self.count = 0;
         if (self.to_player) return self.managed.sendToPlayer(self.ends, packets);
         try self.managed.upstream.send(self.managed.upstreamContext(self.ends, self.ends.backend orelse return error.BackendClosed), packets);
+    }
+
+    fn discard(self: *Batch) void {
+        _ = self.managed.shared.translated.reset(.free_all);
     }
 };
 
@@ -443,6 +448,7 @@ pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
         .logged_in => {
             defer self.early.clear(self.gpa);
             var batch = self.newBatch(ends, false);
+            errdefer batch.discard();
             var next_state: ?bedwire.State = null;
             for (self.early.items()) |bytes| {
                 const kind = Current.packetKind(Packets.packetId(bytes) orelse return error.MalformedBatch);
@@ -500,6 +506,7 @@ fn authenticate(self: *Managed, ends: Ends, packet: PlayerSession.Packet) !void 
 fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) !void {
     var next_state: ?bedwire.State = null;
     var batch = self.newBatch(ends, false);
+    errdefer batch.discard();
     while (packets.next()) |packet| {
         if (packet.kind == .command_request) if (self.shared.hooks) |hooks| if (hooks.plugins.hasCommands()) {
             const request = try typed(try self.player.decodePacket(packet), .command_request);
@@ -532,6 +539,7 @@ fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) 
 fn relayFromBackend(self: *Managed, ends: Ends, packets: *BackendSession.Packets) !void {
     var start_game = false;
     var batch = self.newBatch(ends, true);
+    errdefer batch.discard();
     var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     while (packets.next()) |packet| {
@@ -647,6 +655,72 @@ fn clientData(gpa: std.mem.Allocator, login: @FieldType(protocol.typed.Packet, "
     errdefer gpa.free(json);
     decoder.decode(json, encoded) catch return error.InvalidClaims;
     return json;
+}
+
+test "failed managed batches release replacement storage before the next player" {
+    const Replace = struct {
+        var calls: usize = 0;
+
+        fn init(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+            plugin.name = .of("batch-cleanup");
+            plugin.plugin_version = .of("1");
+            plugin.capabilities.packets = true;
+            return host.subscribe_packet(host.context, .from_backend, 1020, .in_game, .{}, replace, null);
+        }
+
+        fn replace(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+            calls += 1;
+            const out = packet.replacement.?[0..packet.replacement_capacity];
+            @memset(out, 'x');
+            const header = packet.bytes.slice();
+            @memcpy(out[0..header.len], header);
+            packet.replacement_len = out.len;
+            return .replace;
+        }
+    };
+    const gpa = std.testing.allocator;
+    var plugins: Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    try plugins.add(Replace.init, null);
+    var storage: [16][]const u8 = undefined;
+    var shared: Shared = .{ .pool = undefined, .key = undefined, .keys = undefined, .batch = &storage, .translated = .init(gpa), .hooks = .{ .plugins = &plugins, .worker = 0 } };
+    defer shared.translated.deinit();
+    defer gpa.free(shared.scratch);
+    var managed: Managed = .{ .gpa = gpa, .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    managed.player.state = .in_game;
+    var header_buffer: [4]u8 = undefined;
+    var writer = protocol.Writer.init(&header_buffer);
+    try writer.writeVarU32(1020);
+    try std.testing.expect(Current.packetKind(1020) == null);
+    var packets: [9][]const u8 = @splat(writer.written());
+    var malformed: [4]u8 = undefined;
+    writer = protocol.Writer.init(&malformed);
+    try writer.writeVarU32(Current.packetId(.change_dimension).?);
+    packets[8] = writer.written();
+    var stats: Stats = .{};
+    var session: raknet.Session = undefined;
+    const ends: Ends = .{ .io = std.testing.io, .stats = &stats, .player = &session, .backend = null };
+    Replace.calls = 0;
+    for (0..3) |_| {
+        try std.testing.expectError(error.EndOfStream, managed.deliver(ends, &packets));
+        try std.testing.expectEqual(@as(usize, 0), shared.translated.queryCapacity());
+    }
+    try std.testing.expectEqual(@as(usize, 24), Replace.calls);
+}
+
+test "managed batches free storage when arena retention allocation fails" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var shared: Shared = undefined;
+    shared.translated = .init(failing.allocator());
+    defer shared.translated.deinit();
+    _ = try shared.translated.allocator().alloc(u8, 512 * 1024);
+    failing.fail_index = failing.alloc_index;
+    var managed: Managed = .{ .gpa = failing.allocator(), .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    var batch: Batch = .{ .managed = &managed, .ends = undefined, .to_player = true };
+    try batch.flush();
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), shared.translated.queryCapacity());
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "player milestones and container tracking use the delivered packet" {
