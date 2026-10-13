@@ -36,7 +36,7 @@ listener: *raknet.Server,
 scheduler: Scheduler,
 admission: *Admission,
 own_admission: Admission,
-observer_pool: bedwire.BufferPool,
+observer_pool: ?bedwire.BufferPool,
 managed: ?Managed.Shared,
 env: Link.Env,
 links: std.AutoArrayHashMapUnmanaged(u64, *Link) = .empty,
@@ -77,8 +77,8 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .offline_burst = 2 * config.handshake_rate_per_ip,
     });
     errdefer listener.destroy();
-    var observer_pool = try Observer.initPool(gpa);
-    errdefer observer_pool.deinit();
+    var observer_pool: ?bedwire.BufferPool = if (config.session_mode == .passthrough) try Observer.initPool(gpa) else null;
+    errdefer if (observer_pool) |*pool| pool.deinit();
     const own_per_ip = if (options.admission == null) config.max_players_per_ip else 0;
     var own_admission: Admission = try .init(gpa, config.max_players, own_per_ip);
     errdefer own_admission.deinit();
@@ -120,7 +120,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .io = io,
         .stats = &self.stats,
         .scheduler = &self.scheduler,
-        .observer_pool = &self.observer_pool,
+        .observer_pool = if (self.observer_pool) |*pool| pool else null,
         .auth = options.auth,
         .health = options.health,
         .router = &self.router,
@@ -149,7 +149,7 @@ pub fn destroy(self: *Proxy) void {
     self.links.deinit(self.gpa);
     if (self.managed) |*shared| shared.deinit(self.gpa);
     self.own_admission.deinit();
-    self.observer_pool.deinit();
+    if (self.observer_pool) |*pool| pool.deinit();
     self.listener.destroy();
     self.gpa.destroy(self);
 }

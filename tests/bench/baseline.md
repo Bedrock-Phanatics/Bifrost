@@ -569,3 +569,46 @@ Notifying only on an empty-to-nonempty queue transition was evaluated and reject
 consistent speedup. Production queue behavior is unchanged. All four final benchmark cases completed with
 the expected delivery, wake, allocation, and retained-heap checks; formatting and whitespace checks passed.
 Linux compilation/runtime and concurrent notification throughput were not checked in this batch.
+
+## Managed observer memory
+
+Recorded 2026-10-13 on Windows x86_64, Zig 0.17.0, ReleaseFast, with other builds and tests stopped.
+Managed workers now omit the passthrough observer pool and links omit observer initialization. Both directions
+already use the managed session exclusively. Passthrough observation and authentication retain their own pool.
+The benchmark's observer-pool counter reports zero in managed mode; it excludes the separate managed pool.
+
+Fresh-process snapshots use the benchmark proxy with `proxy 1 500 1000 <mode> 9`, send `stats\n`, then close stdin.
+Each mode was sampled in three independent processes before and after the change, with no players joined.
+Every sample in each group had the exact tracked heap below, and every child exited successfully.
+
+| mode | live heap before | live heap after | observer storage before | observer storage after |
+|---|---|---|---|---|
+| passthrough | 4,655,653 B | 4,655,661 B | 2,621,440 B | 2,621,440 B |
+| managed | 17,386,111 B | 14,699,103 B | 2,621,440 B | 0 B |
+
+Managed workers remove two allocations: 2.5 MiB of receive storage and its slot metadata, including 64 KiB of
+decompression history. After the optional pool's 8 B presence tag, the net reduction is 2,687,008 B per worker.
+This is allocated heap, not resident memory: the median managed working set was 6,176 KiB before and 6,188 KiB
+after, so these fresh-process samples show no resident-memory reduction. The shared Link layout still reserves
+space for either mode's observer; removing initialization does not establish a per-player heap improvement.
+
+The regression checks pool presence, each link's mode, the observer's stable pool pointer, and cleanup at every
+allocation failure during proxy and link creation in both modes. It passed in Debug, ReleaseSafe, and ReleaseFast.
+The full ReleaseSafe suite passed 235 tests with three platform skips, including managed login allocation failures,
+injection, transfers, disconnects, and passthrough authentication. Native and Linux ReleaseFast benchmark binaries
+compiled. Linux runtime and multi-worker network behavior were not exercised.
+
+Before and after: `zig build bench -Doptimize=ReleaseFast -- managed --quick`, three 500 ms iterations after
+300 ms warmup, one worker, four driver threads. All 40 relay workloads completed in both runs. Selected results
+for the managed relay with matching compression and no plugins:
+
+| payload / load | trips/s before / after | p50 us before / after | p99 us before / after | CPU before / after |
+|---|---|---|---|---|
+| 256 B / 1x1 | 3,412 / 3,276 | 244 / 246 | 408 / 483 | 55% / 59% |
+| 256 B / 8x32 | 11,422 / 11,916 | 19,654 / 19,041 | 39,883 / 41,151 | 97% / 94% |
+| 20 KiB / 1x1 | 302 / 316 | 3,186 / 3,092 | 3,871 / 3,876 | 66% / 70% |
+| 20 KiB / 8x12 | 630 / 762 | 116,750 / 100,351 | 400,572 / 293,930 | 90% / 86% |
+
+Throughput is the median of the three iterations; latency percentiles combine their samples. CPU 100% is one
+occupied core. These short runs have mixed throughput and tail-latency changes and do not establish a speedup.
+The measured improvement is the worker's allocated heap. Formatting and whitespace checks passed.

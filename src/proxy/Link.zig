@@ -28,7 +28,7 @@ pub const Env = struct {
     io: std.Io,
     stats: *Stats,
     scheduler: *Scheduler,
-    observer_pool: *bedwire.BufferPool,
+    observer_pool: ?*bedwire.BufferPool,
     auth: Observer.Auth,
     health: ?*Health,
     router: *Router,
@@ -52,7 +52,7 @@ backend_id: Backend.Id = .of(0),
 dial_task: ?std.Io.Future(void) = null,
 tried: Router.Set = .{},
 pending: PacketQueue,
-observer: Observer,
+observer: ?Observer,
 managed: ?*Managed = null,
 transfer: ?*Transfer = null,
 id: u64 = 0,
@@ -72,10 +72,9 @@ pub fn create(env: *const Env, session: *raknet.Session) !*Link {
         .env = env,
         .session = session,
         .pending = .init(env.pending_packets, env.pending_bytes),
-        .observer = try .init(env.observer_pool),
+        .observer = if (env.observer_pool) |pool| try Observer.init(pool) else null,
         .managed = managed,
     };
-    if (managed != null) self.observer.watching = false;
     return self;
 }
 
@@ -86,7 +85,7 @@ pub fn destroy(self: *Link) void {
     self.dropBackend();
     if (self.managed) |managed| managed.destroy();
     self.pending.deinit(self.env.gpa);
-    self.observer.deinit();
+    if (self.observer) |*observer| observer.deinit();
     self.env.gpa.destroy(self);
 }
 
@@ -114,10 +113,11 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
         if (self.backend != null) self.env.scheduler.schedule(self);
         return;
     }
-    if (self.observer.watching and self.observe(.client_to_server, payload).rejects()) return error.LoginRejected;
-    if (self.observer.identity) |identity| {
+    const observer = &self.observer.?;
+    if (observer.watching and self.observe(observer, .client_to_server, payload).rejects()) return error.LoginRejected;
+    if (observer.identity) |identity| {
         self.announce(identity);
-        self.observer.dropIdentity();
+        observer.dropIdentity();
     }
     if (self.backend) |client| {
         try client.send(payload, .reliable_ordered, 0);
@@ -206,8 +206,8 @@ pub fn service(self: *Link) error{Canceled}!void {
     if (!drained) self.env.scheduler.schedule(self);
 }
 
-fn observe(self: *Link, direction: bedwire.TapDirection, payload: []const u8) Observer.Event {
-    const event = self.observer.observe(.{ .gpa = self.env.gpa, .io = self.env.io, .auth = self.env.auth }, direction, payload);
+fn observe(self: *Link, observer: *Observer, direction: bedwire.TapDirection, payload: []const u8) Observer.Event {
+    const event = observer.observe(.{ .gpa = self.env.gpa, .io = self.env.io, .auth = self.env.auth }, direction, payload);
     const stats = self.env.stats;
     switch (event) {
         .none => {},
@@ -310,7 +310,8 @@ fn onBackendMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{
         log.debug("managed session failed: {t}", .{err});
         self.backend_error = err;
     };
-    if (self.observer.watching and self.observe(.server_to_client, payload.bytes).rejects()) {
+    const observer = &self.observer.?;
+    if (observer.watching and self.observe(observer, .server_to_client, payload.bytes).rejects()) {
         self.backend_error = error.LoginRejected;
         return;
     }

@@ -282,18 +282,28 @@ test "managed mode needs a proxy key and verified logins" {
     try std.testing.expectError(error.ManagedNeedsVerifiedLogins, bifrost.Proxy.create(gpa, io, proxy_config, .{ .proxy_key = try managed.proxyKey(1) }));
 }
 
-test "managed proxies clean up after allocation failures" {
+test "session modes allocate only their own protocol state and clean up failures" {
     var keys = try managed.keySet();
     defer keys.deinit();
-    try std.testing.checkAllAllocationFailures(gpa, struct {
-        fn run(allocator: std.mem.Allocator, key_set: *const bifrost.KeySet) !void {
-            const proxy = try bifrost.Proxy.create(allocator, io, try managed.config(&.{fixtures.nowhere}), .{
+    for ([_]bool{ false, true }) |is_managed| try std.testing.checkAllAllocationFailures(gpa, struct {
+        fn run(allocator: std.mem.Allocator, key_set: *const bifrost.KeySet, use_managed: bool) !void {
+            var proxy_config = try fixtures.config(&.{fixtures.nowhere});
+            if (use_managed) proxy_config.session_mode = .managed;
+            const proxy = try bifrost.Proxy.create(allocator, io, proxy_config, .{
                 .auth = .{ .verify = key_set },
                 .proxy_key = try managed.proxyKey(1),
             });
-            proxy.destroy();
+            defer proxy.destroy();
+            try std.testing.expectEqual(use_managed, proxy.observer_pool == null);
+            try std.testing.expectEqual(use_managed, proxy.env.observer_pool == null);
+            var session: @import("raknet").Session = undefined;
+            const link = try bifrost.Proxy.Link.create(&proxy.env, &session);
+            defer link.destroy();
+            try std.testing.expectEqual(use_managed, link.observer == null);
+            try std.testing.expectEqual(use_managed, link.managed != null);
+            if (link.observer) |*observer| try std.testing.expect(observer.tap.pool == &proxy.observer_pool.?);
         }
-    }.run, .{&keys});
+    }.run, .{ &keys, is_managed });
 }
 
 test "an allocation failure anywhere in a managed login fails cleanly" {

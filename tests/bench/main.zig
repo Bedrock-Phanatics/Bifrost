@@ -240,12 +240,11 @@ fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
 fn snapshot(io: std.Io, workers: *bifrost.Workers, heap: *const harness.CountingAllocator) !Snapshot {
     const self = try harness.selfUsage(io);
     const totals = workers.totals();
-    const pool = &workers.proxies[0].observer_pool;
     var result: Snapshot = .{
         .rss_kb = self.rss_kb,
         .hwm_kb = self.hwm_kb,
         .cpu_us = self.cpu_us,
-        .pool_bytes = pool.rx_storage.len + pool.tx_storage.len,
+        .pool_bytes = if (workers.proxies[0].observer_pool) |*pool| pool.storageBytes() else 0,
         .accepted = totals.sessions_accepted,
         .closed = totals.links_closed,
         .backend_failures = totals.backend_failures,
