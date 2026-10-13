@@ -612,3 +612,22 @@ for the managed relay with matching compression and no plugins:
 Throughput is the median of the three iterations; latency percentiles combine their samples. CPU 100% is one
 occupied core. These short runs have mixed throughput and tail-latency changes and do not establish a speedup.
 The measured improvement is the worker's allocated heap. Formatting and whitespace checks passed.
+
+## Final native packet API verification
+
+Recorded 2026-10-13 on Windows x86_64 with Zig 0.17.0. The final review covered callback-scoped decoding,
+replacement invalidation, queue bounds and ownership, stale handles, transfers, shutdown, ABI layouts and the
+C++ packet filter. It found missing cleanup when a producer thread failed to start in the concurrency tests.
+Those tests now stop and join started producers before releasing shared state, and limit delivery waits to five
+seconds. A regression forces failure at each of four startup positions for both posts and packet injections;
+all eight cases passed using the leak-detecting test allocator. The C++ test uses joining thread ownership.
+
+`zig build test -Doptimize=ReleaseSafe --summary all` and the corresponding ReleaseFast command each passed
+242 of 245 Zig tests, with three Windows platform skips, and ran the C++ filter checks successfully.
+`zig build bench-test -Doptimize=ReleaseSafe --summary all` passed all four benchmark checks. ReleaseFast
+`zig build` compiled and packaged the proxy, Zig maintenance plugin, C++ greeter and C++ packet filter for
+both native Windows and `x86_64-linux-gnu`. Formatting and whitespace checks passed.
+
+Linux runtime, network behavior with several reuse-port workers, injection transport throughput and callback
+tail latency remain unmeasured. The earlier codec, dispatch, injection queue and heap measurements retain their
+stated scope; this verification does not establish a new performance result or the absence of all races or leaks.

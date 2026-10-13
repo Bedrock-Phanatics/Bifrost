@@ -1137,6 +1137,10 @@ fn postMany(host: abi.Host, players: [2]abi.Player, deliveries: *[2]Delivery, co
 }
 
 test "posts from many threads run once each on the player's worker" {
+    try concurrentPosts(std.Thread.spawn);
+}
+
+fn concurrentPosts(comptime spawn: anytype) !void {
     Probe.reset();
     var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .workers = 2, .max_messages = 64 });
     defer plugins.deinit();
@@ -1151,14 +1155,25 @@ test "posts from many threads run once each on the player's worker" {
 
     const per_thread = 500;
     var threads: [4]std.Thread = undefined;
-    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, postMany, .{ host, players, &deliveries, per_thread });
+    var running: usize = 0;
+    errdefer {
+        plugins.stopping.store(true, .release);
+        for (threads[0..running]) |thread| thread.join();
+    }
+    for (&threads) |*thread| {
+        thread.* = try spawn(.{}, postMany, .{ host, players, &deliveries, per_thread });
+        running += 1;
+    }
     const total = threads.len * per_thread;
+    const deadline = Packets.now(testing.io) + 5 * std.time.ns_per_s;
     while (deliveries[0].ok.load(.monotonic) + deliveries[1].ok.load(.monotonic) < total) {
+        if (Packets.now(testing.io) >= deadline) return error.WaitTimedOut;
         plugins.drain(0, testing.io, null);
         plugins.drain(1, testing.io, null);
         std.Thread.yield() catch {};
     }
     for (threads) |thread| thread.join();
+    running = 0;
     for (&deliveries) |*delivery| {
         try testing.expectEqual(@as(u32, total / 2), delivery.ok.load(.monotonic));
         try testing.expectEqual(@as(u32, 0), delivery.stale.load(.monotonic));
@@ -1297,6 +1312,10 @@ fn injectMany(host: abi.Host, players: [2]abi.Player, deliveries: *[2]Delivery, 
 }
 
 test "packet injection from many threads completes on the owning workers" {
+    try concurrentInjections(std.Thread.spawn);
+}
+
+fn concurrentInjections(comptime spawn: anytype) !void {
     Probe.reset();
     var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .workers = 2, .max_messages = 32 });
     defer plugins.deinit();
@@ -1321,13 +1340,24 @@ test "packet injection from many threads completes on the owning workers" {
     var deliveries: [2]Delivery = .{ .{ .worker = 0 }, .{ .worker = 1 } };
     var errors: std.atomic.Value(u32) = .init(0);
     var threads: [4]std.Thread = undefined;
-    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, injectMany, .{ host, players, &deliveries, &errors });
+    var running: usize = 0;
+    errdefer {
+        plugins.stopping.store(true, .release);
+        for (threads[0..running]) |thread| thread.join();
+    }
+    for (&threads) |*thread| {
+        thread.* = try spawn(.{}, injectMany, .{ host, players, &deliveries, &errors });
+        running += 1;
+    }
+    const deadline = Packets.now(testing.io) + 5 * std.time.ns_per_s;
     while (deliveries[0].ok.load(.monotonic) + deliveries[1].ok.load(.monotonic) + errors.load(.monotonic) < 1000) {
+        if (Packets.now(testing.io) >= deadline) return error.WaitTimedOut;
         plugins.drain(0, testing.io, &sinks[0]);
         plugins.drain(1, testing.io, &sinks[1]);
         std.Thread.yield() catch {};
     }
     for (threads) |thread| thread.join();
+    running = 0;
     try testing.expectEqual(@as(u32, 0), errors.load(.monotonic));
     for (sinks, &deliveries) |sink, *delivery| {
         try testing.expectEqual(@as(usize, 500), sink.calls);
@@ -1336,6 +1366,28 @@ test "packet injection from many threads completes on the owning workers" {
     }
     try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), plugins.injection_bytes.load(.monotonic));
+}
+
+test "plugin producers clean up every partial thread startup" {
+    const Fault = struct {
+        var fail_at: usize = 0;
+        var attempts: usize = 0;
+
+        fn spawn(config: std.Thread.SpawnConfig, comptime function: anytype, args: anytype) std.Thread.SpawnError!std.Thread {
+            const attempt = attempts;
+            attempts += 1;
+            if (attempt == fail_at) return error.ThreadQuotaExceeded;
+            return std.Thread.spawn(config, function, args);
+        }
+    };
+    inline for (.{ concurrentPosts, concurrentInjections }) |run| {
+        for (0..4) |fail_at| {
+            Fault.fail_at = fail_at;
+            Fault.attempts = 0;
+            try testing.expectError(error.ThreadQuotaExceeded, run(Fault.spawn));
+            try testing.expectEqual(fail_at + 1, Fault.attempts);
+        }
+    }
 }
 
 test "packet injection allocation failure releases reservations and old SDK hosts are rejected" {
@@ -1949,6 +2001,7 @@ const Poster = struct {
 
 test "posts from plugin threads racing unload are each settled once before shutdown" {
     var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .max_messages = 64 });
+    defer plugins.deinit();
     try plugins.add(Poster.init, null);
     var context: u8 = 0;
     Poster.player = try plugins.handles.acquire(testing.allocator, .{ .context = &context, .link = 1, .transfer = routedTransfer });
@@ -1960,7 +2013,7 @@ test "posts from plugin threads racing unload are each settled once before shutd
         plugins.drain(0, testing.io, null);
         std.Thread.yield() catch {};
     }
-    plugins.deinit();
+    plugins.unload();
     const delivery = &Poster.delivery;
     try testing.expectEqual(Poster.accepted.load(.acquire), delivery.ok.load(.acquire) + delivery.stale.load(.acquire));
     try testing.expectEqual(@as(u32, 0), delivery.misplaced.load(.acquire));

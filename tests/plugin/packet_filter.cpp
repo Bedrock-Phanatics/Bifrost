@@ -120,8 +120,8 @@ int main() {
             CHECK(host.run(1, player) == BIFROST_PACKET_CANCEL);
         }
     };
-    std::thread first(run, 1);
-    std::thread second(run, 2);
+    std::jthread first(run, 1);
+    std::jthread second(run, 2);
     first.join();
     second.join();
     text = {};
