@@ -424,6 +424,11 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
     const io = env.io;
     const jobs = try gpa.alloc(RelayJob, players.len);
     defer gpa.free(jobs);
+    var initialized: usize = 0;
+    defer for (jobs[0..initialized]) |*job| {
+        gpa.free(job.payload);
+        job.recorder.deinit(gpa);
+    };
     // Random, so compression can't flatter managed mode
     var prng: std.Random.DefaultPrng = .init(size);
     for (jobs, players) |*job, *player| {
@@ -431,12 +436,9 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
         prng.random().bytes(payload);
         payload[0] = 0xfe;
         job.* = .{ .io = io, .player = player, .payload = payload, .window = window, .until_ns = 0 };
+        initialized += 1;
         job.recorder.latencies_ns = try .initCapacity(gpa, 1 << 18);
     }
-    defer for (jobs) |*job| {
-        gpa.free(job.payload);
-        job.recorder.deinit(gpa);
-    };
 
     var latencies: std.ArrayList(u64) = .empty;
     defer latencies.deinit(gpa);
@@ -489,23 +491,51 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
 
 const Mixed = struct { light: Percentiles, hot: ?Percentiles };
 
+test "relay benchmark frees partially initialized jobs" {
+    var players: [3]Player = undefined;
+    var proxy: Proxy = undefined;
+    for ([_]bool{ false, true }) |mixed| {
+        for (0..1 + 2 * players.len) |fail_index| {
+            var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = fail_index });
+            var env: Env = .{
+                .gpa = failing.allocator(),
+                .io = std.testing.io,
+                .exe = "",
+                .process_io = std.testing.io,
+                .frames = undefined,
+                .out = undefined,
+                .quick = true,
+                .cpus = 1,
+            };
+            if (mixed) {
+                try std.testing.expectError(error.OutOfMemory, mixedRelay(&env, &players, 1));
+            } else {
+                try std.testing.expectError(error.OutOfMemory, relay(&env, &proxy, &players, 64, 1));
+            }
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+    }
+}
+
 fn mixedRelay(env: *Env, players: []Player, light_count: usize) !Mixed {
     const gpa = env.gpa;
     const io = env.io;
     const jobs = try gpa.alloc(RelayJob, players.len);
     defer gpa.free(jobs);
+    var initialized: usize = 0;
+    defer for (jobs[0..initialized]) |*job| {
+        gpa.free(job.payload);
+        job.recorder.deinit(gpa);
+    };
     for (jobs, players, 0..) |*job, *player, i| {
         const light = i < light_count;
         const payload = try gpa.alloc(u8, if (light) 64 else 512);
         @memset(payload, 0x5a);
         payload[0] = 0xfe;
         job.* = .{ .io = io, .player = player, .payload = payload, .window = if (light) 1 else 32, .until_ns = 0 };
+        initialized += 1;
         job.recorder.latencies_ns = try .initCapacity(gpa, 1 << 18);
     }
-    defer for (jobs) |*job| {
-        gpa.free(job.payload);
-        job.recorder.deinit(gpa);
-    };
     var light: std.ArrayList(u64) = .empty;
     defer light.deinit(gpa);
     var hot: std.ArrayList(u64) = .empty;
