@@ -41,7 +41,7 @@ fn churn(handles: *Handles, gpa: std.mem.Allocator) void {
     }
 }
 
-fn measure(gpa: std.mem.Allocator, io: std.Io, threads: usize, with_churn: bool, ms: i64) !Result {
+fn measure(comptime spawn: anytype, gpa: std.mem.Allocator, io: std.Io, threads: usize, with_churn: bool, ms: i64) !Result {
     var handles: Handles = .{};
     defer handles.deinit(gpa);
     var players: [live_players]abi.Player = undefined;
@@ -50,8 +50,16 @@ fn measure(gpa: std.mem.Allocator, io: std.Io, threads: usize, with_churn: bool,
     stop.store(false, .release);
     var counts: [8]u64 = @splat(0);
     var workers: [8]std.Thread = undefined;
-    for (workers[0..threads], counts[0..threads], 0..) |*worker, *count, i| worker.* = try std.Thread.spawn(.{}, lookup, .{ &handles, &players, i + 1, count });
-    const churner = if (with_churn) try std.Thread.spawn(.{}, churn, .{ &handles, gpa }) else null;
+    var started_workers: usize = 0;
+    errdefer {
+        stop.store(true, .release);
+        for (workers[0..started_workers]) |worker| worker.join();
+    }
+    for (workers[0..threads], counts[0..threads], 0..) |*worker, *count, i| {
+        worker.* = try spawn(.{}, lookup, .{ &handles, &players, i + 1, count });
+        started_workers += 1;
+    }
+    const churner = if (with_churn) try spawn(.{}, churn, .{ &handles, gpa }) else null;
     const started = harness.nowNs(io);
     harness.sleepMs(io, ms);
     stop.store(true, .release);
@@ -76,8 +84,39 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![8]Result {
     var results: [8]Result = undefined;
     var index: usize = 0;
     for ([_]bool{ false, true }) |with_churn| for ([_]usize{ 1, 2, 4, 8 }) |threads| {
-        results[index] = try measure(gpa, io, threads, with_churn, ms);
+        results[index] = try measure(std.Thread.spawn, gpa, io, threads, with_churn, ms);
         index += 1;
     };
     return results;
+}
+
+test "handle benchmark joins threads after a spawn failure" {
+    const Fault = struct {
+        var fail_at: usize = 0;
+        var attempts: usize = 0;
+        var exited: std.atomic.Value(u32) = .init(0);
+
+        fn spawn(config: std.Thread.SpawnConfig, comptime function: anytype, args: anytype) std.Thread.SpawnError!std.Thread {
+            _ = function;
+            _ = args;
+            const attempt = attempts;
+            attempts += 1;
+            if (attempt == fail_at) return error.ThreadQuotaExceeded;
+            return std.Thread.spawn(config, wait, .{});
+        }
+
+        fn wait() void {
+            while (!stop.load(.acquire)) std.atomic.spinLoopHint();
+            _ = exited.fetchAdd(1, .release);
+        }
+    };
+
+    for (0..5) |fail_at| {
+        Fault.fail_at = fail_at;
+        Fault.attempts = 0;
+        Fault.exited.store(0, .monotonic);
+        try std.testing.expectError(error.ThreadQuotaExceeded, measure(Fault.spawn, std.testing.allocator, std.testing.io, 4, true, 1));
+        try std.testing.expect(stop.load(.acquire));
+        try std.testing.expectEqual(@as(u32, @intCast(fail_at)), Fault.exited.load(.acquire));
+    }
 }

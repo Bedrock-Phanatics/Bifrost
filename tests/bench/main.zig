@@ -28,7 +28,10 @@ pub const std_options_debug_io = zio.debug_io;
 pub const std_options: std.Options = .{ .log_level = .err };
 
 comptime {
-    if (builtin.is_test) std.testing.refAllDecls(harness);
+    if (builtin.is_test) {
+        std.testing.refAllDecls(harness);
+        _ = bench_handles;
+    }
 }
 
 const usage =
