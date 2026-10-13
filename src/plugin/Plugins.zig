@@ -129,6 +129,7 @@ injection_bytes: std.atomic.Value(u32) = .init(0),
 
 pub fn init(gpa: std.mem.Allocator, backends: []const Backend, options: Options) !Plugins {
     if (options.task_threads == 0 or options.task_threads > Pool.max_threads) return error.InvalidOptions;
+    const capacity = std.math.add(u32, options.max_tasks, options.max_messages) catch return error.InvalidOptions;
     const queues = try gpa.alloc(Work.Queue, options.workers);
     var ready: usize = 0;
     errdefer {
@@ -136,7 +137,7 @@ pub fn init(gpa: std.mem.Allocator, backends: []const Backend, options: Options)
         gpa.free(queues);
     }
     for (queues) |*queue| {
-        queue.* = try .init(gpa, options.max_tasks + options.max_messages);
+        queue.* = try .init(gpa, capacity);
         ready += 1;
     }
     return .{ .gpa = gpa, .backends = backends, .options = options, .queues = queues };
@@ -749,6 +750,27 @@ fn hostTransfer(context: *anyopaque, player: abi.Player, backend: u32) callconv(
 }
 
 const testing = std.testing;
+
+test "plugin work queue limits reject overflow before allocating" {
+    const maximum = std.math.maxInt(u32);
+    const invalid = [_]Options{
+        .{ .max_tasks = maximum, .max_messages = 1 },
+        .{ .max_tasks = 1, .max_messages = maximum },
+        .{ .max_tasks = maximum, .max_messages = maximum },
+    };
+    for (invalid) |options| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+        try testing.expectError(error.InvalidOptions, Plugins.init(failing.allocator(), &.{}, options));
+        try testing.expect(!failing.has_induced_failure);
+    }
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, Plugins.init(failing.allocator(), &.{}, .{ .max_tasks = maximum - 1, .max_messages = 1 }));
+    try testing.expect(failing.has_induced_failure);
+    var plugins = try Plugins.init(testing.allocator, &.{}, .{ .max_tasks = 0, .max_messages = 0 });
+    defer plugins.deinit();
+    try testing.expectEqual(@as(usize, 0), plugins.queues[0].items.capacity);
+    try testing.expectEqual(@as(usize, 0), plugins.queues[0].taken.capacity);
+}
 
 test "a rejected plugin cannot queue callbacks during load cleanup" {
     const Rejected = struct {
