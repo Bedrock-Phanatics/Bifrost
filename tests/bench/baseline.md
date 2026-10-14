@@ -631,3 +631,46 @@ both native Windows and `x86_64-linux-gnu`. Formatting and whitespace checks pas
 Linux runtime, network behavior with several reuse-port workers, injection transport throughput and callback
 tail latency remain unmeasured. The earlier codec, dispatch, injection queue and heap measurements retain their
 stated scope; this verification does not establish a new performance result or the absence of all races or leaks.
+
+## Native packet API recheck
+
+Recorded 2026-10-14 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast.
+Command: `zig build bench -Doptimize=ReleaseFast -- decode packet-dispatch injection --quick`.
+The API was already implemented on `main`; this change adds a typed replacement-chain regression and a raw
+C++ access example in the ABI documentation. Production dispatch, codecs, queue behavior and ABI layouts are unchanged.
+These are current measurements, not a before/after performance comparison.
+
+| case | codec-only ns/packet | dispatch ns/packet |
+|---|---|---|
+| raw access | 1.2 | 28.4 |
+| lazy typed decode | 79.5 | 88.6 |
+| ten independent decoders | 806.7 | 509.0 |
+| ten readers sharing fields | 114.4 | 287.8 |
+| raw replacement | 3.6 | 60.8 |
+| typed replacement | 179.3 | 176.4 |
+
+Each result is the median of seven samples. Codec samples process 100 x 4096 Text packets; dispatch samples
+process 200 x 4096 packets alternating Text and an unknown raw packet. Codec and dispatch columns therefore
+have different workloads and must not be subtracted. Sharing reduced the measured ten-reader dispatch cost by
+43.5%. Typed replacement remains above the existing 200 ns/callback budget at 352.4 added ns/callback.
+The codec has no allocator, its views borrow packet bytes, and its cache lives on the dispatch stack.
+
+| injected bytes | ns/packet | packets/s | CPU ns/packet | allocations/packet | queued heap for 32 | retained heap after drain | resident KiB | peak resident KiB |
+|---|---|---|---|---|---|---|---|---|
+| 32 | 130.3 | 7,674,597 | 142.0 | 1 | 4,096 B | 0 B | 7,500 | 7,732 |
+| 1,024 | 213.9 | 4,676,175 | 161.4 | 1 | 35,840 B | 0 B | 7,100 | 7,732 |
+| 16,384 | 872.0 | 1,146,838 | 1,049.9 | 1 | 527,360 B | 0 B | 7,628 | 7,732 |
+| 65,536 | 3,407.4 | 293,477 | 2,774.3 | 1 | 2,100,224 B | 0 B | 9,216 | 9,216 |
+
+Injection timings cover validation, copying, queue insertion, scheduler notification, wake reset, draining and
+freeing, using seven samples of 500 batches of 32 packets. CPU is sampled separately over at least 250 ms.
+Heap figures exclude setup allocations and measure requested live memory, while resident figures cover the
+whole process. The sink does no compression, encryption or network work. Transport throughput, callback tail
+latency, Linux runtime and multi-worker network behavior remain unmeasured in this run.
+
+Verification: the full ReleaseSafe suite passed 247 of 250 Zig tests with three platform skips. The focused
+packet suite passed all 34 tests in Debug and ReleaseFast. All three runs passed the native C++ filter checks.
+The new regression chains three typed replacements across both scratch buffers, rejects a malformed fourth
+replacement, and checks that later listeners, including a validated listener, retain the third version with shared decoding.
+The documented raw callback compiled as C++23 with `-Wall -Wextra -Werror`. Repository formatting and
+whitespace checks passed. No full Debug/ReleaseFast suite or cross-platform build was run for this recheck.

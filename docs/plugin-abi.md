@@ -133,6 +133,20 @@ extension. ABI version 1 and the existing packet layout are unchanged. Subscribe
 to enable these functions for that callback; this flag does not decode the packet automatically. Raw access,
 replacement and cancellation continue to work as before.
 
+Raw-only callbacks can inspect the whole packet without requesting fields or calling the decoder:
+
+```cpp
+#include <span>
+
+bifrost_packet_action onRaw(void *, bifrost_packet *packet) noexcept {
+    const std::span<const uint8_t> bytes(packet->bytes.ptr, packet->bytes.len);
+    return bytes.empty() ? BIFROST_PACKET_CANCEL : BIFROST_PACKET_PASS;
+}
+```
+
+Register this callback with flags `0`. The bytes include the header and borrow host memory until the callback
+returns. A fields-enabled callback has the same raw access and can choose whether to call `decode_packet`.
+
 | type | output | fields |
 |---|---|---|
 | `BIFROST_PACKET_TYPE_TEXT` | `bifrost_text` | all twelve message types, source, message, localization, XUID, platform ID, optional filtered message, and up to four parameters |

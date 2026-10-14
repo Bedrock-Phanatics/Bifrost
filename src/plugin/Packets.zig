@@ -622,6 +622,7 @@ test "replacement chains preserve split-screen headers at the capacity boundary"
 const DecodeProbe = struct {
     mode: enum { read, replace, corrupt, pass, cancel } = .read,
     expected: []const u8 = "original",
+    replacement: []const u8 = "changed",
     status: abi.Status = .ok,
     failed: bool = false,
     saved: ?*const abi.Packet = null,
@@ -645,7 +646,7 @@ const DecodeProbe = struct {
             .read => return .pass,
             .cancel => return .cancel,
             .replace => {
-                text = .{ .message = .of("changed") };
+                text = .{ .message = .of(self.replacement) };
                 // ABI metadata written by a plugin is not the host's source of truth.
                 packet.bytes = .{};
                 packet.replacement = null;
@@ -711,6 +712,37 @@ test "native fields are lazy, shared with validation, refreshed by replacement a
     checks = 0;
     try testing.expectEqual(Result.pass, runBytes(&table, call, bytes, scratch, DecodeChecker{ .calls = &checks }));
     try testing.expectEqual(@as(u32, 0), checks);
+}
+
+test "typed packet modifiers cycle scratch buffers and preserve the last accepted decoded fields" {
+    const gpa = testing.allocator;
+    var metrics: [1]Metrics = .{.{}};
+    var probes: [6]DecodeProbe = .{
+        .{ .mode = .replace, .replacement = "first" },
+        .{ .mode = .replace, .expected = "first", .replacement = "second" },
+        .{ .mode = .replace, .expected = "second", .replacement = "third" },
+        .{ .mode = .corrupt, .expected = "third" },
+        .{ .expected = "third" },
+        .{ .expected = "third" },
+    };
+    var registrations: [probes.len]Registration = undefined;
+    for (&registrations, &probes, 0..) |*registration, *probe, i| registration.* = decodedRegistration(probe, i == probes.len - 1, &metrics);
+    var table: Table = try .build(gpa, .from_player, &registrations);
+    defer table.deinit(gpa);
+    const scratch = try gpa.alloc(u8, scratch_bytes);
+    defer gpa.free(scratch);
+    var buffer: [64]u8 = undefined;
+    const text: abi.Text = .{ .message = .of("original") };
+    const bytes = buffer[0..try Decoded.encode(.{ .packet_id = 9 }, .text, &text, &buffer)];
+    const call: Call = .{ .io = testing.io, .worker = 0, .player = .{ .id = 1 }, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+    var checks: u32 = 0;
+    const result = runBytes(&table, call, bytes, scratch, DecodeChecker{ .calls = &checks }).replace;
+    try testing.expectEqualStrings("third", (try Decoded.decode(result, .text, .{})).text.message.slice());
+    try testing.expectEqualStrings("original", (try Decoded.decode(bytes, .text, .{})).text.message.slice());
+    try testing.expectEqual(@as(u32, 5), checks);
+    try testing.expectEqual(@as(u64, probes.len), metrics[0].calls.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), metrics[0].errors.load(.monotonic));
+    for (probes) |probe| try testing.expect(!probe.failed);
 }
 
 test "invalid native replacements preserve decoded fields and malformed decodes are cached" {
