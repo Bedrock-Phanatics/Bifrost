@@ -753,3 +753,65 @@ The native C++ filter checks passed on Linux. The benchmark regressions check tr
 duplicate replies, exclude drained replies from throughput while retaining their latency, and force allocation
 failure at all ten job-initialization positions with the leak-detecting test allocator. Formatting and final
 whitespace checks passed.
+
+## Injection across Linux workers
+
+Recorded 2026-10-14 on WSL2 Ubuntu, Linux 6.6.87.2-microsoft-standard-WSL2, x86_64, 12 logical CPUs,
+Zig 0.17.0, ReleaseFast, eight driver threads and work-stealing scheduling.
+Command: `zig build bench -Doptimize=ReleaseFast --cache-dir /tmp/bifrost-injection-cache-20261014 -- injection-workers --quick --driver-threads 8`.
+
+Each destination uses a fresh proxy and encrypted echo backend for each worker count. All rows use the same
+32 players, one request in flight per player, deflate above 256 B, and the existing validated native injection
+queue. The kernel chooses each connection's reuse-port worker. The benchmark verifies that every configured
+worker owns at least one of the 32 connections and every player completes a verified exchange in every measured
+iteration, including drain. Throughput counts only replies received before that iteration's timed deadline.
+Per-player tags in the sequence stamp detect misrouting even in the smallest 32-byte packet. The sequence is
+bounded before its 24-bit counter can wrap. Production packet handling and the ABI are unchanged.
+
+| workers | target | packet bytes | replies/s median [min-max] | p50 us | p95 us | p99 us | proxy CPU % | resident KiB | peak resident KiB | players per worker |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | player | 32 | 15,431 [15,198-15,651] | 2,058 | 2,371 | 2,612 | 94.2 | 11,904 | 11,904 | 32 |
+| 1 | player | 1,024 | 8,857 [8,733-8,942] | 3,577 | 3,987 | 4,246 | 92.0 | 11,904 | 11,904 | 32 |
+| 1 | player | 16,384 | 1,878 [1,852-1,895] | 8,182 | 55,553 | 172,473 | 88.5 | 13,568 | 13,568 | 32 |
+| 1 | player | 65,536 | 394 [392-395] | 64,751 | 197,807 | 268,477 | 89.0 | 15,260 | 15,700 | 32 |
+| 1 | backend | 32 | 8,663 [8,182-8,895] | 3,680 | 4,966 | 5,545 | 94.1 | 12,032 | 12,032 | 32 |
+| 1 | backend | 1,024 | 5,886 [4,893-6,216] | 5,476 | 7,617 | 9,739 | 93.8 | 12,160 | 12,160 | 32 |
+| 1 | backend | 16,384 | 1,235 [1,189-1,335] | 14,563 | 105,203 | 178,863 | 86.5 | 14,848 | 14,848 | 32 |
+| 1 | backend | 65,536 | 307 [304-309] | 84,071 | 228,004 | 389,916 | 90.1 | 20,216 | 20,748 | 32 |
+| 2 | player | 32 | 28,857 [27,955-32,561] | 828 | 2,074 | 2,953 | 148.8 | 13,312 | 13,312 | 16 / 16 |
+| 2 | player | 1,024 | 18,567 [18,096-18,596] | 1,637 | 2,331 | 2,686 | 187.8 | 13,312 | 13,312 | 16 / 16 |
+| 2 | player | 16,384 | 3,623 [3,606-3,670] | 7,732 | 9,730 | 18,755 | 176.4 | 14,848 | 14,848 | 16 / 16 |
+| 2 | player | 65,536 | 746 [744-778] | 36,086 | 84,063 | 192,886 | 175.7 | 18,132 | 18,840 | 16 / 16 |
+| 2 | backend | 32 | 16,207 [15,560-16,878] | 1,793 | 3,715 | 4,855 | 167.4 | 13,184 | 13,184 | 10 / 22 |
+| 2 | backend | 1,024 | 10,727 [10,647-10,764] | 2,852 | 5,242 | 6,189 | 162.9 | 13,312 | 13,312 | 10 / 22 |
+| 2 | backend | 16,384 | 1,796 [1,692-1,876] | 14,316 | 28,194 | 167,872 | 126.8 | 16,128 | 16,128 | 10 / 22 |
+| 2 | backend | 65,536 | 346 [316-361] | 81,763 | 175,359 | 264,293 | 124.5 | 21,788 | 22,216 | 10 / 22 |
+| 4 | player | 32 | 60,542 [60,232-65,739] | 419 | 1,016 | 1,525 | 317.8 | 14,848 | 14,848 | 10 / 4 / 8 / 10 |
+| 4 | player | 1,024 | 30,699 [30,266-31,423] | 956 | 1,834 | 2,513 | 346.6 | 14,848 | 14,848 | 10 / 4 / 8 / 10 |
+| 4 | player | 16,384 | 5,803 [5,641-5,894] | 5,815 | 8,332 | 11,996 | 370.2 | 16,256 | 16,256 | 10 / 4 / 8 / 10 |
+| 4 | player | 65,536 | 1,273 [1,242-1,335] | 21,007 | 47,593 | 110,314 | 367.6 | 22,656 | 23,288 | 10 / 4 / 8 / 10 |
+| 4 | backend | 32 | 21,305 [19,940-23,438] | 1,387 | 2,613 | 3,861 | 294.7 | 14,720 | 14,720 | 12 / 11 / 7 / 2 |
+| 4 | backend | 1,024 | 9,094 [8,985-11,051] | 3,109 | 5,280 | 8,513 | 263.7 | 14,848 | 14,848 | 12 / 11 / 7 / 2 |
+| 4 | backend | 16,384 | 1,665 [1,631-1,777] | 12,057 | 60,695 | 123,124 | 178.6 | 18,176 | 18,176 | 12 / 11 / 7 / 2 |
+| 4 | backend | 65,536 | 357 [347-370] | 76,488 | 158,747 | 238,934 | 144.6 | 23,280 | 24,160 | 12 / 11 / 7 / 2 |
+
+Rates are medians of three two-second intervals after 300 ms warmup. CPU, memory, latency and drain accounting
+use the same definitions as the transport benchmark above. The worker scenario uses at least two seconds per
+interval even with `--quick`. Preliminary 500 ms runs exposed an overly strict progress check that rejected
+players whose valid replies arrived during drain. Progress now requires a verified exchange per player per
+iteration, including drain, while late replies remain excluded from throughput. The comparison bounds request
+packets in flight to 2 MiB at the largest size. All 24 recorded cases passed order, content, identity and delivery checks.
+
+The direct-player 32-byte rate rose from 15,431 replies/s with one worker to 60,542 with four in this run.
+Backend scaling was mixed: the 1 KiB result was lower with four workers than with two. Kernel-selected connection
+distribution, WSL scheduling and the shared driver/echo-backend host are part of this workload; their individual
+effects are not isolated. These are measurements of this setup, not a general capacity or speedup claim.
+Isolated callback latency remains unmeasured.
+
+Verification: all seven benchmark checks passed in Debug, ReleaseSafe and ReleaseFast on Windows and in
+ReleaseSafe on Linux. They cover missing/empty workers, incorrect or overflowing connection totals, wrong-player
+replies including the 32-byte case, order/content/duplicate checks, drained-only reply accounting and allocation
+failure cleanup. The existing single-worker transport matrix also passed all sixteen Windows ReleaseFast cases
+after the drain-accounting correction, and the worker scenario explicitly skipped its unsupported Windows mode.
+The full repository test suite was not rerun for this benchmark-only change. Formatting and final whitespace
+checks passed.

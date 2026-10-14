@@ -35,7 +35,7 @@ comptime {
 }
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|injection|injection-transport|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--proxy-exe") and i + 1 < args.len) {
             i += 1;
             proxy_exe = args[i];
-        } else if (std.mem.eql(u8, arg, "packet-dispatch") or std.mem.eql(u8, arg, "injection-transport")) {
+        } else if (std.mem.eql(u8, arg, "packet-dispatch") or std.mem.eql(u8, arg, "injection-transport") or std.mem.eql(u8, arg, "injection-workers")) {
             try selected.append(gpa, arg);
         } else if (for (all_scenarios) |name| {
             if (std.mem.eql(u8, arg, name)) break true;
@@ -108,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
         if (proxy_exe == null) "work_stealing" else bench_options.scheduling,
         if (quick) ", quick" else "",
     });
-    try env.out.print("Login frame {d} B, {d} iterations of {d} ms after {d} ms warmup\n", .{
+    try env.out.print("Default timing: login frame {d} B, {d} iterations of {d} ms after {d} ms warmup\n", .{
         frames.login.len, env.iterations(), env.iterationMs(), env.warmupMs(),
     });
     if (builtin.os.tag == .windows) try env.out.writeAll("Resident memory uses Windows working set; peak is the process lifetime peak. CPU 100% means one fully occupied core.\n");
@@ -121,7 +121,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "deflate")) try deflateScenario(&env);
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
         if (std.mem.eql(u8, name, "packet-dispatch")) try packetDispatch(&env);
-        if (std.mem.eql(u8, name, "injection-transport")) try injectionScenario(&env);
+        if (std.mem.eql(u8, name, "injection-transport")) try injectionScenario(&env, .transport);
+        if (std.mem.eql(u8, name, "injection-workers")) try injectionScenario(&env, .workers);
         if (std.mem.eql(u8, name, "injection")) {
             const results = try bench_injection.run(env.gpa, env.io, env.quick);
             try env.out.print("\n## Packet injection queue\n\nText packets, batches of 32, median of seven samples. Includes validation, copy, queue, scheduler notification, wake reset, drain and free with allocation accounting; sink does no transport work. CPU is sampled separately over at least {d} ms and includes all process threads. Resident memory includes the whole benchmark process.\n\n| packet bytes | ns per packet | packets/s | CPU ns per packet | allocations per packet | queued heap for 32 | retained heap after drain | resident KiB | peak resident KiB |\n|---|---|---|---|---|---|---|---|---|\n", .{if (env.quick) @as(u32, 250) else 1000});
@@ -647,6 +648,7 @@ const InjectionJob = struct {
     message: []u8,
     packet: []u8,
     window: usize,
+    tag: u8 = 0,
     until_ns: u64 = 0,
     sent: u64 = 0,
     received: u64 = 0,
@@ -665,7 +667,9 @@ const InjectionJob = struct {
             const now = nowNs(self.io);
             if (now < self.until_ns) {
                 while (self.sent - self.received < self.window) : (self.sent += 1) {
-                    _ = try std.fmt.bufPrint(self.message[0..24], "{x:0>16}{x:0>8}", .{ nowNs(self.io), @as(u32, @intCast(self.sent)) });
+                    if (self.sent >= 1 << 24) return error.TooManyInjectionSamples;
+                    const sequence = @as(u32, self.tag) << 24 | @as(u32, @intCast(self.sent));
+                    _ = try std.fmt.bufPrint(self.message[0..24], "{x:0>16}{x:0>8}", .{ nowNs(self.io), sequence });
                     const text: bifrost.plugin_abi.Text = .{ .message = .of(self.message) };
                     const len = try bifrost.Plugins.Packets.Decoded.encode(.{ .packet_id = @import("bedwire").protocol.Current.packetId(.text).? }, .text, &text, self.packet);
                     if (len != self.packet.len) return error.InvalidBenchmarkPacket;
@@ -698,7 +702,8 @@ const InjectionJob = struct {
         if (self.received >= self.sent or text.message_type != .raw or text.localize != 0 or text.has_filtered_message != 0 or text.xuid.len != 0 or text.platform_id.len != 0) return error.UnexpectedReply;
         if (message.len != self.message.len or message.len < 24 or !std.mem.eql(u8, message[24..], self.message[24..])) return error.UnexpectedReply;
         const sequence = try std.fmt.parseInt(u32, message[16..24], 16);
-        if (sequence != self.received) return error.ReorderedReply;
+        if (sequence >> 24 != self.tag) return error.MisroutedReply;
+        if (sequence & 0xffffff != self.received) return error.ReorderedReply;
         const sent_at = try std.fmt.parseInt(u64, message[0..16], 16);
         const now = nowNs(self.io);
         if (sent_at > now) return error.InvalidTimestamp;
@@ -716,7 +721,7 @@ const InjectionResult = struct {
     peak_kb: ?u64,
 };
 
-fn injectionRelay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize) !InjectionResult {
+fn injectionRelay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize, sample_ms: u64) !InjectionResult {
     const gpa = env.gpa;
     const jobs = try gpa.alloc(InjectionJob, players.len);
     defer gpa.free(jobs);
@@ -728,7 +733,7 @@ fn injectionRelay(env: *Env, proxy: *Proxy, players: []Player, size: usize, wind
     };
     const overhead: usize = if (size < 128) 8 else if (size <= 16384) 9 else 10;
     var prng: std.Random.DefaultPrng = .init(size);
-    for (jobs, players) |*job, *player| {
+    for (jobs, players, 0..) |*job, *player, i| {
         const message = try gpa.alloc(u8, size - overhead);
         const packet = gpa.alloc(u8, size) catch |err| {
             gpa.free(message);
@@ -736,7 +741,7 @@ fn injectionRelay(env: *Env, proxy: *Proxy, players: []Player, size: usize, wind
         };
         prng.random().bytes(message);
         for (message) |*byte| byte.* = 32 + byte.* % 95;
-        job.* = .{ .io = env.io, .player = player, .message = message, .packet = packet, .window = window };
+        job.* = .{ .io = env.io, .player = player, .message = message, .packet = packet, .window = window, .tag = @intCast(i) };
         initialized += 1;
         job.recorder.latencies_ns = try .initCapacity(gpa, 1 << 18);
     }
@@ -750,7 +755,7 @@ fn injectionRelay(env: *Env, proxy: *Proxy, players: []Player, size: usize, wind
             before = try proxy.stats();
             measuring_since = nowNs(env.io);
         }
-        const duration_ms = if (iteration == 0) env.warmupMs() else env.iterationMs();
+        const duration_ms = if (iteration == 0) env.warmupMs() else sample_ms;
         const started = nowNs(env.io);
         for (jobs) |*job| {
             job.until_ns = started + duration_ms * std.time.ns_per_ms;
@@ -762,8 +767,12 @@ fn injectionRelay(env: *Env, proxy: *Proxy, players: []Player, size: usize, wind
         for (jobs) |*job| try group.concurrent(env.io, InjectionJob.run, .{job});
         try group.await(env.io);
         var count: u64 = 0;
-        for (jobs) |*job| {
+        for (jobs, 0..) |*job, i| {
             if (job.failed or job.received != job.sent) return error.InjectionTransportFailed;
+            if (iteration != 0 and job.recorder.latencies_ns.items.len == 0) {
+                std.log.err("injection player {d} exchanged no verified replies in the measured iteration", .{i});
+                return error.NoInjectionSamples;
+            }
             count += job.recorder.messages;
             if (iteration != 0) try latencies.appendSlice(gpa, job.recorder.latencies_ns.items);
         }
@@ -783,33 +792,68 @@ fn injectionRelay(env: *Env, proxy: *Proxy, players: []Player, size: usize, wind
     };
 }
 
-fn injectionScenario(env: *Env) !void {
-    try env.out.writeAll("\n## Packet injection transport\n\n1 proxy worker, encrypted managed sessions, deflate above 256 B, pseudorandom printable Text messages. Each request is canceled by a plugin and injected to the player or backend; the backend echoes Text to the player. Throughput counts verified replies received within each timed interval, latency includes drained replies. Sequence, content and exact delivery counts are checked. CPU and resident memory cover only the proxy process; peak memory is its lifetime peak. Allocations are measured separately by the injection queue benchmark.\n\n| target | packet bytes | load | replies/s median [min-max] | p50 us | p95 us | p99 us | proxy CPU % | resident KiB | peak resident KiB |\n|---|---|---|---|---|---|---|---|---|---|\n");
-    for ([_][]const u8{ "inject-player", "inject-backend" }) |setup| {
+fn injectionDistribution(snapshot_value: Snapshot, workers: u8, players: usize) !void {
+    if (snapshot_value.workers != workers) return error.InvalidWorkerDistribution;
+    var total: usize = 0;
+    for (snapshot_value.per_worker[0..snapshot_value.workers]) |count| {
+        if (count == 0 or count > players - total) return error.InvalidWorkerDistribution;
+        total += @intCast(count);
+    }
+    if (total != players) return error.InvalidWorkerDistribution;
+}
+
+fn injectionScenario(env: *Env, mode: enum { transport, workers }) !void {
+    if (mode == .workers and !bifrost.Config.multi_worker_supported) {
+        try env.out.writeAll("\n## Packet injection workers\n\nSkipped: multiple reuse-port workers require Linux.\n");
+        return;
+    }
+    const sample_ms = if (mode == .workers) @max(2000, env.iterationMs()) else env.iterationMs();
+    try env.out.print("\n## Packet injection transport\n\nEncrypted managed sessions, deflate above 256 B, pseudorandom printable Text messages. Each request is canceled by a plugin and injected to the player or backend; the backend echoes Text to the player. Throughput counts verified replies received within each timed interval, latency includes drained replies. Sequence, content and exact delivery counts are checked, and every player must make progress. CPU and resident memory cover only the proxy process; peak memory is its lifetime peak. Allocations are measured separately by the injection queue benchmark. Sampling {d} intervals of {d} ms after {d} ms warmup.\n\n| workers | target | packet bytes | load | replies/s median [min-max] | p50 us | p95 us | p99 us | proxy CPU % | resident KiB | peak resident KiB | connected players per worker |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n", .{ env.iterations(), sample_ms, env.warmupMs() });
+    const worker_counts = [_]u8{ 1, 2, 4 };
+    for (worker_counts[0..if (mode == .workers) worker_counts.len else 1]) |workers| for ([_][]const u8{ "inject-player", "inject-backend" }) |setup| {
+        if (workers > env.cpus) continue;
         var backend: managed.Backend = undefined;
         try backend.start(env.gpa, env.io);
         defer backend.deinit();
         var proxy: Proxy = undefined;
-        try env.startProxy(&proxy, .{ .managed = true, .plugins = setup, .backends = &.{backend.port()} });
+        try env.startProxy(&proxy, .{ .workers = workers, .managed = true, .plugins = setup, .backends = &.{backend.port()} });
         defer proxy.stop();
-        var players: [8]Player = undefined;
+        var storage: [32]Player = undefined;
+        const players = storage[0..if (mode == .workers) storage.len else 8];
         var joined: usize = 0;
         defer for (players[0..joined]) |*player| player.deinit();
-        for (&players, 0..) |*player, i| {
+        for (players, 0..) |*player, i| {
             try player.connect(env.gpa, env.io, proxy.address());
             joined += 1;
             try managed.join(env.gpa, env.io, player, @intCast(i + 2));
         }
-        for ([_]usize{ 32, 1024, 16384, 65536 }) |size| for (0..2) |loaded| {
-            const window = if (loaded == 0) 1 else windowFor(size);
-            const result = try injectionRelay(env, &proxy, if (loaded == 0) players[0..1] else &players, size, window);
-            try env.out.print("| {s} | {d} | {d}x{d} | {d:.0} [{d:.0}-{d:.0}] | {d:.0} | {d:.0} | {d:.0} | {?d:.1} | {?d} | {?d} |\n", .{ setup["inject-".len..], size, if (loaded == 0) @as(usize, 1) else players.len, window, result.packets_s.median, result.packets_s.min, result.packets_s.max, result.latency.p50, result.latency.p95, result.latency.p99, result.cpu_pct, result.rss_kb, result.peak_kb });
+        const distribution = try proxy.stats();
+        try injectionDistribution(distribution, workers, players.len);
+        for ([_]usize{ 32, 1024, 16384, 65536 }) |size| for (@as(usize, if (mode == .workers) 1 else 0)..2) |loaded| {
+            const window = if (loaded == 0 or mode == .workers) 1 else windowFor(size);
+            const result = try injectionRelay(env, &proxy, if (loaded == 0) players[0..1] else players, size, window, sample_ms);
+            try env.out.print("| {d} | {s} | {d} | {d}x{d} | {d:.0} [{d:.0}-{d:.0}] | {d:.0} | {d:.0} | {d:.0} | {?d:.1} | {?d} | {?d} | ", .{ workers, setup["inject-".len..], size, if (loaded == 0) @as(usize, 1) else players.len, window, result.packets_s.median, result.packets_s.min, result.packets_s.max, result.latency.p50, result.latency.p95, result.latency.p99, result.cpu_pct, result.rss_kb, result.peak_kb });
+            for (distribution.per_worker[0..distribution.workers], 0..) |count, i| try env.out.print("{s}{d}", .{ if (i == 0) "" else " / ", count });
+            try env.out.writeAll(" |\n");
             try env.out.flush();
         };
-    }
+    };
 }
 
-test "relay benchmark injection rejects reordered, altered and duplicate replies" {
+test "relay benchmark injection requires complete worker distribution" {
+    var value: Snapshot = .{ .workers = 4 };
+    @memcpy(value.per_worker[0..4], &[_]u64{ 8, 8, 8, 8 });
+    try injectionDistribution(value, 4, 32);
+    try std.testing.expectError(error.InvalidWorkerDistribution, injectionDistribution(value, 2, 32));
+    value.per_worker[0] = 7;
+    try std.testing.expectError(error.InvalidWorkerDistribution, injectionDistribution(value, 4, 32));
+    @memcpy(value.per_worker[0..4], &[_]u64{ 16, 8, 8, 0 });
+    try std.testing.expectError(error.InvalidWorkerDistribution, injectionDistribution(value, 4, 32));
+    value.per_worker[3] = std.math.maxInt(u64);
+    try std.testing.expectError(error.InvalidWorkerDistribution, injectionDistribution(value, 4, 32));
+}
+
+test "relay benchmark injection rejects invalid replies" {
     var message: [32]u8 = @splat('x');
     @memcpy(message[0..24], "000000000000000000000000");
     var buffer: [64]u8 = undefined;
@@ -824,6 +868,10 @@ test "relay benchmark injection rejects reordered, altered and duplicate replies
     _ = try Decoded.encode(.{ .packet_id = 9 }, .text, &text, &buffer);
     message[23] = '0';
     try std.testing.expectError(error.ReorderedReply, job.record(buffer[0..len]));
+    message[16] = '1';
+    _ = try Decoded.encode(.{ .packet_id = 9 }, .text, &text, &buffer);
+    message[16] = '0';
+    try std.testing.expectError(error.MisroutedReply, job.record(buffer[0..len]));
     message[24] = 'y';
     _ = try Decoded.encode(.{ .packet_id = 9 }, .text, &text, &buffer);
     message[24] = 'x';
@@ -835,12 +883,23 @@ test "relay benchmark injection rejects reordered, altered and duplicate replies
     try std.testing.expectError(error.UnexpectedReply, job.record(buffer[0..len]));
     job.sent = 2;
     job.until_ns = 0;
+    job.recorder.messages = 0;
+    job.recorder.latencies_ns.clearRetainingCapacity();
     message[23] = '1';
     _ = try Decoded.encode(.{ .packet_id = 9 }, .text, &text, &buffer);
     try job.record(buffer[0..len]);
     try std.testing.expectEqual(@as(u64, 2), job.received);
-    try std.testing.expectEqual(@as(u64, 1), job.recorder.messages);
-    try std.testing.expectEqual(@as(usize, 2), job.recorder.latencies_ns.items.len);
+    try std.testing.expectEqual(@as(u64, 0), job.recorder.messages);
+    try std.testing.expectEqual(@as(usize, 1), job.recorder.latencies_ns.items.len);
+    job.tag = 1;
+    job.message = message[0..24];
+    job.sent = 1;
+    job.received = 0;
+    message[23] = '0';
+    const shortest: bifrost.plugin_abi.Text = .{ .message = .of(job.message) };
+    const shortest_len = try Decoded.encode(.{ .packet_id = 9 }, .text, &shortest, &buffer);
+    try std.testing.expectEqual(@as(usize, 32), shortest_len);
+    try std.testing.expectError(error.MisroutedReply, job.record(buffer[0..shortest_len]));
 }
 
 test "relay benchmark injection frees partially initialized jobs" {
@@ -849,7 +908,7 @@ test "relay benchmark injection frees partially initialized jobs" {
     for (0..1 + 3 * players.len) |fail_index| {
         var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = fail_index });
         var env: Env = .{ .gpa = failing.allocator(), .io = std.testing.io, .exe = "", .process_io = std.testing.io, .frames = undefined, .out = undefined, .quick = true, .cpus = 1 };
-        try std.testing.expectError(error.OutOfMemory, injectionRelay(&env, &proxy, &players, 32, 1));
+        try std.testing.expectError(error.OutOfMemory, injectionRelay(&env, &proxy, &players, 32, 1, 500));
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 }
