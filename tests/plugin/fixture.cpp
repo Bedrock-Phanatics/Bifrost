@@ -7,6 +7,7 @@
 #include <type_traits>
 
 #include "bifrost_plugin.h"
+#include "bifrost_manifest.h"
 
 static_assert(std::is_nothrow_invocable_v<bifrost_event_fn, void *, const bifrost_event *, bifrost_transfer_decision *>);
 static_assert(std::is_nothrow_invocable_v<bifrost_command_fn, void *, const bifrost_command *>);

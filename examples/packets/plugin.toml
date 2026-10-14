@@ -1,0 +1,3 @@
+name = "PacketFilter"
+version = "1.0.0"
+description = "Limits client chat and chunk-radius requests"

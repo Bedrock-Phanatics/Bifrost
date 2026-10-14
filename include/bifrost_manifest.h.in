@@ -1,0 +1,17 @@
+#ifndef BIFROST_MANIFEST_H
+#define BIFROST_MANIFEST_H
+
+#include "bifrost_plugin.h"
+
+#ifdef __cplusplus
+extern "C"
+#endif
+BIFROST_EXPORT bifrost_status bifrost_plugin_get_manifest(bifrost_str *out) BIFROST_NOEXCEPT {
+    static const uint8_t bytes[] = { @BIFROST_MANIFEST_BYTES@ };
+    if (!out) return BIFROST_STATUS_INVALID_ARGUMENT;
+    out->ptr = bytes;
+    out->len = sizeof(bytes);
+    return BIFROST_STATUS_OK;
+}
+
+#endif

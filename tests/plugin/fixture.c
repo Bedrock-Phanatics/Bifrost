@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include "bifrost_plugin.h"
+#include "bifrost_manifest.h"
 
 static uint32_t events;
 static uint32_t shutdowns;

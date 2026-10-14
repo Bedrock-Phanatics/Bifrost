@@ -6,6 +6,9 @@ const std = @import("std");
 
 pub const version: u32 = 1;
 pub const entrypoint = "bifrost_plugin_init";
+pub const manifest_entrypoint = "bifrost_plugin_get_manifest";
+pub const max_manifest_bytes = 4096;
+pub const ManifestFn = *const fn (out: ?*Str) callconv(.c) Status;
 pub const no_backend: u32 = std.math.maxInt(u32);
 pub const no_worker: u32 = std.math.maxInt(u32);
 

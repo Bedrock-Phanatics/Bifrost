@@ -176,12 +176,9 @@ pub fn load(plugins: *bifrost.Plugins, io: std.Io, setup: Setup, hot: u10) !void
         .ten_shared => for (0..10) |_| try plugins.add(lazy, null),
         .typed_replace => try plugins.add(typedReplacer, null),
         .packet_filter, .packet_filter_chat => {
-            const path = try std.Io.Dir.cwd().realPathFileAlloc(io, bench_options.packet_filter, plugins.gpa);
-            defer plugins.gpa.free(path);
-            var library = try bifrost.Plugins.Library.open(path);
-            errdefer library.close();
-            const entry = library.lookup(abi.InitFn, "bifrost_plugin_init") orelse return error.MissingEntrypoint;
-            try plugins.add(entry, library);
+            var dir = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(bench_options.packet_filter) orelse ".", .{});
+            defer dir.close(io);
+            try bifrost.Plugins.Package.load(plugins, io, dir, std.fs.path.basename(bench_options.packet_filter));
         },
         .ten_ids => {
             try plugins.add(raw, null);

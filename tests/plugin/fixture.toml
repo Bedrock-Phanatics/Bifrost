@@ -1,0 +1,3 @@
+name = "c-fixture"
+version = "1.0.0"
+description = "Counts players, says plugin.toml"

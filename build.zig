@@ -23,6 +23,8 @@ const Plugin = struct {
     c_fixture: *std.Build.Step.Compile,
     cpp_fixture: *std.Build.Step.Compile,
     no_entry: *std.Build.Step.Compile,
+    no_manifest: *std.Build.Step.Compile,
+    rejected: *std.Build.Step.Compile,
     packet_filter: *std.Build.Step.Compile,
     filter_test: *std.Build.Step.Compile,
     header: *std.Build.Module,
@@ -84,7 +86,7 @@ fn addPluginSdk(ctx: Context) Plugin {
     const example = b.addLibrary(.{ .name = "maintenance", .linkage = .dynamic, .root_module = ctx.module("examples/maintenance.zig", &.{
         .{ .name = "bifrost_plugin", .module = sdk },
     }) });
-    installPackage(ctx, example, "Maintenance", "maintenance", "Keeps players off the maintenance backend");
+    installPlugin(ctx, example, "Maintenance");
     const greeter = b.addLibrary(.{ .name = "Greeter", .linkage = .dynamic, .root_module = b.createModule(.{
         .target = ctx.target,
         .optimize = ctx.optimize,
@@ -92,14 +94,17 @@ fn addPluginSdk(ctx: Context) Plugin {
     }) });
     greeter.root_module.addCSourceFile(.{ .file = b.path("examples/greeter/Greeter.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
     greeter.root_module.addIncludePath(b.path("include"));
-    installPackage(ctx, greeter, "Greeter", "Greeter", "Logs a welcome for every player");
+    embedManifest(b, greeter, "examples/greeter/plugin.toml");
+    installPlugin(ctx, greeter, "Greeter");
     const packet_filter = b.addLibrary(.{ .name = "PacketFilter", .linkage = .dynamic, .root_module = b.createModule(.{ .target = ctx.target, .optimize = ctx.optimize, .link_libcpp = true }) });
     packet_filter.root_module.addCSourceFile(.{ .file = b.path("examples/packets/PacketFilter.cpp"), .flags = &.{ "-std=c++23", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror" } });
     packet_filter.root_module.addIncludePath(b.path("include"));
-    installPackage(ctx, packet_filter, "PacketFilter", "PacketFilter", "Limits client chat and chunk-radius requests");
+    embedManifest(b, packet_filter, "examples/packets/plugin.toml");
+    installPlugin(ctx, packet_filter, "PacketFilter");
     const filter_test = b.addExecutable(.{ .name = "packet-filter-test", .root_module = b.createModule(.{ .target = ctx.target, .optimize = ctx.optimize, .link_libcpp = true }) });
     filter_test.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/packet_filter.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
     filter_test.root_module.addIncludePath(b.path("include"));
+    embedManifest(b, filter_test, "examples/packets/plugin.toml");
     const header = b.addTranslateC(.{
         .root_source_file = b.path("include/bifrost_plugin.h"),
         .target = ctx.target,
@@ -113,6 +118,7 @@ fn addPluginSdk(ctx: Context) Plugin {
     }) });
     c_fixture.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/fixture.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
     c_fixture.root_module.addIncludePath(b.path("include"));
+    embedManifest(b, c_fixture, "tests/plugin/fixture.toml");
     const cpp_fixture = b.addLibrary(.{ .name = "cpp_fixture", .linkage = .dynamic, .root_module = b.createModule(.{
         .target = ctx.target,
         .optimize = ctx.optimize,
@@ -120,6 +126,7 @@ fn addPluginSdk(ctx: Context) Plugin {
     }) });
     cpp_fixture.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/fixture.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
     cpp_fixture.root_module.addIncludePath(b.path("include"));
+    embedManifest(b, cpp_fixture, "tests/plugin/fixture_cpp.toml");
     const no_entry = b.addLibrary(.{ .name = "no_entry", .linkage = .dynamic, .root_module = b.createModule(.{
         .target = ctx.target,
         .optimize = ctx.optimize,
@@ -127,20 +134,43 @@ fn addPluginSdk(ctx: Context) Plugin {
     }) });
     no_entry.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/no_entry.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
     no_entry.root_module.addIncludePath(b.path("include"));
-    return .{ .example = example, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .no_entry = no_entry, .packet_filter = packet_filter, .filter_test = filter_test, .header = header.createModule() };
+    embedManifest(b, no_entry, "tests/plugin/no_entry.toml");
+    const no_manifest = b.addLibrary(.{ .name = "no_manifest", .linkage = .dynamic, .root_module = b.createModule(.{
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = true,
+    }) });
+    no_manifest.root_module.addCSourceFile(.{ .file = b.path("tests/plugin/no_manifest.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
+    no_manifest.root_module.addIncludePath(b.path("include"));
+    const rejected = b.addLibrary(.{ .name = "rejected", .linkage = .dynamic, .root_module = ctx.module("tests/plugin/rejected.zig", &.{
+        .{ .name = "bifrost_plugin", .module = sdk },
+    }) });
+    return .{ .no_manifest = no_manifest, .rejected = rejected, .example = example, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .no_entry = no_entry, .packet_filter = packet_filter, .filter_test = filter_test, .header = header.createModule() };
 }
 
-// The manifest is generated so `library` has the target's extension
-fn installPackage(ctx: Context, library: *std.Build.Step.Compile, dir: []const u8, name: []const u8, description: []const u8) void {
+fn installPlugin(ctx: Context, library: *std.Build.Step.Compile, name: []const u8) void {
     const b = ctx.b;
-    const file = b.fmt("{s}{s}", .{ dir, ctx.target.result.dynamicLibSuffix() });
-    const manifest = b.addWriteFiles().add("plugin.toml", b.fmt(
-        "name = \"{s}\"\nversion = \"1.0.0\"\ndescription = \"{s}\"\nlibrary = \"{s}\"\n",
-        .{ name, description, file },
-    ));
-    const dest: std.Build.InstallDir = .{ .custom = b.fmt("plugins/{s}", .{dir}) };
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(manifest, dest, "plugin.toml").step);
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(library.getEmittedBin(), dest, file).step);
+    const file = b.fmt("{s}{s}", .{ name, ctx.target.result.dynamicLibSuffix() });
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(library.getEmittedBin(), .{ .custom = "plugins" }, file).step);
+}
+
+fn embedManifest(b: *std.Build, library: *std.Build.Step.Compile, path: []const u8) void {
+    b.dependOnFileContents(b.path(path));
+    b.dependOnFileContents(b.path("include/bifrost_manifest.h.in"));
+    const source_path = b.root.joinString(b.allocator, path) catch @panic("out of memory");
+    const template_path = b.root.joinString(b.allocator, "include/bifrost_manifest.h.in") catch @panic("out of memory");
+    const source = std.Io.Dir.cwd().readFileAlloc(b.graph.io, source_path, b.allocator, .limited(4096)) catch
+        @panic("can't read plugin.toml");
+    if (source.len == 0 or !std.unicode.utf8ValidateSlice(source)) @panic("plugin.toml must be UTF-8 and nonempty");
+    var bytes: std.Io.Writer.Allocating = .init(b.allocator);
+    for (source) |byte| bytes.writer.print("0x{x:0>2},", .{byte}) catch @panic("out of memory");
+    const template = std.Io.Dir.cwd().readFileAlloc(b.graph.io, template_path, b.allocator, .limited(4096)) catch
+        @panic("can't read manifest header template");
+    const header = std.mem.replaceOwned(u8, b.allocator, template, "@BIFROST_MANIFEST_BYTES@", bytes.written()) catch
+        @panic("out of memory");
+    const files = b.addWriteFiles();
+    _ = files.add("bifrost_manifest.h", header);
+    library.root_module.addIncludePath(files.getDirectory());
 }
 
 fn addTests(ctx: Context, plugin: Plugin) void {
@@ -155,6 +185,8 @@ fn addTests(ctx: Context, plugin: Plugin) void {
         .{ .name = "bifrost_plugin_h", .module = plugin.header },
     }), .filters = filters });
     integration_tests.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
+    integration_tests.root_module.addAnonymousImport("maintenance_manifest", .{ .root_source_file = b.path("examples/maintenance/plugin.toml") });
+    integration_tests.root_module.addAnonymousImport("packet_manifest", .{ .root_source_file = b.path("examples/packets/plugin.toml") });
     const options = b.addOptions();
     options.addOption(bool, "report", b.option(bool, "transfer-report", "Print transfer stress timings and memory") orelse false);
     options.addOption(u32, "soak", b.option(u32, "soak", "Multiply the transfer stress rounds, e.g. 25 for a soak run") orelse 1);
@@ -162,6 +194,8 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     options.addOptionPath("c_plugin", plugin.c_fixture.getEmittedBin());
     options.addOptionPath("cpp_plugin", plugin.cpp_fixture.getEmittedBin());
     options.addOptionPath("no_entry_library", plugin.no_entry.getEmittedBin());
+    options.addOptionPath("no_manifest_library", plugin.no_manifest.getEmittedBin());
+    options.addOptionPath("rejected_plugin", plugin.rejected.getEmittedBin());
     options.addOptionPath("packet_filter", plugin.packet_filter.getEmittedBin());
     integration_tests.root_module.addImport("test_options", options.createModule());
 

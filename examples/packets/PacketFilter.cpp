@@ -2,6 +2,7 @@
 #include <cstring>
 #include <string_view>
 #include "bifrost_plugin.h"
+#include "bifrost_manifest.h"
 
 namespace {
 bifrost_str toStr(std::string_view text) noexcept {
@@ -66,8 +67,6 @@ private:
 
 extern "C" BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin) noexcept {
     if (host->abi_version != BIFROST_ABI_VERSION || !BIFROST_HOST_HAS(host, send_packet)) return BIFROST_STATUS_INCOMPATIBLE;
-    plugin->name = toStr("PacketFilter");
-    plugin->plugin_version = toStr("1.0.0");
     plugin->capabilities = BIFROST_CAPABILITY_PACKETS;
     return PacketFilter::start(host);
 }

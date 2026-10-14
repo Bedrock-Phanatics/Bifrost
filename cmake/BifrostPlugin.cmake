@@ -1,0 +1,15 @@
+function(bifrost_embed_manifest target manifest)
+    get_filename_component(manifest "${manifest}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${manifest}")
+    file(SIZE "${manifest}" manifestSize)
+    if(manifestSize LESS 1 OR manifestSize GREATER 4096)
+        message(FATAL_ERROR "plugin.toml must be 1 to 4096 bytes")
+    endif()
+    file(READ "${manifest}" manifestHex HEX)
+    string(REGEX REPLACE "(..)" "0x\\1," BIFROST_MANIFEST_BYTES "${manifestHex}")
+    set(generatedDir "${CMAKE_CURRENT_BINARY_DIR}/${target}-manifest")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../include/bifrost_manifest.h.in"
+        "${generatedDir}/bifrost_manifest.h" @ONLY)
+    target_include_directories(${target} PRIVATE "${generatedDir}"
+        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../include")
+endfunction()

@@ -275,6 +275,9 @@ typedef struct bifrost_plugin {
 
 BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin) BIFROST_NOEXCEPT;
 
+/* Returns static UTF-8 TOML bytes valid until the library is unloaded */
+BIFROST_EXPORT bifrost_status bifrost_plugin_get_manifest(bifrost_str *out) BIFROST_NOEXCEPT;
+
 #ifdef __cplusplus
 }
 #endif

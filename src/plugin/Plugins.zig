@@ -171,12 +171,21 @@ pub fn load(self: *Plugins, entry: abi.InitFn, library: ?Library, manifest: ?*co
     loaded.metrics = try self.gpa.alloc(Packets.Metrics, self.options.workers);
     errdefer self.gpa.free(loaded.metrics);
     @memset(loaded.metrics, .{});
-    if (manifest) |expected| loaded.metadata.package = try self.gpa.dupe(u8, expected.package);
+    if (manifest) |expected| {
+        loaded.metadata.package = try self.gpa.dupe(u8, expected.package);
+        loaded.plugin.name = .of(expected.name());
+        loaded.plugin.plugin_version = .of(expected.version());
+    }
     errdefer self.gpa.free(loaded.metadata.package);
 
     self.pending.clearRetainingCapacity();
     self.pending_packets.clearRetainingCapacity();
     self.pending_commands.clearRetainingCapacity();
+    defer {
+        self.pending.clearRetainingCapacity();
+        self.pending_packets.clearRetainingCapacity();
+        self.pending_commands.clearRetainingCapacity();
+    }
     self.initializing.store(loaded, .release);
     const outer = Work.enter();
     const status = entry(&loaded.host, &loaded.plugin);
@@ -253,6 +262,8 @@ pub fn load(self: *Plugins, entry: abi.InitFn, library: ?Library, manifest: ?*co
     if (self.pending_packets.items.len != 0) try self.addPacketHooks(loaded);
     for (self.pending_commands.items, names) |item, name| self.commands.putAssumeCapacityNoClobber(name, item.command);
     for (self.pending.items) |item| self.subscribers[@backingInt(item.kind)].appendAssumeCapacity(item.subscriber);
+    plugin.name = .of(meta.name());
+    plugin.plugin_version = .of(meta.version());
     self.loaded.appendAssumeCapacity(loaded);
     loaded.ready.store(true, .release);
     if (meta.package.len != 0) {

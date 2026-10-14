@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "bifrost_plugin.h"
+#include "bifrost_manifest.h"
 
 namespace {
 
@@ -57,8 +58,6 @@ void onShutdown(void *state) noexcept {
 
 extern "C" BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin) noexcept {
     if (host->abi_version != BIFROST_ABI_VERSION) return BIFROST_STATUS_INCOMPATIBLE;
-    plugin->name = toStr("Greeter");
-    plugin->plugin_version = toStr("1.0.0");
     plugin->capabilities = BIFROST_CAPABILITY_EVENTS;
     plugin->state = &greeter;
     plugin->shutdown = onShutdown;

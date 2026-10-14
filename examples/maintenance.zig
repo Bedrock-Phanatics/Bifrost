@@ -1,9 +1,7 @@
 const std = @import("std");
 const bifrost = @import("bifrost_plugin");
 
-pub const name = "maintenance";
-pub const version = "1.0.0";
-pub const description = "Keeps players off the maintenance backend";
+pub const manifest = @embedFile("maintenance/plugin.toml");
 
 var host: bifrost.Host = undefined;
 

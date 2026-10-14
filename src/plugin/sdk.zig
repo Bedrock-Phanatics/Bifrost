@@ -142,6 +142,19 @@ fn packetType(comptime T: type) abi.PacketType {
 
 pub fn exportPlugin(comptime Plugin: type) void {
     @export(entry(Plugin), .{ .name = abi.entrypoint });
+    @export(manifest(Plugin.manifest), .{ .name = abi.manifest_entrypoint });
+}
+
+pub fn manifest(comptime source: []const u8) abi.ManifestFn {
+    if (source.len == 0 or source.len > abi.max_manifest_bytes or !std.unicode.utf8ValidateSlice(source))
+        @compileError("plugin.toml must be 1 to 4096 bytes of UTF-8");
+    return struct {
+        fn get(out: ?*abi.Str) callconv(.c) abi.Status {
+            const value = out orelse return .invalid_argument;
+            value.* = .of(source);
+            return .ok;
+        }
+    }.get;
 }
 
 pub fn entry(comptime Plugin: type) abi.InitFn {
@@ -149,8 +162,8 @@ pub fn entry(comptime Plugin: type) abi.InitFn {
         fn init(raw: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
             if (raw.abi_version != abi.version or !raw.has(.register_command_info)) return .incompatible;
             plugin.* = .{
-                .name = .of(Plugin.name),
-                .plugin_version = .of(Plugin.version),
+                .name = if (@hasDecl(Plugin, "name")) .of(Plugin.name) else plugin.name,
+                .plugin_version = if (@hasDecl(Plugin, "version")) .of(Plugin.version) else plugin.plugin_version,
                 .capabilities = if (@hasDecl(Plugin, "capabilities")) Plugin.capabilities else .{ .events = true },
                 .shutdown = shutdown,
             };

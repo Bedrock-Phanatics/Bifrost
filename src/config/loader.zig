@@ -120,7 +120,7 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
         } else if (eql(name, "plugins")) {
             try readPlugins(config, try table(diag, key, value), diag);
         } else if (eql(name, "plugin")) {
-            return fail(diag, key, "[[plugin]] path is gone; put each library in plugins/<Name>/ with a plugin.toml", .{});
+            return fail(diag, key, "[[plugin]] path is gone; put native libraries with embedded manifests directly in plugins/", .{});
         } else return fail(diag, key, "unknown section", .{});
     }
 }
@@ -134,7 +134,7 @@ fn readPlugins(config: *Config, section: *const toml.Table, diag: *Diagnostic) E
             config.setPluginsDir(try string(diag, key, value)) catch
                 return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len});
         } else if (eql(key.name.?, "disabled")) {
-            if (value != .array) return fail(diag, key, "expected a list of package directory names", .{});
+            if (value != .array) return fail(diag, key, "expected a list of plugin filename stems", .{});
             for (value.array.items) |item| config.disablePlugin(try string(diag, key, item)) catch |err| return switch (err) {
                 error.InvalidName => fail(diag, key, "names must be 1 to {d} bytes", .{Config.max_plugin_dir_name}),
                 error.TooManyPlugins => fail(diag, key, "at most {d} names", .{Config.max_disabled_plugins}),
@@ -436,7 +436,7 @@ test "transfer section sets the timeouts" {
     try std.testing.expectEqual(.match, matching.content_policy);
 }
 
-test "plugins section picks the package directory and disables packages" {
+test "plugins section picks the directory and disables filename stems" {
     var diag: Diagnostic = .{};
     const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
     const defaults = try parse(std.testing.allocator, backend, &diag);
@@ -446,11 +446,11 @@ test "plugins section picks the package directory and disables packages" {
     try std.testing.expectEqualStrings("mods", config.pluginsDir());
     try std.testing.expectEqual(@as(usize, 2), config.disabled_count);
     try std.testing.expectEqualStrings("B", config.disabledPlugin(1));
-    try expectInvalid("[plugins]\ndisabled = \"A\"\n" ++ backend, "plugins.disabled: expected a list of package directory names");
+    try expectInvalid("[plugins]\ndisabled = \"A\"\n" ++ backend, "plugins.disabled: expected a list of plugin filename stems");
     try expectInvalid("[plugins]\ndisabled = [1]\n" ++ backend, "plugins.disabled: expected a string");
     try expectInvalid("[plugins]\ndirectory = \"\"\n" ++ backend, "plugins.directory: must be 1 to 1024 bytes");
     try expectInvalid("[plugins]\npath = \"a.so\"\n" ++ backend, "plugins.path: unknown key");
-    try expectInvalid("[[plugin]]\npath = \"plugins/a.so\"\n" ++ backend, "plugin: [[plugin]] path is gone; put each library in plugins/<Name>/ with a plugin.toml");
+    try expectInvalid("[[plugin]]\npath = \"plugins/a.so\"\n" ++ backend, "plugin: [[plugin]] path is gone; put native libraries with embedded manifests directly in plugins/");
 }
 
 test "loadFile reports missing and oversized files" {
