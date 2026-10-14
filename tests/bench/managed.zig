@@ -284,6 +284,7 @@ pub const Backend = struct {
                 try session.advance(.spawn_ready);
             },
             .set_local_player_as_initialised => try session.advance(.in_game),
+            .text => self.packets.appendAssumeCapacity(packet.bytes),
             else => {},
         };
         if (self.packets.items.len != 0) try send(session, carrier, self.packets.items);

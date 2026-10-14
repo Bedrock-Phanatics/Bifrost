@@ -30,6 +30,24 @@ fn noTransfer(_: *anyopaque, _: u64, _: u32) abi.Status {
     return .ok;
 }
 
+pub fn loadTransport(plugins: *bifrost.Plugins, comptime target: abi.PacketTarget) !void {
+    const Plugin = struct {
+        fn start(api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+            plugin.name = .of("injection-transport");
+            plugin.plugin_version = .of("1");
+            plugin.capabilities = .{ .packets = true };
+            return api.subscribe_packet(api.context, .from_player, @import("bedwire").protocol.Current.packetId(.text).?, .in_game, .{}, onPacket, @constCast(api));
+        }
+
+        fn onPacket(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+            const api: *const abi.Host = @ptrCast(@alignCast(user.?));
+            _ = api.send_packet(api.context, packet.player, target, packet.bytes, null, null);
+            return .cancel;
+        }
+    };
+    try plugins.add(Plugin.start, null);
+}
+
 const Sink = struct {
     delivered: usize = 0,
     pub fn message(_: *Sink, _: u64, _: []const u8) void {}

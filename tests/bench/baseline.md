@@ -674,3 +674,82 @@ The new regression chains three typed replacements across both scratch buffers, 
 replacement, and checks that later listeners, including a validated listener, retain the third version with shared decoding.
 The documented raw callback compiled as C++23 with `-Wall -Wextra -Werror`. Repository formatting and
 whitespace checks passed. No full Debug/ReleaseFast suite or cross-platform build was run for this recheck.
+
+## Managed packet injection transport
+
+Recorded 2026-10-14 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast, four driver threads and
+one proxy worker. Command: `zig build bench -Doptimize=ReleaseFast -- injection-transport --quick`.
+The driver authenticates eight managed sessions against a real child proxy and encrypted echo backend.
+A native packet callback cancels each incoming Text packet and submits a copied packet through `send_packet`.
+The player target replies directly; the backend target traverses the backend injection path and returns through
+the normal backend relay. These are verified request/reply rates, not isolated injection queue throughput.
+
+| target | packet bytes | load | replies/s median [min-max] | p50 us | p95 us | p99 us | proxy CPU % | resident KiB | peak resident KiB |
+|---|---|---|---|---|---|---|---|---|---|
+| player | 32 | 1x1 | 7,568 [7,452-7,586] | 89 | 143 | 247 | 72.9 | 9,848 | 9,848 |
+| player | 32 | 8x32 | 20,820 [19,512-22,772] | 12,316 | 14,096 | 14,837 | 98.6 | 9,880 | 9,880 |
+| player | 1,024 | 1x1 | 3,280 [3,278-3,370] | 246 | 304 | 445 | 78.1 | 9,904 | 9,904 |
+| player | 1,024 | 8x32 | 10,562 [10,538-10,934] | 18,886 | 66,825 | 77,096 | 89.8 | 11,240 | 11,240 |
+| player | 16,384 | 1x1 | 638 [608-656] | 1,483 | 1,799 | 2,121 | 70.7 | 11,320 | 11,320 |
+| player | 16,384 | 8x16 | 1,164 [1,148-1,182] | 96,375 | 184,442 | 248,018 | 98.5 | 12,508 | 13,180 |
+| player | 65,536 | 1x1 | 154 [152-158] | 6,382 | 6,915 | 7,119 | 70.3 | 12,772 | 13,180 |
+| player | 65,536 | 8x4 | 266 [262-268] | 98,268 | 201,765 | 252,248 | 90.1 | 12,996 | 13,772 |
+| backend | 32 | 1x1 | 4,062 [3,860-4,092] | 201 | 266 | 347 | 72.9 | 9,324 | 9,324 |
+| backend | 32 | 8x32 | 16,042 [14,994-16,792] | 15,903 | 18,116 | 18,708 | 99.2 | 9,396 | 9,396 |
+| backend | 1,024 | 1x1 | 2,252 [2,234-2,276] | 394 | 465 | 647 | 72.9 | 9,424 | 9,424 |
+| backend | 1,024 | 8x32 | 7,856 [7,798-8,010] | 25,582 | 74,791 | 104,813 | 96.7 | 10,872 | 10,872 |
+| backend | 16,384 | 1x1 | 386 [378-388] | 2,548 | 2,789 | 2,928 | 63.3 | 10,964 | 10,964 |
+| backend | 16,384 | 8x16 | 808 [774-836] | 129,632 | 225,997 | 300,226 | 94.5 | 11,900 | 12,944 |
+| backend | 65,536 | 1x1 | 90 [90-92] | 10,896 | 11,851 | 12,013 | 60.5 | 12,280 | 12,944 |
+| backend | 65,536 | 8x4 | 196 [190-202] | 129,499 | 255,400 | 298,888 | 95.6 | 13,164 | 13,904 |
+
+Throughput is the median of three 500 ms intervals after 300 ms warmup. Latency runs from before driver
+encoding through reply decoding and content checks. Percentiles combine the intervals' samples, including
+replies drained after each interval; throughput excludes those late replies. Every submitted
+request must receive exactly one ordered reply with the expected message fields and per-player content, or the
+run fails. Outstanding replies have a three-second drain deadline. Sample storage is bounded and exhaustion
+fails the run. Printable pseudorandom message bodies permit strict UTF-8 decoding, with deflate above 256 B
+and encryption enabled. Each player has at most the stated number of requests in flight.
+
+CPU and memory cover the child proxy only, excluding driver and backend work on the same host. CPU includes
+the measured intervals, draining and sample collection; 100% is one core. Resident memory is sampled after each
+case and peak memory covers the lifetime of that destination's proxy. The separate queue benchmark measures
+allocation counts. These short loopback measurements do not establish network capacity or a speedup.
+Production packet handling and the native ABI are unchanged.
+
+The same command and workload also passed on WSL2 Ubuntu, Linux 6.6.87.2-microsoft-standard-WSL2, x86_64,
+12 logical CPUs and Zig 0.17.0. The compiler cache was placed on the Linux filesystem with
+`--cache-dir /tmp/bifrost-injection-cache-20261014` after an artifact rename was denied in the OneDrive-backed
+Windows cache. All sixteen Linux cases verified exact delivery, order and content.
+
+| target | packet bytes | load | replies/s median [min-max] | p50 us | p95 us | p99 us | proxy CPU % | resident KiB | peak resident KiB |
+|---|---|---|---|---|---|---|---|---|---|
+| player | 32 | 1x1 | 10,222 [9,704-10,234] | 77 | 124 | 228 | 82.1 | 6,912 | 6,912 |
+| player | 32 | 8x32 | 56,170 [55,880-56,636] | 4,346 | 5,925 | 8,615 | 92.0 | 7,168 | 7,168 |
+| player | 1,024 | 1x1 | 3,438 [3,416-3,492] | 242 | 329 | 505 | 65.3 | 7,168 | 7,168 |
+| player | 1,024 | 8x32 | 14,698 [14,086-14,920] | 16,000 | 27,819 | 40,866 | 85.4 | 8,064 | 8,064 |
+| player | 16,384 | 1x1 | 914 [898-980] | 997 | 1,273 | 1,494 | 58.0 | 8,192 | 8,192 |
+| player | 16,384 | 8x16 | 1,640 [1,636-1,644] | 69,933 | 110,140 | 127,818 | 93.6 | 9,216 | 9,344 |
+| player | 65,536 | 1x1 | 222 [218-226] | 4,345 | 5,022 | 5,182 | 53.7 | 9,472 | 9,472 |
+| player | 65,536 | 8x4 | 386 [370-394] | 70,381 | 127,284 | 149,493 | 92.4 | 9,744 | 10,308 |
+| backend | 32 | 1x1 | 4,038 [3,830-4,070] | 226 | 319 | 537 | 75.1 | 7,040 | 7,040 |
+| backend | 32 | 8x32 | 30,154 [26,546-30,406] | 8,462 | 12,019 | 13,598 | 94.5 | 7,424 | 7,424 |
+| backend | 1,024 | 1x1 | 1,934 [1,892-1,970] | 467 | 631 | 867 | 63.4 | 7,424 | 7,424 |
+| backend | 1,024 | 8x32 | 12,306 [12,144-12,394] | 19,188 | 31,634 | 39,867 | 94.6 | 8,832 | 8,832 |
+| backend | 16,384 | 1x1 | 598 [598-600] | 1,590 | 2,015 | 2,218 | 51.8 | 8,960 | 8,960 |
+| backend | 16,384 | 8x16 | 1,256 [1,232-1,320] | 87,234 | 143,431 | 165,172 | 93.1 | 10,624 | 10,624 |
+| backend | 65,536 | 1x1 | 136 [134-138] | 7,172 | 7,875 | 8,206 | 44.5 | 10,880 | 10,880 |
+| backend | 65,536 | 8x4 | 294 [290-298] | 91,005 | 156,106 | 198,568 | 91.7 | 11,384 | 11,704 |
+
+WSL scheduling, filesystem and networking differ from native Windows and bare-metal Linux. These separate
+platform runs do not establish a production throughput advantage. Multi-worker transport throughput and
+isolated callback latency remain unmeasured by this scenario.
+
+Verification: Windows `bench-test` passed all six checks in Debug, ReleaseSafe and ReleaseFast. Linux
+`zig build test bench-test -Doptimize=ReleaseSafe --summary all`, using the Linux cache above, passed 255 of
+256 checks: 249 repository tests and six benchmark tests. The skipped test checks rejection of multiple workers
+on platforms without reuse-port support; Linux reuse-port distribution, admission and shutdown tests passed.
+The native C++ filter checks passed on Linux. The benchmark regressions check truncated, reordered, altered and
+duplicate replies, exclude drained replies from throughput while retaining their latency, and force allocation
+failure at all ten job-initialization positions with the leak-detecting test allocator. Formatting and final
+whitespace checks passed.

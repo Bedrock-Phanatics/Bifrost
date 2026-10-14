@@ -84,14 +84,16 @@ zig build bench -Doptimize=ReleaseFast -- relay workers --quick # pick scenarios
 zig build bench -Doptimize=ReleaseFast -Dscheduling=pinned      # proxy without ZIO work stealing
 zig build bench -Doptimize=ReleaseFast -- managed               # passthrough vs managed sessions
 zig build bench -Doptimize=ReleaseFast -- packet-dispatch decode --quick # native packet dispatch and codec
+zig build bench -Doptimize=ReleaseFast -- injection-transport --quick # managed packet injection
 ```
 
 [`tests/bench/baseline.md`](tests/bench/baseline.md) records the numbers later changes are compared against.
 
 The suite starts the real proxy (`Workers` on the same runtime as `bifrost`) as a child process, and drives it with
 RakNet clients and echo backends from the parent. Scenarios: `relay`, `fairness`, `managed`, `deflate`, `plugins`,
-`ids`, `tasks`, `handles`, `handshake`, `connections`, `workers`, `backends`.
-RSS, CPU and kernel drop counts need Linux; elsewhere only the single-worker numbers are meaningful.
+`ids`, `tasks`, `handles`, `handshake`, `connections`, `workers`, `backends`. The optional `injection-transport`
+scenario measures verified delivery through the native packet queue and encrypted managed transport in both directions.
+RSS and CPU counters support Linux and Windows. Kernel drop counts and reuse-port worker distribution need Linux.
 
 Results from one run (2026-10-10, 1.0.0-rc.1): WSL2 Ubuntu on 12 logical CPUs, ReleaseFast, 1 worker, loopback, with
 the clients and backends on the same machine as the proxy. Treat them as relative numbers, not capacity planning. The
