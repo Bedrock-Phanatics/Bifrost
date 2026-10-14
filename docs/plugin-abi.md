@@ -8,7 +8,8 @@ ways listed under [Versioning](#versioning).
 ## Trust
 
 Plugins are native code loaded into the proxy's process. They are trusted completely: a crash, an infinite loop or
-memory corruption in a plugin takes the whole proxy down. There is no sandbox or process isolation.
+memory corruption in a plugin takes the whole proxy down. There is no sandbox or process isolation. Constructors and `DllMain` may run before manifest validation,
+including for rejected libraries. Manifest validation does not establish trust.
 
 No exception may cross into Bifrost, from `bifrost_plugin_init` or any callback. With C++17 or newer the header
 makes the entry point and every callback type `noexcept`, so passing a function that might throw doesn't compile, and
@@ -16,7 +17,7 @@ an exception that escapes anyway calls `std::terminate` instead of unwinding thr
 
 ## Loading
 
-Plugins are loaded from packages: a directory with a `plugin.toml` and the compiled library, described in
+Plugins are single shared libraries with embedded `plugin.toml` metadata, described in
 [`plugins.md`](plugins.md). `bifrost_plugin_init(host, plugin)` is called once, on the main thread, before any player connects. Fill in
 `plugin` (`name`, `plugin_version`, `capabilities`, optionally `state` and `shutdown`) and register everything you
 need; subscriptions and commands can't be added later. Returning anything but `OK` unloads the plugin and fails
@@ -30,7 +31,8 @@ from `shutdown` when loading fails, so no queued callback can outlive a refused 
 `name` (up to 64 bytes) and `plugin_version` (up to 64 bytes) are required and must be printable UTF-8: no control
 characters, and no `NULL` pointer with a non-zero length. A plugin can also call `set_description` with up to 256
 bytes of the same. Bifrost checks and copies all three when `bifrost_plugin_init` returns, so they only have to stay
-valid until then, and logs them as the plugin loads. `name` and `plugin_version` must equal the package's
+valid until then, and logs them as the plugin loads. Bifrost pre-fills `name` and `plugin_version` from the
+manifest so plugins may leave them unchanged. Values written by the plugin must equal the embedded
 `plugin.toml` exactly, and its `description` replaces whatever `set_description` set. Two plugins can't share a name,
 ignoring ASCII case.
 
@@ -42,6 +44,15 @@ Once shutdown begins, valid new messages, posts and tasks return `UNSUPPORTED`; 
 Calls already in progress can still be queued. Messages, posts, tasks and packets are settled during teardown;
 a queued transfer can be abandoned when shutdown disconnects its player. When embedding Bifrost, stop and
 join workers, unload plugins, then destroy workers before deinitializing the plugin runtime and its I/O runtime.
+
+## Embedded manifest export
+
+Dynamic plugins must also export `bifrost_plugin_get_manifest(bifrost_str *out)`.
+Return `INVALID_ARGUMENT` for null `out`, otherwise return `OK` and static UTF-8 TOML bytes with an explicit
+length of 1 to 4096 bytes. The bytes remain valid until unload and require no allocation.
+Bifrost validates the pointer/length shape before parsing and copies the bounded name, version and
+description fields into host-owned storage. Retrieval and parsing happen once per load at startup.
+This independent export does not change ABI v1 layouts or packet callback costs.
 
 ## Threads
 

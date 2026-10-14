@@ -41,11 +41,11 @@ Bifrost answers each target's pack negotiation itself. `"match"` also refuses ta
 
 ## Plugins
 
-Native plugins are compiled shared libraries, each in its own package directory under `plugins/` with a
-`plugin.toml` naming it ([`docs/plugins.md`](docs/plugins.md)). They load at startup in directory name order and
-unload in reverse once every worker has stopped. A plugin exports `bifrost_plugin_init` and talks to Bifrost only
+Native plugins are single compiled shared libraries directly under `plugins/`, with `plugin.toml` embedded
+at build time ([`docs/plugins.md`](docs/plugins.md)). They load at startup in filename order and
+unload in reverse once every worker has stopped. A plugin exports `bifrost_plugin_get_manifest` and `bifrost_plugin_init` and talks to Bifrost only
 through the C ABI in [`include/bifrost_plugin.h`](include/bifrost_plugin.h); Zig plugins can use the `bifrost_plugin`
-module instead. `zig build` packages three examples into `zig-out/plugins/`:
+module instead. `zig build` installs three single-file examples into `zig-out/plugins/`:
 [`examples/maintenance.zig`](examples/maintenance.zig) keeps players off any backend named `maintenance`,
 [`examples/greeter/Greeter.cpp`](examples/greeter/Greeter.cpp) logs a welcome, and
 [`examples/packets/PacketFilter.cpp`](examples/packets/PacketFilter.cpp) limits chat size, corrects chat authors
@@ -58,7 +58,7 @@ and run slow work on task threads. Callbacks run on worker threads and must not
 block; callbacks slower than `[limits] slow_plugin_callback_ms` are logged. Player handles stop working once the
 player leaves. [`docs/plugin-abi.md`](docs/plugin-abi.md) has the full contract: threads, memory, every host
 function and its statuses, and how the frozen v1 ABI may grow. Plugins run in-process, so one that crashes takes
-the proxy down.
+the proxy down. Library constructors can run before manifest validation.
 
 ## Development
 

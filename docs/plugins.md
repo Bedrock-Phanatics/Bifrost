@@ -1,95 +1,158 @@
-# Plugin packages
+# Native plugins
 
-Bifrost only loads compiled native plugins, and only from packages. A package is a directory holding a
-`plugin.toml` and the shared library it names:
+Each plugin is one normal native shared library containing its code and embedded `plugin.toml`:
 
-```
+```text
 plugins/
-  Greeter/
-    plugin.toml
-    Greeter.dll        Greeter.so on Linux, Greeter.dylib on macOS
-  Maintenance/
-    plugin.toml
-    Maintenance.dll
+  Maintenance.so
+  Greeter.so
+  PacketFilter.so
 ```
+
+Use `.dll` on Windows and `.dylib` on macOS. Copy only the binary into the configured directory.
+Directory packages are rejected. There are no archives, extraction caches or runtime manifest files.
+
+## Embedded metadata
+
+Keep this as a source file named `plugin.toml`:
 
 ```toml
 name = "Greeter"
 version = "1.0.0"
 description = "Logs a welcome for every player"
-library = "Greeter.dll"
 ```
 
-The library talks to Bifrost through the C ABI in [`plugin-abi.md`](plugin-abi.md); C, C++ and Zig all work.
-Nothing is compiled, interpreted or run from source.
+All three fields are required strings. Name and version must each be 1 to 64 bytes, and description 1 to
+256 bytes, of printable UTF-8. The whole manifest must be 1 to 4096 bytes of UTF-8 TOML. Invalid TOML,
+duplicate keys and unknown keys are refused. The old `library` key is no longer accepted.
 
-## plugin.toml
+The library exports both functions from [`bifrost_plugin.h`](../include/bifrost_plugin.h):
 
-| key | rule |
-|---|---|
-| `name` | 1 to 64 bytes of printable UTF-8; must equal the `name` the library reports |
-| `version` | 1 to 64 bytes of printable UTF-8; must equal the library's `plugin_version` |
-| `description` | 1 to 256 bytes of printable UTF-8; logged at startup, replaces anything set with `set_description` |
-| `library` | a file name in the package ending in `.dll`, `.so` or `.dylib` for the platform (case-insensitive except on Linux); no `/`, `\` or `:` |
+```c
+bifrost_status bifrost_plugin_get_manifest(bifrost_str *out);
+bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin);
+```
 
-All four are required strings. Unknown keys, invalid TOML, invalid UTF-8 and files over 4096 bytes are refused.
-Names are unique ignoring ASCII case: a second package with a loaded name is refused before its library is opened.
+`get_manifest` returns `INVALID_ARGUMENT` for null `out`. Otherwise it returns `OK` and a non-null pointer
+plus explicit byte length. The bytes have static lifetime until unload. No allocation or terminator is
+needed. Bifrost retrieves and parses the manifest once per load at startup, then keeps validated metadata
+in host-owned storage. There is no metadata processing in packet callbacks.
 
-## Discovery
+The existing C ABI v1 structures and initialization function are unchanged. Bifrost fills `plugin->name`
+and `plugin->plugin_version` from the manifest before initialization. Plugins may leave them unchanged.
+If a plugin writes them, they must match the manifest exactly. The manifest description takes precedence
+over `set_description`. Existing plugins need the new export and must be rebuilt.
 
-At startup Bifrost reads `[plugins] directory` (default `plugins`, relative to the working directory) and loads
-every package in it, sorted by directory name byte order. A missing directory means no plugins. Entries starting
-with `.` and files that aren't libraries are ignored. Bifrost refuses to start if it finds:
-
-- a library directly in the directory, outside a package
-- a package that is a symlink
-- a package with no `plugin.toml`, or one that fails any check below
-- more than 64 packages
+## Discovery and disabling
 
 ```toml
 [plugins]
 directory = "plugins"
-disabled = ["Maintenance"]    # package directory names, ASCII case ignored; up to 16
+disabled = ["Maintenance"]
 ```
 
-A disabled package isn't read at all, so its manifest may be broken.
+The directory defaults to `plugins`, relative to the working directory. A missing directory means no
+plugins. Candidates are sorted by filename byte order, with at most 64 enabled libraries. Hidden entries
+and unrelated files are ignored. Directories and symlinked candidate libraries are rejected. Only the
+current platform's extension is scanned, case-sensitive on Linux and case-insensitive on Windows and macOS.
 
-For each package Bifrost reads and checks `plugin.toml`, opens the library, checks it is a regular file whose
-header is a shared library for this OS and CPU, checks its canonical path is directly inside the package (a symlink
-pointing out is refused), loads it by that absolute path, looks up `bifrost_plugin_init` and initializes it as
-described in [`plugin-abi.md`](plugin-abi.md#loading). The plugin is registered only once all of that succeeds;
-until then nothing it registered is kept. Every failure is logged with the package path and the reason.
+Disabled entries are filename stems, compared ignoring ASCII case: `Maintenance` skips `Maintenance.dll`
+before opening it. A renamed binary must be disabled using its new stem. Loaded identity comes from the
+manifest and may differ from the stem. Manifest names are unique ignoring ASCII case. A duplicate is
+rejected before initialization, though its library has already been opened.
 
-Libraries a plugin depends on resolve with the platform's normal rules, minus the unsafe ones where Bifrost can
-avoid them: on Windows the plugin's own directory, Bifrost's directory and System32, but never the working
-directory or `PATH`; on Linux and macOS through `dlopen`, so bundle dependencies next to the plugin and set an
-`$ORIGIN` (`@loader_path` on macOS) rpath.
+Bifrost checks the native header and architecture, resolves an absolute path inside the configured
+directory, opens the library, validates its manifest, resolves initialization, checks ABI compatibility
+and commits registrations only after success. Errors fail startup. Shutdown settles tasks and removes
+callbacks before shutdown hooks and library unloading, in reverse load order.
 
-Packaging is not a sandbox. A plugin runs inside the proxy with its full privileges; only install ones you trust.
+## Zig
 
-## Migrating from `[[plugin]] path`
+[`examples/maintenance.zig`](../examples/maintenance.zig) is a complete working example. A minimal plugin is:
 
-`[[plugin]] path = "..."` is no longer accepted, and Bifrost won't start with it. For each old entry, make a
-directory under `plugins/`, move the library into it and write a `plugin.toml` whose `name` and `version` match what
-the plugin reports (Bifrost logs both when a mismatch refuses it). Load order is now the directory names' order.
+```zig
+const bifrost = @import("bifrost_plugin");
 
-## A C++23 plugin
+pub const manifest = @embedFile("plugin.toml");
 
-[`examples/greeter/Greeter.cpp`](../examples/greeter/Greeter.cpp) is a complete plugin. `zig build` builds it and
-the Zig and C++ packet-filter examples into ready-to-copy packages under `zig-out/plugins/`.
-By hand, from the repository root:
+comptime {
+    bifrost.exportPlugin(@This());
+}
+
+pub fn init(host: bifrost.Host) !void {
+    host.log(.info, "plugin started", .{});
+}
+```
+
+The SDK exports both functions and preserves the manifest name/version defaults. Optional `name` and
+`version` declarations are still supported and checked. A raw ABI plugin can use
+`bifrost.manifest(@embedFile("plugin.toml"))` as its manifest export.
+
+Run `zig build` with the repository's Zig 0.17.0 toolchain. It compiles the Zig and C++23 examples and
+installs only their libraries under `zig-out/plugins/`. Windows output is `Maintenance.dll`, `Greeter.dll`
+and `PacketFilter.dll`. Third-party builds can import the dependency's `bifrost_plugin` module and use
+`addLibrary` with `.linkage = .dynamic`, as in [`build.zig`](../build.zig). No Zig runtime files are needed.
+
+## C++23 and CMake
+
+[`examples/greeter`](../examples/greeter) contains a complete C++23 CMake project:
 
 ```sh
-# Linux
-mkdir -p plugins/Greeter
-clang++ -std=c++23 -shared -fPIC -Iinclude examples/greeter/Greeter.cpp -o plugins/Greeter/Greeter.so
-# Windows (MSVC)
-cl /std:c++latest /EHsc /LD /Iinclude examples\greeter\Greeter.cpp /Fe:plugins\Greeter\Greeter.dll
-# or with Zig anywhere
-zig c++ -std=c++23 -shared -Iinclude examples/greeter/Greeter.cpp -o plugins/Greeter/Greeter.dll
+cmake -S examples/greeter -B build/greeter -DCMAKE_BUILD_TYPE=Release
+cmake --build build/greeter --config Release
+cmake --install build/greeter --config Release --prefix ./stage
 ```
 
-then put the `plugin.toml` above next to it, with `library` set to the file you built.
+Copy `stage/plugins/Greeter.so`, `.dll` or `.dylib` into `plugins/`. Use a compiler and standard library
+with C++23 `std::format` support.
+
+For another project, include [`cmake/BifrostPlugin.cmake`](../cmake/BifrostPlugin.cmake), create a shared
+library target and call `bifrost_embed_manifest(MyPlugin plugin.toml)`. Include the generated
+`bifrost_manifest.h` in exactly one translation unit. It embeds the actual TOML bytes with no section or
+linker tricks and exports the C ABI getter. Manifest changes trigger CMake reconfiguration.
+The Zig build uses the same header template and also tracks manifest content changes.
+
+MSVC, Clang and GCC can use this interface. Keep classes, containers, allocators and exceptions inside
+the binary. All exports and callbacks use the existing C ABI, with `extern "C"` and `noexcept` in C++.
+Catch exceptions inside callbacks where recovery is possible. The Greeter uses PascalCase classes
+and camelCase members.
+
+## C
+
+The generated header also works with C99:
+
+```c
+#include "bifrost_manifest.h"
+
+BIFROST_EXPORT bifrost_status bifrost_plugin_init(const bifrost_host *host, bifrost_plugin *plugin) {
+    (void)plugin;
+    return host->abi_version == BIFROST_ABI_VERSION
+        ? BIFROST_STATUS_OK : BIFROST_STATUS_INCOMPATIBLE;
+}
+```
+
+Use a CMake shared library target and the same `bifrost_embed_manifest` call. The
+[working C test plugin](../tests/plugin/fixture.c) also demonstrates event callbacks and shutdown.
+
+## Dependencies and trust
+
+Link private dependencies statically where licensing and platform support permit. The CMake Greeter
+uses the static MSVC runtime and static GCC/C++ runtimes on MinGW. System libraries, platform runtimes
+and some private dependencies still require external installation.
+
+Bifrost preserves the existing loader's dependency search rules. Windows uses the library directory,
+application directory and configured safe default directories, excluding the working directory and
+`PATH`. Linux and macOS use the platform loader. Install external dependencies in trusted system
+locations and avoid relative or writable dependency search paths and rpaths.
+
+Native plugins are fully trusted code. Loading a library can run constructors or `DllMain` **before
+Bifrost reads its manifest**, including for rejected libraries. Manifest validation is neither a sandbox
+nor proof that a library is safe. Bifrost cannot validate arbitrary native pointers or recover from a
+crashing export. Install only trusted binaries.
+
+To migrate a directory package, remove `library`, embed the TOML during compilation, add the manifest
+export and copy the rebuilt binary directly into `plugins/`. Remove the old package directory.
+Legacy `[[plugin]] path` configuration is also rejected.
 
 ## Packet filtering
 
