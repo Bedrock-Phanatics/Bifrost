@@ -878,3 +878,59 @@ the leak-detecting test allocator. The full repository suite was not rerun for t
 Verification: all eight `bench-test` checks passed on Windows in Debug, ReleaseSafe and ReleaseFast and on
 Linux in ReleaseSafe. Both ReleaseFast latency runs completed all eight cases and their eleven percentile
 rows. Repository formatting and final whitespace checks passed.
+
+## Final native packet API validation
+
+Recorded 2026-10-14 with Zig 0.17.0 on Windows x86_64 and WSL2 Ubuntu Linux x86_64. The closing audit
+reviewed the native codec, callback scopes, replacement cache, worker queues, handle generations, transfer
+epochs, session sends, SDK, C header and C++ example against the packet API requirements. The implementation
+already supplies lazy borrowed Text and RequestChunkRadius fields, shared dispatch decoding, validated raw
+and typed replacements, and bounded injection through managed transport. This pass adds fuzz coverage,
+explicit filtered-test discovery, packet destination ABI checks, CI checks and verification documentation.
+Production packet handling, ABI version 1 and the raw dispatch path are unchanged.
+
+Commands used for the full matrix were `zig build test bench-test --test-timeout 120s --summary all`, with
+`-Doptimize=ReleaseSafe` or `-Doptimize=ReleaseFast` for the release modes. Linux used the cache directory
+shown above. Counts include 124 unit tests, 127 integration tests and eight benchmark checks. The C++ filter
+executable passed separately in every mode.
+
+| platform | mode | passed | skipped | timed out |
+|---|---|---|---|---|
+| Windows | Debug | 256 | 3 | 0 |
+| Windows | ReleaseSafe | 256 | 3 | 0 |
+| Windows | ReleaseFast | 256 | 3 | 0 |
+| Linux | Debug, initial 120-second bound | 256 | 1 | 2 |
+| Linux | ReleaseSafe | 258 | 1 | 0 |
+| Linux | ReleaseFast | 258 | 1 | 0 |
+
+Windows skips the three reuse-port worker tests. Linux skips the test that requires an unsupported reuse-port
+platform. The two Linux Debug timeouts were the existing transfer memory/time stress cases. Both passed in an
+isolated retry with their workloads and assertions unchanged:
+`zig build test -Dtest-filter="keep transfer time and memory flat" -Dtransfer-report=true --test-timeout 5m --summary all`.
+That retry passed all four discovered checks. Across 200 transfers, median transfer time was 644.28 ms and
+live heap stayed at 13,372,569 bytes from round 20 through round 200. Across 50 rounds of eight concurrent
+transfers, median batch time was 2343.65 ms and live heap stayed at 15,183,200 bytes from round 5 through
+round 50. These Debug test timings explain why a 120-second per-test limit was insufficient here, and are
+not release performance measurements. The added packet destination ABI assertion also passed a focused
+Windows ReleaseSafe check after its addition.
+
+`zig build stress -Doptimize=ReleaseSafe --test-timeout 120s --summary all` repeated the full integration
+suite successfully on both platforms: 124 passed and three skipped on Windows, 126 passed and one skipped
+on Linux. Native installs passed for Windows ReleaseFast and Linux ReleaseSafe, including Maintenance,
+Greeter and PacketFilter. ReleaseSafe installs also cross-compiled successfully for `x86_64-macos` and
+`aarch64-linux-musl`, with the proxy and all three plugins built for each target.
+
+`zig build fuzz-test --fuzz=1M --test-timeout 120s --summary all` completed 1,001,958 executions on Linux,
+with 1,944 unique runs reported, in a six-second campaign after compilation. Fourteen seeds cover all twelve
+Text variants and positive and negative chunk radii. Mutated inputs are bounded to 1024 bytes. The target
+checks both injection destinations and decode/encode/decode field and header preservation. No failure was
+reported. An initial attempt through the default compiler backend failed with a zero-length coverage-file
+error, so the dedicated fuzz step explicitly selects LLVM, which completed the campaign. Normal tests replay
+the seeds, while existing tests separately cover the maximum 65536-byte packet and malformed/truncated input.
+CI now runs benchmark checks in all three test modes and the bounded LLVM campaign on Linux.
+
+Repository formatting, whitespace checks and final diff review passed. No new production performance claim
+is made by this verification pass. The earlier codec, dispatch, queue, callback and managed transport results
+retain their documented workloads and limits. macOS and ARM64 runtime tests, the 25x nightly soak, race
+sanitizers and exhaustive fuzzing were not run. This evidence does not establish the absence of all races,
+leaks or malformed-input failures.

@@ -66,6 +66,8 @@ the proxy down. Library constructors can run before manifest validation.
 zig build test                        # unit and integration tests
 zig build test -Doptimize=ReleaseSafe
 zig build test -Dtest-filter=plugins  # focus on named tests
+zig build bench-test                 # benchmark counters and cleanup
+zig build fuzz-test --fuzz=1M         # bounded native packet fuzzing on Linux
 ```
 
 | path | contents |
@@ -84,6 +86,7 @@ zig build bench -Doptimize=ReleaseFast -- relay workers --quick # pick scenarios
 zig build bench -Doptimize=ReleaseFast -Dscheduling=pinned      # proxy without ZIO work stealing
 zig build bench -Doptimize=ReleaseFast -- managed               # passthrough vs managed sessions
 zig build bench -Doptimize=ReleaseFast -- packet-dispatch decode --quick # native packet dispatch and codec
+zig build bench -Doptimize=ReleaseFast -- callback-latency --quick # isolated native callback percentiles
 zig build bench -Doptimize=ReleaseFast -- injection-transport --quick # managed packet injection
 zig build bench -Doptimize=ReleaseFast -- injection-workers --quick --driver-threads 8 # Linux injection across workers
 ```
@@ -96,6 +99,8 @@ RakNet clients and echo backends from the parent. Scenarios: `relay`, `fairness`
 scenario measures verified delivery through the native packet queue and encrypted managed transport in both directions.
 `injection-workers` compares one, two and four workers with 32 players on Linux, one request in flight per player,
 and at least two seconds per measured interval. It verifies worker distribution and progress by every player.
+`callback-latency` reports p50/p95/p99/max callback times with an empty-callback timing baseline, separating
+the first shared reader from later readers. Its repeated-packet measurements include clock overhead and exclude transport.
 RSS and CPU counters support Linux and Windows. Kernel drop counts and reuse-port worker distribution need Linux.
 
 Results from one run (2026-10-10, 1.0.0-rc.1): WSL2 Ubuntu on 12 logical CPUs, ReleaseFast, 1 worker, loopback, with

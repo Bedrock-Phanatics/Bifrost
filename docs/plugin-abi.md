@@ -242,5 +242,23 @@ it returns `STALE_HANDLE`, even if a new player gets the same slot. `id` 0 is ne
 - Structs a plugin writes into (`bifrost_plugin`, `bifrost_transfer_decision`, `bifrost_packet`) never grow in v1,
   because a newer plugin writing a field into an older host's smaller struct would corrupt it. New outputs arrive as
   new host functions instead.
+- Typed outputs (`bifrost_text`, `bifrost_chunk_radius`) also keep their v1 layouts. New layouts require new packet types.
 - Structs you pass in (`bifrost_command_info`) carry `struct_size` so Bifrost knows which fields you set; fill it in.
 - Enums and status codes can gain values; treat unknown ones as "not for me" rather than as errors.
+
+## Verification
+
+`zig build test` covers the native ABI layouts and constants, borrowed field access, replacement chains,
+phase and direction checks, queue limits, allocation failures, worker ownership, disconnects, transfers and
+shutdown. `zig build bench-test` checks benchmark accounting and cleanup separately.
+
+On Linux, `zig build fuzz-test --fuzz=1M` runs the native packet target with LLVM coverage instrumentation.
+Its fourteen seeds cover all twelve Text variants and positive and negative chunk radii. Inputs are bounded
+to 1024 bytes. Successful native decodes must survive encoding and decoding with the same fields and header.
+Accepted injections must have supported types, destinations, sub-client indices and radius values. Normal
+test runs replay the seeds. Existing boundary tests exercise the 65536-byte injection limit separately.
+
+Use `zig build bench -Doptimize=ReleaseFast -- packet-dispatch decode injection --quick` for dispatch,
+codec and queue costs. The optional `callback-latency`, `injection-transport` and Linux `injection-workers`
+scenarios measure callback distributions and verified managed transport. Workloads, results and measurement
+limits are recorded in [`tests/bench/baseline.md`](../tests/bench/baseline.md).
