@@ -48,3 +48,62 @@ test "packet injection validates supported packets and truncated input" {
         _ = validate(.backend, &buffer);
     }
 }
+
+test "native packet codec and injection fuzz round trips" {
+    const std = @import("std");
+    const Decoded = @import("Decoded.zig");
+    var buffers: [14][1028]u8 = undefined;
+    var corpus: [14][]const u8 = undefined;
+    for (&buffers, &corpus, 0..) |*buffer, *seed, tag| {
+        const out = buffer[4..];
+        const len = if (tag < 12) blk: {
+            var text: abi.Text = .{ .message_type = @fromBackingInt(@intCast(tag)), .message = .of("hello"), .xuid = .of("123"), .platform_id = .of("platform"), .has_filtered_message = 1, .filtered_message = .of("filtered") };
+            switch (text.message_type) {
+                .chat, .whisper, .announcement => text.source = .of("Steve"),
+                .translate, .popup, .jukebox_popup => {
+                    text.parameter_count = 4;
+                    for (&text.parameters) |*parameter| parameter.* = .of("parameter");
+                },
+                else => {},
+            }
+            break :blk try Decoded.encode(.{ .packet_id = 9 }, .text, &text, out);
+        } else try Decoded.encode(.{ .packet_id = 69 }, .chunk_radius, &abi.ChunkRadius{ .radius = if (tag == 12) 8 else -1, .max_radius = 255 }, out);
+        std.mem.writeInt(u32, buffer[0..4], @intCast(len), .little);
+        seed.* = buffer[0 .. 4 + len];
+    }
+    try std.testing.fuzz({}, struct {
+        fn check(_: void, smith: *std.testing.Smith) !void {
+            var buffer: [1024]u8 = undefined;
+            const bytes = buffer[0..smith.slice(&buffer)];
+            for ([_]abi.PacketTarget{ .player, .backend }) |target| {
+                if (validate(target, bytes) == .ok) {
+                    const packet = try protocol.Current.decodeBorrowed(bytes, .{ .max_packet_bytes = max_packet_bytes });
+                    try std.testing.expect(packet.header.sender_subclient == 0 and packet.header.target_subclient == 0);
+                    switch (packet.value.typed) {
+                        .text => {},
+                        .request_chunk_radius => |radius| try std.testing.expect(target == .backend and radius.chunk_radius >= 0),
+                        else => return error.UnsafeInjectionAccepted,
+                    }
+                }
+            }
+            for ([_]abi.PacketType{ .text, .chunk_radius }) |packet_type| {
+                const value = Decoded.decode(bytes, packet_type, .{ .max_packet_bytes = buffer.len }) catch continue;
+                const header = (try protocol.packet.decode(bytes, .{ .max_packet_bytes = buffer.len })).header;
+                var out: [2048]u8 = undefined;
+                const len = switch (value) {
+                    inline else => |fields| try Decoded.encode(header, packet_type, &fields, &out),
+                };
+                const result = try Decoded.decode(out[0..len], packet_type, .{});
+                try std.testing.expectEqual(header, (try protocol.packet.decode(out[0..len], .{})).header);
+                switch (value) {
+                    .text => |text| {
+                        inline for (.{ "message_type", "localize", "has_filtered_message", "parameter_count" }) |field| try std.testing.expectEqual(@field(text, field), @field(result.text, field));
+                        inline for (.{ "source", "message", "xuid", "platform_id", "filtered_message" }) |field| try std.testing.expectEqualStrings(@field(text, field).slice(), @field(result.text, field).slice());
+                        for (text.parameters[0..text.parameter_count], result.text.parameters[0..text.parameter_count]) |expected, actual| try std.testing.expectEqualStrings(expected.slice(), actual.slice());
+                    },
+                    .chunk_radius => |radius| try std.testing.expectEqual(radius, result.chunk_radius),
+                }
+            }
+        }
+    }.check, .{ .corpus = &corpus });
+}

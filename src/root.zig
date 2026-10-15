@@ -50,6 +50,7 @@ test {
     _ = @import("plugin/Handles.zig");
     _ = @import("plugin/Packets.zig");
     _ = @import("plugin/Decoded.zig");
+    _ = @import("plugin/injection.zig");
     _ = @import("plugin/Work.zig");
     _ = @import("plugin/sdk.zig");
 }

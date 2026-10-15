@@ -177,6 +177,8 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     const b = ctx.b;
     const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run tests whose names contain this text")) |filter| &.{filter} else &.{};
     const unit_tests = b.addTest(.{ .root_module = ctx.bifrost, .filters = filters });
+    const fuzz_tests = b.addTest(.{ .root_module = ctx.bifrost, .filters = &.{"native packet codec and injection fuzz"}, .use_llvm = true });
+    b.step("fuzz-test", "Fuzz native packet decoding and injection validation").dependOn(&b.addRunArtifact(fuzz_tests).step);
     const integration_tests = b.addTest(.{ .root_module = ctx.module("tests/root.zig", &.{
         .{ .name = "bifrost", .module = ctx.bifrost },
         .{ .name = "raknet", .module = ctx.raknet },

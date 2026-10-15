@@ -265,6 +265,7 @@ test "the C header matches the Zig ABI" {
     try expectConstants(abi.PacketPhase, "BIFROST_PHASE_");
     try expectConstants(abi.PacketAction, "BIFROST_PACKET_");
     try expectConstants(abi.PacketType, "BIFROST_PACKET_TYPE_");
+    try expectConstants(abi.PacketTarget, "BIFROST_PACKET_TO_");
     try expectConstants(abi.TextType, "BIFROST_TEXT_");
     try expectConstants(abi.CommandPermission, "BIFROST_PERMISSION_");
     try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .validated = true })), header.BIFROST_PACKET_VALIDATED);

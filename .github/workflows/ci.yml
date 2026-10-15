@@ -30,9 +30,11 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
-      - run: zig build test
-      - run: zig build test -Doptimize=ReleaseSafe
-      - run: zig build test -Doptimize=ReleaseFast
+      - run: zig build test bench-test
+      - run: zig build test bench-test -Doptimize=ReleaseSafe
+      - run: zig build test bench-test -Doptimize=ReleaseFast
+      - if: runner.os == 'Linux'
+        run: zig build fuzz-test --fuzz=1M
 
   stress:
     needs: test
