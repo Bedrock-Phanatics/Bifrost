@@ -815,3 +815,66 @@ failure cleanup. The existing single-worker transport matrix also passed all six
 after the drain-accounting correction, and the worker scenario explicitly skipped its unsupported Windows mode.
 The full repository test suite was not rerun for this benchmark-only change. Formatting and final whitespace
 checks passed.
+
+## Isolated native callback latency
+
+Recorded 2026-10-14 on Windows x86_64 and WSL2 Ubuntu Linux x86_64, 12 logical CPUs, Zig 0.17.0,
+ReleaseFast and four driver threads. Platform runs were sequential, with no other Bifrost builds running.
+Command: `zig build bench -Doptimize=ReleaseFast -- callback-latency --quick`.
+Linux additionally used `--cache-dir /tmp/bifrost-injection-cache-20261014` before `--`.
+
+The optional scenario wraps the existing native callbacks inside `Packets.run`, preserving their original user
+pointers and callback-scoped host access. Every case repeats the same chat packet with a 33-byte message and a
+matching `Steve` player name. After 1,024 uninstrumented warmup dispatches, it records 65,536 callback durations
+per listener. Normal mode records 262,144 instead. The first listener is reported separately from all later
+listeners pooled together. Shared decoding is scoped to each dispatch, so the first shared reader decodes on
+every packet and the later nine reuse that result.
+
+Times include the original callback's indirect call, field access or encoding, and clock overhead. Host work
+outside that callback, including replacement validation and metrics, is excluded, as are sample storage and
+transport. The empty raw callback uses the same wrapper and clock pair to expose the measurement baseline.
+No overhead is subtracted from any percentile. Samples use preallocated bounded storage, 512 KiB per listener
+in quick mode, plus the existing 128 KiB replacement scratch buffer per case. This instrumentation changes no
+production code or ABI. The generic benchmark header's interval timing does not apply to this sample-count scenario.
+
+| platform | case | listener | samples | p50 ns | p95 ns | p99 ns | max ns |
+|---|---|---|---|---|---|---|---|
+| Windows | empty raw | first | 65,536 | 0 | 100 | 100 | 4,500 |
+| Windows | lazy fields | first | 65,536 | 100 | 200 | 200 | 24,100 |
+| Windows | independent decoding | first | 65,536 | 100 | 100 | 100 | 24,200 |
+| Windows | independent decoding | later | 589,824 | 100 | 100 | 100 | 23,600 |
+| Windows | shared fields | first | 65,536 | 100 | 200 | 200 | 8,700 |
+| Windows | shared fields | later | 589,824 | 0 | 100 | 100 | 34,500 |
+| Windows | raw replacement | first | 65,536 | 0 | 100 | 100 | 100 |
+| Windows | chained raw replacement | first | 65,536 | 0 | 100 | 100 | 2,800 |
+| Windows | chained raw replacement | later | 65,536 | 0 | 100 | 100 | 2,300 |
+| Windows | typed modification | first | 65,536 | 200 | 300 | 300 | 23,700 |
+| Windows | C++ chat filter with name lookup | first | 65,536 | 100 | 200 | 200 | 6,600 |
+| Linux | empty raw | first | 65,536 | 30 | 30 | 31 | 47,019 |
+| Linux | lazy fields | first | 65,536 | 130 | 141 | 150 | 29,896 |
+| Linux | independent decoding | first | 65,536 | 101 | 111 | 120 | 26,290 |
+| Linux | independent decoding | later | 589,824 | 101 | 111 | 120 | 27,551 |
+| Linux | shared fields | first | 65,536 | 130 | 141 | 151 | 20,779 |
+| Linux | shared fields | later | 589,824 | 40 | 50 | 51 | 19,006 |
+| Linux | raw replacement | first | 65,536 | 30 | 30 | 31 | 10,510 |
+| Linux | chained raw replacement | first | 65,536 | 30 | 30 | 31 | 18,675 |
+| Linux | chained raw replacement | later | 65,536 | 30 | 30 | 31 | 90 |
+| Linux | typed modification | first | 65,536 | 211 | 221 | 240 | 26,831 |
+| Linux | C++ chat filter with name lookup | first | 65,536 | 130 | 131 | 141 | 27,822 |
+
+The Windows clock produces 100 ns increments here, so a reported zero means the callback fell within one
+clock increment. Linux provides finer resolution in this run. Later shared readers measured 40 ns median
+against independent readers' 101 ns, with a 30 ns empty-callback baseline. The native host accessor has work
+beyond the protocol decoder, so the first shared reader need not match the independent decoder's cost.
+These are observed distributions from one warm-cache run per platform, not production latency bounds or
+transport timings. Clock overhead, instrumentation and scheduler interruptions affect the measurements,
+especially maxima. No timer baseline or individual percentile is treated as an exact correction factor.
+
+Every dispatch checks its expected action and verifies replacement contents. Sample counts and host error
+counters are checked for every measured listener. Benchmark regression coverage exercises all eight setups,
+including callback-scoped typed access, chained replacements and the dynamically loaded C++ filter, using
+the leak-detecting test allocator. The full repository suite was not rerun for this benchmark-only change.
+
+Verification: all eight `bench-test` checks passed on Windows in Debug, ReleaseSafe and ReleaseFast and on
+Linux in ReleaseSafe. Both ReleaseFast latency runs completed all eight cases and their eleven percentile
+rows. Repository formatting and final whitespace checks passed.

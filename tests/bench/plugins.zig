@@ -304,3 +304,108 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![std.enums.val
     for (&results) |*result| result.extra_ns = result.ns_per_packet - results[0].ns_per_packet;
     return results;
 }
+
+const CallbackProbe = struct {
+    io: std.Io,
+    callback: abi.PacketFn,
+    user: ?*anyopaque,
+    samples: []u64,
+    used: usize = 0,
+    recording: bool = false,
+    failed: bool = false,
+
+    fn call(user: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
+        const self: *CallbackProbe = @ptrCast(@alignCast(user.?));
+        if (!self.recording) return self.callback(self.user, packet);
+        const started = harness.nowNs(self.io);
+        const action = self.callback(self.user, packet);
+        const ended = harness.nowNs(self.io);
+        if (ended < started or self.used == self.samples.len) {
+            self.failed = true;
+        } else {
+            self.samples[self.used] = ended - started;
+            self.used += 1;
+        }
+        return action;
+    }
+};
+
+pub fn callbackSamples(gpa: std.mem.Allocator, io: std.Io, setup: Setup, count: usize) ![]u64 {
+    if (count == 0 or count > 1 << 20) return error.InvalidSampleCount;
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{ .slow_callback_ns = std.math.maxInt(u64) });
+    defer plugins.deinit();
+    try load(&plugins, io, setup, text_packet_id);
+    const table = plugins.packetTable(.from_player) orelse return error.MissingSubscribers;
+    const range = table.ranges[text_packet_id];
+    const subscribers = table.subscribers[range.start..][0..range.len];
+    var probes: [10]CallbackProbe = undefined;
+    if (subscribers.len == 0 or subscribers.len > probes.len) return error.InvalidSubscribers;
+    const values = try gpa.alloc(u64, count * subscribers.len);
+    errdefer gpa.free(values);
+    for (subscribers, probes[0..subscribers.len], 0..) |*subscriber, *probe, i| {
+        probe.* = .{ .io = io, .callback = subscriber.callback, .user = subscriber.user, .samples = values[i * count ..][0..count] };
+        subscriber.callback = CallbackProbe.call;
+        subscriber.user = probe;
+    }
+    defer for (subscribers, probes[0..subscribers.len]) |*subscriber, probe| {
+        subscriber.callback = probe.callback;
+        subscriber.user = probe.user;
+    };
+    var player_context: u8 = 0;
+    const player = try plugins.handles.acquire(gpa, .{
+        .context = &player_context,
+        .link = 0,
+        .transfer = struct {
+            fn transfer(_: *anyopaque, _: u64, _: u32) abi.Status {
+                return .unsupported;
+            }
+        }.transfer,
+    });
+    plugins.handles.setName(player, "Steve");
+    var buffer: [256]u8 = undefined;
+    const bytes = try sample.typedPacket(&buffer, .{ .text = .{
+        .localize = false,
+        .body = .{ .author_and_message = .{ .message_type = .chat, .player_name = "Steve", .message = "hello there, how are things going" } },
+        .senders_xuid = "",
+        .platform_id = "",
+        .filtered_message = null,
+    } });
+    const scratch = try gpa.alloc(u8, Packets.scratch_bytes);
+    defer gpa.free(scratch);
+    const call: Packets.Call = .{ .io = io, .worker = 0, .player = player, .direction = .from_player, .in_game = true, .slow_ns = std.math.maxInt(u64) };
+    const replacing = setup == .one_replace or setup == .two_replace or setup == .typed_replace;
+    for (0..1024 + count) |i| {
+        if (i == 1024) for (probes[0..subscribers.len]) |*probe| {
+            probe.recording = true;
+        };
+        switch (Packets.run(table, call, text_packet_id, bytes, scratch, Checker{})) {
+            .pass => if (replacing) return error.MissingReplacement,
+            .cancel => return error.UnexpectedCancellation,
+            .replace => |replacement| {
+                if (!replacing) return error.UnexpectedReplacement;
+                if (setup == .typed_replace) {
+                    const value = try Packets.Decoded.decode(replacement, .text, .{});
+                    if (!std.mem.eql(u8, value.text.message.slice(), "changed by plugin")) return error.InvalidReplacement;
+                } else if (!std.mem.eql(u8, bytes, replacement)) return error.InvalidReplacement;
+            },
+        }
+    }
+    for (subscribers, probes[0..subscribers.len]) |subscriber, probe| {
+        if (probe.failed or probe.used != count or subscriber.metrics[0].errors.load(.monotonic) != 0) return error.InvalidCallbackSamples;
+    }
+    return values;
+}
+
+test "relay benchmark callback samples preserve typed scope and replacement chains" {
+    for ([_]Setup{ .one_raw, .one_lazy, .ten_independent, .ten_shared, .one_replace, .two_replace, .typed_replace, .packet_filter_chat }) |setup| {
+        const values = try callbackSamples(std.testing.allocator, std.testing.io, setup, 4);
+        defer std.testing.allocator.free(values);
+        const listeners: usize = switch (setup) {
+            .ten_independent, .ten_shared => 10,
+            .two_replace => 2,
+            else => 1,
+        };
+        try std.testing.expectEqual(4 * listeners, values.len);
+    }
+    try std.testing.expectError(error.InvalidSampleCount, callbackSamples(std.testing.allocator, std.testing.io, .one_raw, 0));
+}

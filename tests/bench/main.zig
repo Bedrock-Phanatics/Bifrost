@@ -31,11 +31,12 @@ comptime {
     if (builtin.is_test) {
         std.testing.refAllDecls(harness);
         _ = bench_handles;
+        _ = bench_plugins;
     }
 }
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|callback-latency|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
@@ -66,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--proxy-exe") and i + 1 < args.len) {
             i += 1;
             proxy_exe = args[i];
-        } else if (std.mem.eql(u8, arg, "packet-dispatch") or std.mem.eql(u8, arg, "injection-transport") or std.mem.eql(u8, arg, "injection-workers")) {
+        } else if (std.mem.eql(u8, arg, "packet-dispatch") or std.mem.eql(u8, arg, "callback-latency") or std.mem.eql(u8, arg, "injection-transport") or std.mem.eql(u8, arg, "injection-workers")) {
             try selected.append(gpa, arg);
         } else if (for (all_scenarios) |name| {
             if (std.mem.eql(u8, arg, name)) break true;
@@ -121,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "deflate")) try deflateScenario(&env);
         if (std.mem.eql(u8, name, "plugins")) try pluginsScenario(&env);
         if (std.mem.eql(u8, name, "packet-dispatch")) try packetDispatch(&env);
+        if (std.mem.eql(u8, name, "callback-latency")) try callbackLatency(&env);
         if (std.mem.eql(u8, name, "injection-transport")) try injectionScenario(&env, .transport);
         if (std.mem.eql(u8, name, "injection-workers")) try injectionScenario(&env, .workers);
         if (std.mem.eql(u8, name, "injection")) {
@@ -1137,6 +1139,26 @@ fn packetDispatch(env: *Env) !void {
             result.extra_ns,                      cost,
             if (cost <= budget) "ok" else "OVER", budget,
         });
+    }
+}
+
+fn callbackLatency(env: *Env) !void {
+    try env.out.writeAll("\n## Native callback latency\n\nOne repeated chat packet with a matching player name, 1024 warmup dispatches. Times bracket the original callback inside normal dispatch and include the indirect call and clock overhead. The empty raw callback is the measurement baseline; no subtraction is applied. Host dispatch, validation, metrics, sample storage and transport are excluded. Later listeners are pooled separately from the first.\n\n| setup | listener | samples | p50 ns | p95 ns | p99 ns | max ns |\n|---|---|---|---|---|---|---|\n");
+    const count: usize = if (env.quick) 65_536 else 262_144;
+    for ([_]bench_plugins.Setup{ .one_raw, .one_lazy, .ten_independent, .ten_shared, .one_replace, .two_replace, .typed_replace, .packet_filter_chat }) |setup| {
+        const values = try bench_plugins.callbackSamples(env.gpa, env.io, setup, count);
+        defer env.gpa.free(values);
+        const groups = [_][]u64{ values[0..count], values[count..] };
+        for (groups, 0..) |group, i| {
+            if (group.len == 0) continue;
+            const latency: Percentiles = .of(group);
+            try env.out.print("| {s} | {s} | {d} | {d:.0} | {d:.0} | {d:.0} | {d:.0} |\n", .{
+                setup.describe(),   if (i == 0) "first" else "later", group.len,
+                latency.p50 * 1000, latency.p95 * 1000,               latency.p99 * 1000,
+                latency.max * 1000,
+            });
+        }
+        try env.out.flush();
     }
 }
 
