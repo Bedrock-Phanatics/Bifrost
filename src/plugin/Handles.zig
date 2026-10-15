@@ -11,6 +11,8 @@ pub const Route = struct {
     epoch: u64 = 0,
     link: u64,
     transfer: *const fn (context: *anyopaque, link: u64, backend: u32) abi.Status,
+    network: ?*const fn (context: *anyopaque, link: u64, target: abi.PacketTarget, out: *abi.NetworkStats) abi.Status = null,
+    io: ?std.Io = null,
 };
 
 const Slot = struct {
@@ -18,6 +20,8 @@ const Slot = struct {
     route: ?Route = null,
     name: [max_name_len]u8 = undefined,
     name_len: u8 = 0,
+    info: abi.PlayerInfo = .{},
+    connected_ns: u64 = 0,
 };
 
 lock: std.atomic.Value(bool) = .init(false),
@@ -41,6 +45,8 @@ pub fn acquire(self: *Handles, gpa: std.mem.Allocator, to: Route) !abi.Player {
     const slot = &self.slots.items[index];
     slot.route = to;
     slot.name_len = 0;
+    slot.info = .{ .worker = to.worker };
+    slot.connected_ns = if (to.io) |io| @import("Packets.zig").now(io) else 0;
     return handle(index, slot.generation);
 }
 
@@ -77,6 +83,42 @@ pub fn route(self: *Handles, player: abi.Player) ?Route {
     defer self.leave();
     _, const slot = self.find(player) orelse return null;
     return slot.route;
+}
+
+pub fn setIdentity(self: *Handles, player: abi.Player, name: []const u8, xuid: []const u8, uuid: []const u8, online: bool) void {
+    self.enter();
+    defer self.leave();
+    _, const slot = self.find(player) orelse return;
+    slot.info.state.authentication = .authenticated;
+    slot.name_len = @intCast(@min(name.len, max_name_len));
+    @memcpy(slot.name[0..slot.name_len], name[0..slot.name_len]);
+    slot.info.online = @intFromBool(online);
+    inline for (.{ "name", "xuid", "uuid" }, .{ name, xuid, uuid }) |field, bytes| {
+        const buffer = &@field(slot.info, field);
+        @field(slot.info, field ++ "_len") = if (bytes.len <= buffer.len) @intCast(bytes.len) else 0;
+        if (bytes.len <= buffer.len) @memcpy(buffer[0..bytes.len], bytes);
+    }
+}
+
+pub fn setState(self: *Handles, player: abi.Player, state: abi.PlayerState) ?abi.ConnectionPhase {
+    self.enter();
+    defer self.leave();
+    _, const slot = self.find(player) orelse return null;
+    const previous = slot.info.state.phase;
+    slot.info.state = state;
+    return previous;
+}
+
+pub fn copyInfo(self: *Handles, player: abi.Player, out: *abi.PlayerInfo) bool {
+    const io, const started = copied: {
+        self.enter();
+        defer self.leave();
+        _, const slot = self.find(player) orelse return false;
+        out.* = slot.info;
+        break :copied .{ slot.route.?.io, slot.connected_ns };
+    };
+    if (io) |clock| out.connection_duration_ms = (@import("Packets.zig").now(clock) -| started) / std.time.ns_per_ms;
+    return true;
 }
 
 pub fn invalidatePackets(self: *Handles, player: abi.Player) void {
@@ -132,6 +174,37 @@ test "a released handle goes stale even after its slot is reused" {
     try std.testing.expectEqual(@as(u64, 2), handles.route(second).?.link);
     try std.testing.expectEqual(@as(?Route, null), handles.route(.{}));
     try std.testing.expectEqual(@as(?Route, null), handles.route(.{ .id = 99 }));
+}
+
+test "player snapshots copy identity and state without retaining session memory" {
+    const gpa = std.testing.allocator;
+    var handles: Handles = .{};
+    defer handles.deinit(gpa);
+    var context: u8 = 0;
+    const player = try handles.acquire(gpa, .{ .context = &context, .link = 1, .transfer = noTransfer, .io = std.testing.io });
+    var info: abi.PlayerInfo = undefined;
+    try std.testing.expect(handles.copyInfo(player, &info));
+    try std.testing.expectEqual(@as(u32, 0), info.name_len);
+    try std.testing.expectEqual(abi.AuthenticationState.pending, info.state.authentication);
+    handles.setIdentity(player, "Steve", "123", "00000000-0000-0000-0000-000000000001", true);
+    try std.testing.expect(handles.copyInfo(player, &info));
+    try std.testing.expectEqualStrings("Steve", info.name[0..info.name_len]);
+    try std.testing.expectEqualStrings("123", info.xuid[0..info.xuid_len]);
+    try std.testing.expectEqual(@as(u32, 36), info.uuid_len);
+    try std.testing.expectEqual(abi.AuthenticationState.authenticated, info.state.authentication);
+    try std.testing.expectEqual(@as(u32, 1), info.online);
+    handles.setIdentity(player, "Alex", "456", "", false);
+    try std.testing.expectEqualStrings("Steve", info.name[0..info.name_len]);
+    try std.testing.expectEqual(abi.ConnectionPhase.unknown, handles.setState(player, .{ .backend = 2, .mode = .managed, .phase = .in_game, .transfer = .syncing_client }).?);
+    try std.testing.expect(handles.copyInfo(player, &info));
+    try std.testing.expectEqual(@as(u32, 2), info.state.backend);
+    try std.testing.expectEqual(abi.TransferState.syncing_client, info.state.transfer);
+    handles.release(player);
+    try std.testing.expect(!handles.copyInfo(player, &info));
+    const next = try handles.acquire(gpa, .{ .context = &context, .link = 2, .transfer = noTransfer });
+    try std.testing.expect(handles.copyInfo(next, &info));
+    try std.testing.expectEqual(@as(u32, 0), info.name_len);
+    try std.testing.expectEqual(@as(u32, 0), info.xuid_len);
 }
 
 test "generation exhaustion never revives a released player handle" {

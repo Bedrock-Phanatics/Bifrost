@@ -213,6 +213,26 @@ pub fn packet(self: *Proxy, link_id: u64, target: abi.PacketTarget, bytes: []con
     return link.sendPacket(target, bytes);
 }
 
+pub fn action(self: *Proxy, link_id: u64, disconnect: bool, backend: u32, reason: []const u8) abi.Status {
+    const link = self.findLink(link_id) orelse return .stale_handle;
+    if (disconnect) return link.disconnect(reason);
+    if (backend >= self.router.backends.len) return .invalid_argument;
+    link.requestTransfer(.of(backend)) catch |err| return switch (err) {
+        error.NotManaged => .unsupported,
+        error.TransferInProgress => .busy,
+        error.NotInGame, error.AlreadyThere => .too_late,
+        error.CanceledByPlugin => .canceled,
+        else => .failed,
+    };
+    return .ok;
+}
+
+fn routeNetwork(context: *anyopaque, link_id: u64, target: abi.PacketTarget, out: *abi.NetworkStats) abi.Status {
+    const self: *Proxy = @ptrCast(@alignCast(context));
+    const link = self.findLink(link_id) orelse return .too_late;
+    return link.networkStats(target, out);
+}
+
 fn routeTransfer(context: *anyopaque, link: u64, backend: u32) abi.Status {
     const self: *Proxy = @ptrCast(@alignCast(context));
     self.requestTransfer(link, .of(backend)) catch |err| return switch (err) {
@@ -325,7 +345,7 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     errdefer link.destroy();
     link.id = std.math.add(u64, self.next_player, 1) catch return error.PlayerIdExhausted;
     self.next_player = link.id;
-    link.player = self.env.events.connected(.{ .context = self, .worker = self.env.events.worker, .link = link.id, .transfer = routeTransfer }, session.address);
+    link.player = self.env.events.connected(.{ .context = self, .worker = self.env.events.worker, .link = link.id, .transfer = routeTransfer, .network = routeNetwork, .io = self.io }, session.address, if (self.env.events.plugins != null) link.playerState() else .{});
     if (link.managed) |managed| managed.plugin_player = link.player;
 
     try link.connect();
@@ -342,7 +362,7 @@ fn onMessage(_: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPa
     const link = linkOf(session) orelse return error.ApplicationFailure;
     link.forwardToBackend(payload.bytes) catch |err| {
         log.debug("dropping player: {t}", .{err});
-        session.close();
+        _ = link.disconnect("");
     };
 }
 

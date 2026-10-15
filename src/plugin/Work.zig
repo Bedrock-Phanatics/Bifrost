@@ -7,6 +7,8 @@ pub const max_message_bytes = 1024;
 
 // True while we're the ones calling into a plugin
 pub threadlocal var hosted: bool = false;
+pub threadlocal var worker: u32 = abi.no_worker;
+pub threadlocal var context: ?*const anyopaque = null;
 
 pub fn enter() bool {
     const outer = hosted;
@@ -39,6 +41,16 @@ pub const Item = union(enum) {
     message: *Message,
     post: *Done,
     packet: *Injection,
+    action: *Action,
+};
+
+pub const Action = struct {
+    player: abi.Player,
+    kind: enum { disconnect, transfer },
+    backend: u32 = abi.no_backend,
+    reason_len: usize = 0,
+    reason: [max_message_bytes]u8 = undefined,
+    then: ?Done,
 };
 
 pub const Injection = struct {

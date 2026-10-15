@@ -174,3 +174,13 @@ packet fields; the callback's host pointer remains valid for the plugin's lifeti
 replacement buffer. The `packet-dispatch` benchmark measures raw-text and chat pass paths, including the actual
 player-name lookup. This example limits client requests; backend view-distance policy remains the backend's
 responsibility.
+
+## Player information and actions
+
+The [Greeter](../examples/greeter/Greeter.cpp) feature-checks copied player information and posts a networking
+query to the player's worker. The C ABI also offers queued disconnect and backend-transfer actions from any
+thread. Zig uses `host.playerInfo`, `host.networkStats`, `host.disconnect` and `host.requestTransfer`.
+Networking fields carry availability bits; unsupported measurements are never presented as zero measurements.
+See [the player API contract](plugin-abi.md#copied-player-information) for lifetimes, statuses, transfer semantics,
+disconnect-reason limitations and the phase-change event. Run `zig build bench -Doptimize=ReleaseFast -- players --quick`
+to measure information lookups, transport collection, snapshots, rate sampling, action scheduling and event dispatch.

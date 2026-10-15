@@ -22,6 +22,11 @@ const Recorder = struct {
     var action: abi.TransferAction = .proceed;
     var redirect_to: u32 = abi.no_backend;
     var host: ?*const abi.Host = null;
+    var last_phase: abi.ConnectionPhase = .unknown;
+    var bad_snapshot: bool = false;
+    var network_status: std.atomic.Value(i32) = .init(-100);
+    var player_network: abi.NetworkStats = .{};
+    var backend_network: abi.NetworkStats = .{};
 
     fn reset() void {
         for (&counts) |*counter| counter.store(0, .release);
@@ -31,6 +36,9 @@ const Recorder = struct {
         action = .proceed;
         redirect_to = abi.no_backend;
         host = null;
+        last_phase = .unknown;
+        bad_snapshot = false;
+        network_status.store(-100, .release);
     }
 
     fn init(host_api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
@@ -47,8 +55,27 @@ const Recorder = struct {
 
     fn onEvent(_: ?*anyopaque, event: *const abi.Event, decision: ?*abi.TransferDecision) callconv(.c) void {
         switch (event.kind) {
-            .player_connected => player.store(event.player.id, .release),
+            .player_connected => {
+                var info: abi.PlayerInfo = undefined;
+                const api = host.?;
+                if (api.player_info(api.context, event.player, &info, @sizeOf(abi.PlayerInfo)) != .ok) bad_snapshot = true else last_phase = info.state.phase;
+                player.store(event.player.id, .release);
+            },
+            .connection_phase_changed => {
+                var info: abi.PlayerInfo = undefined;
+                const api = host.?;
+                if (event.previous_phase != last_phase or api.player_info(api.context, event.player, &info, @sizeOf(abi.PlayerInfo)) != .ok or info.state.phase != event.phase) bad_snapshot = true;
+                last_phase = event.phase;
+            },
+            .player_disconnected => {
+                var info: abi.PlayerInfo = undefined;
+                const api = host.?;
+                if (api.player_info(api.context, event.player, &info, @sizeOf(abi.PlayerInfo)) != .ok or info.state.connection != .disconnected) bad_snapshot = true;
+            },
             .player_authenticated => {
+                var network: abi.NetworkStats = undefined;
+                const api = host.?;
+                if (api.network_stats(api.context, event.player, .player, &network, @sizeOf(abi.NetworkStats)) != .ok) bad_snapshot = true;
                 const text = event.name.slice();
                 @memcpy(name[0..text.len], text);
                 name_len.store(text.len, .release);
@@ -58,6 +85,9 @@ const Recorder = struct {
                 out.backend = redirect_to;
             },
             .transfer_failed, .transfer_completed => {
+                var info: abi.PlayerInfo = undefined;
+                const api = host.?;
+                if (api.player_info(api.context, event.player, &info, @sizeOf(abi.PlayerInfo)) != .ok or ((event.kind == .transfer_completed or event.failure == .failed_after_commit) and info.state.backend != event.backend)) bad_snapshot = true;
                 from.store(event.from_backend, .release);
                 backend.store(event.backend, .release);
                 failure.store(@backingInt(event.failure), .release);
@@ -68,6 +98,25 @@ const Recorder = struct {
     }
 
     var posted: std.atomic.Value(i32) = .init(-1);
+
+    fn queryNetwork(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+        const api = host.?;
+        var status = result.status;
+        if (status == .ok) status = api.network_stats(api.context, result.player, .player, &player_network, @sizeOf(abi.NetworkStats));
+        if (status == .ok) status = api.network_stats(api.context, result.player, .backend, &backend_network, @sizeOf(abi.NetworkStats));
+        network_status.store(@backingInt(status), .release);
+    }
+
+    fn query(player_handle: abi.Player) !void {
+        const api = host.?;
+        network_status.store(-100, .release);
+        try std.testing.expectEqual(abi.Status.ok, api.post(api.context, player_handle, queryNetwork, null));
+        for (0..500) |_| {
+            if (network_status.load(.acquire) != -100) break;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+        try std.testing.expectEqual(@as(i32, 0), network_status.load(.acquire));
+    }
 
     fn transferThere(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
         const api = host.?;
@@ -168,6 +217,27 @@ test "a managed player is named, followed across a transfer and goes stale on le
     var len: usize = 0;
     try std.testing.expectEqual(abi.Status.ok, host.player_name(host.context, player, &name, name.len, &len));
     try std.testing.expectEqualStrings("Steve", name[0..len]);
+    var info: abi.PlayerInfo = undefined;
+    try std.testing.expectEqual(abi.Status.ok, host.player_info(host.context, player, &info, @sizeOf(abi.PlayerInfo)));
+    try std.testing.expectEqual(abi.ConnectionState.connected, info.state.connection);
+    try std.testing.expectEqual(abi.AuthenticationState.authenticated, info.state.authentication);
+    try std.testing.expectEqual(abi.SessionMode.managed, info.state.mode);
+    try std.testing.expectEqual(abi.ConnectionPhase.in_game, info.state.phase);
+    try std.testing.expectEqualStrings("Steve", info.name[0..info.name_len]);
+    try std.testing.expectEqualStrings("2535400000000001", info.xuid[0..info.xuid_len]);
+    try std.testing.expectEqual(@as(u32, 36), info.uuid_len);
+    try std.testing.expect(info.connection_duration_ms > 0);
+    var network: abi.NetworkStats = undefined;
+    try std.testing.expectEqual(abi.Status.wrong_thread, host.network_stats(host.context, player, .player, &network, @sizeOf(abi.NetworkStats)));
+    try Recorder.query(player);
+    try std.testing.expect(Recorder.player_network.available & abi.NetworkMetric.reliability != 0);
+    try std.testing.expectEqual(@as(u64, 0), Recorder.player_network.available & abi.NetworkMetric.rates);
+    try std.testing.expectEqual(@as(u64, 0), Recorder.backend_network.available & abi.NetworkMetric.rates);
+    try io.sleep(.fromMilliseconds(260), .awake);
+    try rig.expectOn(&rig.a);
+    try Recorder.query(player);
+    try std.testing.expect(Recorder.backend_network.available & abi.NetworkMetric.rates != 0);
+    try std.testing.expect(Recorder.backend_network.incoming_bytes_per_second > 0);
 
     try std.testing.expectEqual(abi.Status.wrong_thread, host.transfer(host.context, player, 1));
     try std.testing.expectEqual(abi.Status.ok, host.post(host.context, player, Recorder.transferThere, null));
@@ -178,12 +248,132 @@ test "a managed player is named, followed across a transfer and goes stale on le
     try std.testing.expectEqual(@as(u32, 0), Recorder.from.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), Recorder.backend.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), Recorder.count(.transfer_requested));
+    try std.testing.expectEqual(abi.Status.ok, host.player_info(host.context, player, &info, @sizeOf(abi.PlayerInfo)));
+    try std.testing.expectEqual(@as(u32, 1), info.state.backend);
+    try std.testing.expectEqual(abi.TransferState.none, info.state.transfer);
+    try Recorder.query(player);
+    try std.testing.expectEqual(@as(u64, 0), Recorder.backend_network.available & abi.NetworkMetric.rates);
 
     rig.player.destroy();
     rig.player = try managed.Player.connect(io, rig.running.address(), 3);
     try Recorder.waitFor(.player_disconnected, 1);
     try std.testing.expectEqual(abi.Status.stale_handle, host.post(host.context, player, Recorder.transferThere, null));
     try std.testing.expectEqual(abi.Status.stale_handle, host.player_name(host.context, player, &name, name.len, &len));
+    try std.testing.expectEqual(abi.Status.stale_handle, host.player_info(host.context, player, &info, @sizeOf(abi.PlayerInfo)));
+    rig.running.stop();
+    try std.testing.expect(!Recorder.bad_snapshot);
+}
+
+test "player API disconnect delivers a managed reason and transfers from non-worker threads" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    try loadRecorder(&plugins);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    plugins.backends = rig.running.proxy.config.backends();
+    const api = Recorder.host.?;
+    const player = Recorder.handle();
+    try std.testing.expectEqual(abi.Status.ok, api.request_transfer(api.context, player, 1, null, null));
+    try rig.waitFor(.transfers_committed, 1);
+    try rig.expectOn(&rig.b);
+    try Recorder.waitFor(.transfer_completed, 1);
+    try std.testing.expectEqual(abi.Status.ok, api.disconnect(api.context, player, .of("Maintenance"), null, null));
+    var found = false;
+    for (0..8) |_| {
+        var packets = try rig.player.receive();
+        defer packets.deinit();
+        while (packets.next()) |packet| if (packet.kind == .disconnect) {
+            const message = (try rig.player.session.decodePacket(packet)).value.typed.disconnect.messages.messages.message;
+            try std.testing.expectEqualStrings("Maintenance", message);
+            found = true;
+        };
+        if (found) break;
+    }
+    try std.testing.expect(found);
+}
+
+test "player snapshots follow transfer commit and retain the target on shutdown failure" {
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    try loadRecorder(&plugins);
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    rig.player.hold_acks = true;
+    try rig.transfer(1);
+    try rig.pumpUntil(rig.player, struct {
+        fn waiting(player: *managed.Player) bool {
+            return player.held_acks != 0;
+        }
+    }.waiting);
+    var info: abi.PlayerInfo = undefined;
+    const api = Recorder.host.?;
+    try std.testing.expectEqual(abi.Status.ok, api.player_info(api.context, Recorder.handle(), &info, @sizeOf(abi.PlayerInfo)));
+    try std.testing.expectEqual(@as(u32, 1), info.state.backend);
+    try std.testing.expectEqual(abi.TransferState.syncing_client, info.state.transfer);
+    rig.running.stop();
+    try std.testing.expectEqual(@as(u32, 1), Recorder.count(.transfer_failed));
+    try std.testing.expectEqual(@backingInt(abi.TransferFailure.failed_after_commit), Recorder.failure.load(.acquire));
+    try std.testing.expect(!Recorder.bad_snapshot);
+}
+
+test "player API actions and snapshots stay on their owning proxy workers" {
+    const Multi = struct {
+        var api: *const abi.Host = undefined;
+        var players: [2]std.atomic.Value(u64) = @splat(.init(0));
+        var finished: [2]std.atomic.Value(i32) = @splat(.init(-100));
+        var left: std.atomic.Value(u32) = .init(0);
+        fn init(host_api: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+            api = host_api;
+            plugin.name = .of("multi-player");
+            plugin.plugin_version = .of("1");
+            plugin.capabilities.events = true;
+            const status = api.subscribe(api.context, .player_connected, event, null);
+            if (status != .ok) return status;
+            return api.subscribe(api.context, .player_disconnected, event, null);
+        }
+        fn event(_: ?*anyopaque, incoming: *const abi.Event, _: ?*abi.TransferDecision) callconv(.c) void {
+            if (incoming.kind == .player_connected) players[incoming.worker].store(incoming.player.id, .release);
+            if (incoming.kind == .player_disconnected) _ = left.fetchAdd(1, .release);
+        }
+        fn query(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+            var stats: abi.NetworkStats = undefined;
+            var status = api.network_stats(api.context, result.player, .player, &stats, @sizeOf(abi.NetworkStats));
+            if (result.player.id != players[result.worker].load(.acquire)) status = .failed;
+            if (status == .ok) status = api.disconnect(api.context, result.player, .of("opaque reason"), done, null);
+            if (status != .ok) finished[result.worker].store(@backingInt(status), .release);
+        }
+        fn done(_: ?*anyopaque, result: *const abi.TaskResult) callconv(.c) void {
+            finished[result.worker].store(@backingInt(result.status), .release);
+        }
+    };
+    for (&Multi.players) |*player| player.store(0, .release);
+    for (&Multi.finished) |*status| status.store(-100, .release);
+    Multi.left.store(0, .release);
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{ .workers = 2, .packets = false });
+    defer plugins.deinit();
+    try plugins.add(Multi.init, null);
+    var backend: fixtures.Backend = undefined;
+    try backend.start(io, .{});
+    defer backend.deinit();
+    var first: fixtures.Running = undefined;
+    try first.start(io, try fixtures.config(&.{backend.address()}), .{ .plugins = &plugins, .worker = 0 });
+    defer first.deinit();
+    var second: fixtures.Running = undefined;
+    try second.start(io, try fixtures.config(&.{backend.address()}), .{ .plugins = &plugins, .worker = 1 });
+    defer second.deinit();
+    var a = try fixtures.Player.connect(io, first.address());
+    defer a.deinit();
+    var b = try fixtures.Player.connect(io, second.address());
+    defer b.deinit();
+    try a.roundTrip("\xfehello");
+    try b.roundTrip("\xfehello");
+    for (&Multi.players) |*player| try std.testing.expectEqual(abi.Status.ok, Multi.api.post(Multi.api.context, .{ .id = player.load(.acquire) }, Multi.query, null));
+    try a.awaitClosed();
+    try b.awaitClosed();
+    try fixtures.waitFor(io, &Multi.left, 2);
+    for (&Multi.finished) |*status| try std.testing.expectEqual(@as(i32, 0), status.load(.acquire));
 }
 
 test "a transfer request can be cancelled" {
@@ -250,6 +440,9 @@ test "the C header matches the Zig ABI" {
         .{ abi.Command, header.bifrost_command },
         .{ abi.TaskResult, header.bifrost_task_result },
         .{ abi.CommandInfo, header.bifrost_command_info },
+        .{ abi.PlayerState, header.bifrost_player_state },
+        .{ abi.PlayerInfo, header.bifrost_player_info },
+        .{ abi.NetworkStats, header.bifrost_network_stats },
     }) |pair| {
         try std.testing.expectEqual(@sizeOf(pair[0]), @sizeOf(pair[1]));
         inline for (comptime std.meta.fieldNames(pair[0])) |field| {
@@ -268,6 +461,19 @@ test "the C header matches the Zig ABI" {
     try expectConstants(abi.PacketTarget, "BIFROST_PACKET_TO_");
     try expectConstants(abi.TextType, "BIFROST_TEXT_");
     try expectConstants(abi.CommandPermission, "BIFROST_PERMISSION_");
+    try expectConstants(abi.ConnectionState, "BIFROST_CONNECTION_");
+    try expectConstants(abi.AuthenticationState, "BIFROST_AUTHENTICATION_");
+    try expectConstants(abi.SessionMode, "BIFROST_MODE_");
+    try expectConstants(abi.ConnectionPhase, "BIFROST_CONNECTION_PHASE_");
+    try expectConstants(abi.TransferState, "BIFROST_TRANSFER_STATE_");
+    inline for (comptime std.meta.declarations(abi.NetworkMetric)) |decl| {
+        const name = comptime upper: {
+            var buffer: [decl.len]u8 = undefined;
+            break :upper "BIFROST_NETWORK_" ++ std.ascii.upperString(&buffer, decl);
+        };
+        try std.testing.expectEqual(@field(abi.NetworkMetric, decl), @field(header, name));
+    }
+    try std.testing.expectEqual(abi.api_revision, header.BIFROST_API_REVISION);
     try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .validated = true })), header.BIFROST_PACKET_VALIDATED);
     try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .fields = true })), header.BIFROST_PACKET_FIELDS);
     try std.testing.expectEqual(abi.version, header.BIFROST_ABI_VERSION);

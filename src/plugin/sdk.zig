@@ -2,6 +2,9 @@ const std = @import("std");
 pub const abi = @import("abi.zig");
 
 pub const Player = abi.Player;
+pub const PlayerInfo = abi.PlayerInfo;
+pub const NetworkStats = abi.NetworkStats;
+pub const NetworkMetric = abi.NetworkMetric;
 pub const Event = abi.Event;
 pub const EventKind = abi.EventKind;
 pub const TransferDecision = abi.TransferDecision;
@@ -123,6 +126,30 @@ pub const Host = struct {
         var len: usize = 0;
         try check(self.raw.player_name(self.raw.context, player, buffer.ptr, buffer.len, &len));
         return buffer[0..@min(len, buffer.len)];
+    }
+
+    pub fn playerInfo(self: Host, player: Player) Error!PlayerInfo {
+        if (!self.raw.has(.player_info)) return error.Unsupported;
+        var info: PlayerInfo = undefined;
+        try check(self.raw.player_info(self.raw.context, player, &info, @sizeOf(PlayerInfo)));
+        return info;
+    }
+
+    pub fn networkStats(self: Host, player: Player, target: PacketTarget) Error!NetworkStats {
+        if (!self.raw.has(.network_stats)) return error.Unsupported;
+        var stats: NetworkStats = undefined;
+        try check(self.raw.network_stats(self.raw.context, player, target, &stats, @sizeOf(NetworkStats)));
+        return stats;
+    }
+
+    pub fn disconnect(self: Host, player: Player, reason: []const u8, done: ?abi.TaskDoneFn, user: ?*anyopaque) Error!void {
+        if (!self.raw.has(.disconnect)) return error.Unsupported;
+        try check(self.raw.disconnect(self.raw.context, player, .of(reason), done, user));
+    }
+
+    pub fn requestTransfer(self: Host, player: Player, backend: u32, done: ?abi.TaskDoneFn, user: ?*anyopaque) Error!void {
+        if (!self.raw.has(.request_transfer)) return error.Unsupported;
+        try check(self.raw.request_transfer(self.raw.context, player, backend, done, user));
     }
 
     pub fn backendCount(self: Host) u32 {

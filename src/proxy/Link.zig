@@ -12,6 +12,7 @@ const Managed = @import("../session/Managed.zig");
 const Transfer = @import("../transfer/Transfer.zig");
 const Events = @import("../plugin/Events.zig");
 const abi = @import("../plugin/abi.zig");
+const Network = @import("../plugin/Network.zig");
 const PacketQueue = @import("PacketQueue.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -58,6 +59,10 @@ transfer: ?*Transfer = null,
 id: u64 = 0,
 player: abi.Player = .{},
 announced: bool = false,
+published: abi.PlayerState = .{},
+authentication: abi.AuthenticationState = .pending,
+network_rates: Network.Rates = .{},
+network_backend: ?*raknet.Client = null,
 watch: Watch(raknet.Client) = .{},
 // Can't free the link while it's still on the ready stack
 queued: std.atomic.Value(bool) = .init(false),
@@ -90,6 +95,7 @@ pub fn destroy(self: *Link) void {
 }
 
 pub fn connect(self: *Link) (error{NoBackendAvailable} || std.Io.ConcurrentError)!void {
+    defer self.publishState();
     std.debug.assert(self.dial_task == null and self.backend == null);
     const id = self.env.router.pick(self.tried, self.tried.count() >= max_dial_attempts) orelse return error.NoBackendAvailable;
     self.tried.add(id);
@@ -106,9 +112,13 @@ pub fn isFinished(self: *const Link) bool {
 }
 
 pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
+    defer self.publishState();
     if (self.managed) |managed| {
         if (self.backend == null and self.dial_task == null) return error.BackendClosed;
-        try managed.fromPlayer(self.ends(self.session.?), payload);
+        managed.fromPlayer(self.ends(self.session.?), payload) catch |err| {
+            if (managed.identity == null and managed.player_phase == .login) self.authentication = if (err == error.OutOfMemory) .unavailable else .rejected;
+            return err;
+        };
         if (!self.announced) if (managed.identity) |identity| self.announce(identity);
         if (self.backend != null) self.env.scheduler.schedule(self);
         return;
@@ -131,13 +141,100 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
 pub fn sendMessage(self: *Link, text: []const u8) !void {
     const managed = self.managed orelse return error.NotManaged;
     const session = self.session orelse return error.NotInGame;
+    if (!session.isConnected()) return error.NotInGame;
     if (!managed.inGame()) return error.NotInGame;
     try managed.sendText(self.ends(session), text);
+}
+
+pub fn disconnect(self: *Link, reason: []const u8) abi.Status {
+    const session = self.session orelse return .stale_handle;
+    if (!session.isConnected()) return .too_late;
+    var status: abi.Status = .ok;
+    if (reason.len != 0) {
+        if (self.managed) |managed| {
+            managed.sendDisconnect(self.ends(session), reason) catch {
+                status = .failed;
+            };
+        }
+    }
+    session.close();
+    if (self.env.events.plugins) |plugins| plugins.handles.invalidatePackets(self.player);
+    self.publishState();
+    self.env.scheduler.schedule(self);
+    return status;
+}
+
+pub fn networkStats(self: *Link, target: abi.PacketTarget, out: *abi.NetworkStats) abi.Status {
+    const session = self.session orelse return .stale_handle;
+    if (!session.isConnected()) return .too_late;
+    const now_ms = @import("../plugin/Packets.zig").now(self.env.io) / std.time.ns_per_ms;
+    switch (target) {
+        .player => out.* = Network.snapshot(session.statistics(), now_ms),
+        .backend => {
+            const client = self.backend orelse return .too_late;
+            if (self.backend_closing or client.isClosed()) return .too_late;
+            if (self.network_backend != client) {
+                self.network_backend = client;
+                self.network_rates = .{};
+            }
+            out.* = Network.snapshot(client.statistics(), now_ms);
+            self.network_rates.sample(client.traffic(), out);
+        },
+        else => return .invalid_argument,
+    }
+    return .ok;
+}
+
+pub fn playerState(self: *const Link) abi.PlayerState {
+    var state: abi.PlayerState = .{
+        .backend = if (self.tried.count() != 0) @intCast(self.backend_id.index()) else abi.no_backend,
+        .authentication = if (self.authentication != .pending) self.authentication else if (self.env.auth == .off) .disabled else .pending,
+        .mode = if (self.managed != null) .managed else .passthrough,
+    };
+    if (self.managed) |managed| {
+        if (managed.identity != null) state.authentication = .authenticated;
+        state.phase = switch (managed.player.state) {
+            .transport_ready, .network_settings => .settings,
+            .authenticating => .login,
+            .encrypted_handshake => .handshake,
+            .resource_packs => .resource_packs,
+            .waiting_for_start_game, .spawn_ready => .joining,
+            .in_game => .in_game,
+            .closing => .closing,
+            .disconnected => .disconnected,
+        };
+    }
+    if (self.observer) |observer| if (observer.verified) {
+        state.authentication = .authenticated;
+    };
+    if (self.transfer) |transfer| {
+        state.transfer = transfer.pluginState();
+        if (transfer.state.phase.committed()) state.backend = @intCast(transfer.target.index());
+    }
+    if (self.session) |session| {
+        if (session.state == .closing or session.state == .closed) {
+            state.connection = .closing;
+            state.phase = .closing;
+        }
+    } else {
+        state.connection = .disconnected;
+        state.phase = .disconnected;
+    }
+    return state;
+}
+
+fn publishState(self: *Link) void {
+    if (self.env.events.plugins == null or self.player.id == 0) return;
+    const state = self.playerState();
+    if (std.meta.eql(state, self.published)) return;
+    self.published = state;
+    self.env.events.stateChanged(self.player, state);
 }
 
 pub fn sendPacket(self: *Link, target: abi.PacketTarget, bytes: []const u8) abi.Status {
     const managed = self.managed orelse return .unsupported;
     const session = self.session orelse return .stale_handle;
+    if (!session.isConnected()) return .too_late;
     if (self.transfer != null) return .busy;
     if (self.backend == null or self.backend_closing or self.backend_error != null or !managed.inGame()) return .too_late;
     managed.inject(self.ends(session), target, bytes) catch |err| {
@@ -151,7 +248,8 @@ pub fn sendPacket(self: *Link, target: abi.PacketTarget, bytes: []const u8) abi.
 
 fn announce(self: *Link, identity: bedwire.Identity) void {
     self.announced = true;
-    self.env.events.authenticated(self.player, identity.display_name, identity.xuid);
+    self.published = self.playerState();
+    self.env.events.authenticated(self.player, identity.display_name, identity.xuid, identity.uuid, identity.online, self.published);
 }
 
 pub fn detachSession(self: *Link) void {
@@ -164,6 +262,7 @@ pub fn detachSession(self: *Link) void {
 }
 
 pub fn service(self: *Link) error{Canceled}!void {
+    defer self.publishState();
     if (self.dial_task) |*task| if (self.dial.finished()) |result| {
         task.await(self.env.io);
         self.dial_task = null;
@@ -172,9 +271,7 @@ pub fn service(self: *Link) error{Canceled}!void {
     if (self.transfer) |transfer| if (self.session) |session| switch (try transfer.service(self.transferHost(session))) {
         .running => {},
         .finished => {
-            const target = transfer.target;
             self.endTransfer(null);
-            self.backend_id = target;
         },
         .rolled_back, .abandoned => self.endTransfer(null),
         .disconnect => {
@@ -214,8 +311,14 @@ fn observe(self: *Link, observer: *Observer, direction: bedwire.TapDirection, pa
         .encrypted => stats.bump(.handshakes_observed, 1),
         .gave_up => stats.bump(.observer_gave_up, 1),
         .login_verified => stats.bump(.logins_verified, 1),
-        .login_rejected => stats.bump(.logins_rejected, 1),
-        .auth_unavailable => stats.bump(.auth_unavailable, 1),
+        .login_rejected => {
+            self.authentication = .rejected;
+            stats.bump(.logins_rejected, 1);
+        },
+        .auth_unavailable => {
+            self.authentication = .unavailable;
+            stats.bump(.auth_unavailable, 1);
+        },
     }
     return event;
 }
@@ -234,6 +337,7 @@ fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
         return;
     };
     self.backend = client;
+    self.network_rates = .{};
     self.env.stats.bump(.backends_connected, 1);
     const session = self.session orelse return self.dropBackend();
     if (self.managed) |managed| return managed.backendConnected(self.ends(session)) catch |err| self.fail(err);
@@ -241,7 +345,9 @@ fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
 }
 
 pub fn requestTransfer(self: *Link, requested: Backend.Id) !void {
+    defer self.publishState();
     self.startTransfer(requested) catch |err| {
+        self.env.events.stateChanged(self.player, self.playerState());
         self.env.events.transferEnded(self.player, self.backend_id.index(), requested.index(), .rejected);
         return err;
     };
@@ -251,6 +357,7 @@ fn startTransfer(self: *Link, requested: Backend.Id) !void {
     const managed = self.managed orelse return error.NotManaged;
     if (self.transfer != null) return error.TransferInProgress;
     const session = self.session orelse return error.NotInGame;
+    if (!session.isConnected()) return error.NotInGame;
     if (self.backend == null or self.backend_closing or !managed.inGame()) return error.NotInGame;
     const decision = self.env.events.transferRequested(self.player, self.backend_id.index(), requested.index());
     const target: Backend.Id = switch (decision.action) {
@@ -277,14 +384,22 @@ fn transferHost(self: *Link, session: *raknet.Session) Transfer.Host {
         .notify = Scheduler.linkNotify(self),
         .backend = &self.backend,
         .backend_watch = &self.watch,
+        .events = self.env.events,
+        .source_backend = @intCast(self.backend_id.index()),
     };
 }
 
 fn endTransfer(self: *Link, event: ?Transfer.State.Event) void {
     const transfer = self.transfer orelse return;
+    const source = self.backend_id;
     self.transfer = null;
     if (event) |cause| transfer.end(self.env.io, self.env.stats, cause);
-    self.env.events.transferEnded(self.player, self.backend_id.index(), transfer.target.index(), failure(transfer));
+    if (transfer.state.phase.committed()) {
+        self.backend_id = transfer.target;
+        self.network_rates = .{};
+    }
+    self.publishState();
+    self.env.events.transferEnded(self.player, source.index(), transfer.target.index(), failure(transfer));
     transfer.destroy(self.env.gpa, self.env.io);
 }
 
@@ -304,6 +419,7 @@ fn ends(self: *Link, session: *raknet.Session) Managed.Ends {
 // Errors wait for the poll to end; returning one would drop the backend without telling it
 fn onBackendMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
     const self: *Link = @ptrCast(@alignCast(context));
+    defer self.publishState();
     if (self.backend_error != null) return;
     const session = self.session orelse return;
     if (self.managed) |managed| return managed.fromBackend(self.ends(session), payload.bytes) catch |err| {
@@ -349,6 +465,7 @@ fn fail(self: *Link, err: anyerror) void {
 
 fn closeSession(self: *Link) void {
     if (self.session) |session| session.close();
+    self.publishState();
 }
 
 fn closeBackend(self: *Link) void {

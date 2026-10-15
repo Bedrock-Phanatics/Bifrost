@@ -9,11 +9,12 @@ extern "C" {
 #endif
 
 /* Plugins run in-process, so a crash takes the proxy down. Callbacks run on several workers at once; never block.
-   From your own threads log, counts, names, send_message, send_packet and post work; callback-only calls return WRONG_THREAD.
+   From your own threads use log, counts, names, player_info and queued actions. Query network_stats on the player's worker.
    Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns.
    The full contract is in docs/plugin-abi.md. */
 
 #define BIFROST_ABI_VERSION 1u
+#define BIFROST_API_REVISION 2u
 #define BIFROST_NO_BACKEND UINT32_MAX
 #define BIFROST_NO_WORKER UINT32_MAX
 
@@ -54,6 +55,85 @@ typedef struct bifrost_player {
     uint64_t id;
 } bifrost_player;
 
+typedef uint32_t bifrost_connection_state;
+enum { BIFROST_CONNECTION_CONNECTED, BIFROST_CONNECTION_CLOSING, BIFROST_CONNECTION_DISCONNECTED };
+typedef uint32_t bifrost_authentication_state;
+enum { BIFROST_AUTHENTICATION_PENDING, BIFROST_AUTHENTICATION_AUTHENTICATED, BIFROST_AUTHENTICATION_DISABLED, BIFROST_AUTHENTICATION_UNAVAILABLE, BIFROST_AUTHENTICATION_REJECTED };
+typedef uint32_t bifrost_session_mode;
+enum { BIFROST_MODE_PASSTHROUGH, BIFROST_MODE_MANAGED };
+typedef uint32_t bifrost_connection_phase;
+enum { BIFROST_CONNECTION_PHASE_UNKNOWN, BIFROST_CONNECTION_PHASE_SETTINGS, BIFROST_CONNECTION_PHASE_LOGIN, BIFROST_CONNECTION_PHASE_HANDSHAKE, BIFROST_CONNECTION_PHASE_RESOURCE_PACKS, BIFROST_CONNECTION_PHASE_JOINING, BIFROST_CONNECTION_PHASE_IN_GAME, BIFROST_CONNECTION_PHASE_CLOSING, BIFROST_CONNECTION_PHASE_DISCONNECTED };
+typedef uint32_t bifrost_transfer_state;
+enum { BIFROST_TRANSFER_STATE_NONE, BIFROST_TRANSFER_STATE_REQUESTED, BIFROST_TRANSFER_STATE_DIALING, BIFROST_TRANSFER_STATE_LOGGING_IN, BIFROST_TRANSFER_STATE_JOINING, BIFROST_TRANSFER_STATE_PREPARING_CLIENT, BIFROST_TRANSFER_STATE_SYNCING_CLIENT, BIFROST_TRANSFER_STATE_CLOSING_SOURCE };
+
+typedef struct bifrost_player_state {
+    uint32_t backend;
+    bifrost_connection_state connection;
+    bifrost_authentication_state authentication;
+    bifrost_session_mode mode;
+    bifrost_connection_phase phase;
+    bifrost_transfer_state transfer;
+} bifrost_player_state;
+
+typedef struct bifrost_player_info {
+    uint32_t struct_size;
+    uint32_t worker;
+    bifrost_player_state state;
+    uint64_t connection_duration_ms;
+    uint32_t name_len;
+    uint32_t xuid_len;
+    uint32_t uuid_len;
+    uint32_t online;
+    uint8_t name[64];
+    uint8_t xuid[32];
+    uint8_t uuid[36];
+} bifrost_player_info;
+
+#define BIFROST_NETWORK_RTT (UINT64_C(1) << 0)
+#define BIFROST_NETWORK_RELIABILITY (UINT64_C(1) << 1)
+#define BIFROST_NETWORK_QUEUES (UINT64_C(1) << 2)
+#define BIFROST_NETWORK_LOSS_ESTIMATE (UINT64_C(1) << 3)
+#define BIFROST_NETWORK_RATES (UINT64_C(1) << 4)
+#define BIFROST_NETWORK_JITTER (UINT64_C(1) << 5)
+#define BIFROST_NETWORK_DUPLICATES (UINT64_C(1) << 6)
+#define BIFROST_NETWORK_OUT_OF_ORDER (UINT64_C(1) << 7)
+#define BIFROST_NETWORK_ANOMALIES (UINT64_C(1) << 8)
+
+typedef struct bifrost_network_stats {
+    uint32_t struct_size;
+    uint32_t mtu;
+    uint64_t available;
+    uint64_t sampled_at_ms;
+    uint64_t rtt_ms;
+    uint64_t jitter_ms;
+    uint32_t loss_estimate_ppm;
+    uint32_t retransmission_timeout_ms;
+    uint64_t acknowledged_datagrams;
+    uint64_t lost_datagrams;
+    uint64_t retransmitted_datagrams;
+    uint64_t ack_records_received;
+    uint64_t nack_records_received;
+    uint64_t ack_records_sent;
+    uint64_t nack_records_sent;
+    uint64_t queued_packets;
+    uint64_t queued_bytes;
+    uint64_t queued_packets_high_water;
+    uint64_t recovery_packets;
+    uint64_t recovery_bytes;
+    uint64_t ordered_packets;
+    uint64_t ordered_bytes;
+    uint64_t in_flight_bytes;
+    uint64_t congestion_window_bytes;
+    uint64_t incoming_packets_per_second;
+    uint64_t outgoing_packets_per_second;
+    uint64_t incoming_bytes_per_second;
+    uint64_t outgoing_bytes_per_second;
+    uint64_t duplicate_packets;
+    uint64_t out_of_order_packets;
+    uint64_t reliability_anomalies;
+    uint64_t rate_interval_ms;
+} bifrost_network_stats;
+
 #define BIFROST_CAPABILITY_EVENTS (UINT64_C(1) << 0)
 #define BIFROST_CAPABILITY_COMMANDS (UINT64_C(1) << 1)
 #define BIFROST_CAPABILITY_PACKETS (UINT64_C(1) << 2)
@@ -78,6 +158,7 @@ enum {
     BIFROST_EVENT_TRANSFER_REQUESTED = 6,
     BIFROST_EVENT_TRANSFER_FAILED = 7,
     BIFROST_EVENT_TRANSFER_COMPLETED = 8,
+    BIFROST_EVENT_CONNECTION_PHASE_CHANGED = 9,
 };
 
 typedef uint32_t bifrost_transfer_failure;
@@ -100,6 +181,9 @@ typedef struct bifrost_event {
     bifrost_str name;
     bifrost_str xuid;
     bifrost_str address;
+    uint32_t worker;
+    bifrost_connection_phase phase;
+    bifrost_connection_phase previous_phase;
 } bifrost_event;
 
 typedef uint32_t bifrost_transfer_action;
@@ -258,6 +342,10 @@ typedef struct bifrost_host {
        Thread-safe, bypasses listeners. Text in either direction; RequestChunkRadius to backend.
        In-game only, main sub-client only, <= 65536 bytes. Check BIFROST_HOST_HAS first. */
     bifrost_status (*send_packet)(void *context, bifrost_player player, bifrost_packet_target target, bifrost_str bytes, bifrost_task_done_fn done, void *user) BIFROST_NOEXCEPT;
+    bifrost_status (*player_info)(void *context, bifrost_player player, bifrost_player_info *out, size_t capacity) BIFROST_NOEXCEPT;
+    bifrost_status (*network_stats)(void *context, bifrost_player player, bifrost_packet_target target, bifrost_network_stats *out, size_t capacity) BIFROST_NOEXCEPT;
+    bifrost_status (*disconnect)(void *context, bifrost_player player, bifrost_str reason, bifrost_task_done_fn done, void *user) BIFROST_NOEXCEPT;
+    bifrost_status (*request_transfer)(void *context, bifrost_player player, uint32_t backend, bifrost_task_done_fn done, void *user) BIFROST_NOEXCEPT;
 } bifrost_host;
 
 /* Older hosts have a shorter table, so use this instead of sizeof */
