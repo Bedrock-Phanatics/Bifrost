@@ -42,6 +42,7 @@ pub const Subscriber = struct {
     validated: bool,
     fields: bool = false,
     context: ?*anyopaque = null,
+    owner: ?*const anyopaque = null,
     name: []const u8,
     metrics: []Metrics,
 };
@@ -132,6 +133,13 @@ fn dispatch(comptime fields: bool, table: *const Table, call: Call, id: u10, byt
     std.debug.assert(scratch.len >= scratch_bytes);
     const outer = Work.enter();
     defer Work.hosted = outer;
+    const previous_worker = Work.worker;
+    const previous_context = Work.context;
+    Work.worker = call.worker;
+    defer {
+        Work.worker = previous_worker;
+        Work.context = previous_context;
+    }
 
     var current = bytes;
     var valid: ?bool = null;
@@ -179,6 +187,7 @@ fn dispatch(comptime fields: bool, table: *const Table, call: Call, id: u10, byt
         var access: Access = undefined;
         if (fields and subscriber.fields) access = .{ .packet = &packet, .context = subscriber.context, .bytes = current, .out = out, .packet_type = decoded_type, .cache = &cache, .decoder = Thunk.decode, .permits = Thunk.permits, .decoder_context = &checker };
         const started = clock orelse now(call.io);
+        Work.context = subscriber.owner;
         const action = if (fields and subscriber.fields) access.call(subscriber) else subscriber.callback(subscriber.user, &packet);
         const ended = now(call.io);
         clock = ended;

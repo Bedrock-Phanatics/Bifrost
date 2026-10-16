@@ -68,7 +68,8 @@ never inside it.
 
 | host function | where it may be called |
 |---|---|
-| `log`, `worker_count`, `backend_count`, `backend_name`, `player_name`, `send_message`, `send_packet`, `post` | any thread |
+| `log`, `worker_count`, `backend_count`, `backend_name`, `player_name`, `player_info`, `send_message`, `send_packet`, `post`, `disconnect`, `request_transfer` | any thread |
+| `network_stats` | a callback on this player's worker, use `post` from other threads |
 | `transfer`, `spawn_task` | inside a callback Bifrost is running |
 | `subscribe`, `subscribe_packet`, `register_command`, `register_command_info`, `set_description` | inside `bifrost_plugin_init` |
 
@@ -229,10 +230,114 @@ callback against something the plugin trusts, such as a list of XUIDs it saw in 
 A `bifrost_player` is valid from `PLAYER_CONNECTED` until `PLAYER_DISCONNECTED` returns. After that every call with
 it returns `STALE_HANDLE`, even if a new player gets the same slot. `id` 0 is never a player.
 
+### Copied player information
+
+API revision 2 adds `player_info(player, out, capacity)`. Check `BIFROST_HOST_HAS(host, player_info)` first,
+then pass a `bifrost_player_info` and `sizeof(*out)`. It returns `INVALID_ARGUMENT` for a null or short output
+and `STALE_HANDLE` for a retired handle. The output owns its bytes and contains no session pointers or borrowed
+strings. It needs no allocation, takes one short handle-table lock, and is safe from any thread.
+
+`name`, `xuid` and `uuid` have explicit byte lengths and no promised terminator. Zero length means unavailable,
+including an identity field too large for its fixed buffer. Identity is copied only after successful verification.
+`online` distinguishes an online identity from an authenticated offline identity; it is meaningful only when
+`authentication` is `AUTHENTICATED`. Authentication may instead be pending, disabled, unavailable or rejected.
+An empty name never means an authenticated anonymous player. `player_name` retains its original truncation rules.
+
+`state` reports the connection, session mode, connection phase, current backend and transfer state. `NO_BACKEND`
+means no backend has been selected. During the initial dial the selected backend is reported even before it connects.
+During transfer the source remains current until commit, then the target becomes current, including inside
+`TRANSFER_COMPLETED`. The handle and connection duration survive transfers. Duration uses elapsed awake-clock
+milliseconds since handle creation, rather than wall time. A snapshot is coherent at the copy instant and may
+immediately become stale. During `PLAYER_DISCONNECTED` it reports disconnected; after that callback the handle is retired.
+
+Managed phases follow the player-facing Bedrock session: settings, login, handshake, resource packs, joining and
+in-game. Passthrough phases are `UNKNOWN` because encrypted progress cannot be observed reliably. Both modes
+report closing and disconnected. Changes publish at session/batch boundaries, with no lock or copy for unchanged
+state. `TRANSFER_REQUESTED` reports requested, then snapshots expose the transfer state machine's current phase.
+
+### Networking snapshots
+
+`network_stats(player, target, out, capacity)` returns a `bifrost_network_stats` for `PACKET_TO_PLAYER` or
+`PACKET_TO_BACKEND`. Directions are relative to the proxy: incoming is received by the proxy, outgoing is sent
+by it. The backend target means the active transport, which switches at commit. It returns `WRONG_THREAD` outside
+this player's worker callback, `STALE_HANDLE` for a retired handle, `TOO_LATE` before the link/backend is ready or
+while closing, and `INVALID_ARGUMENT` for an invalid target or null/short output. Check the host function first.
+Use `post` to query from another thread and copy the result in its completion. No internal transport pointer escapes.
+
+Only fields whose `available` bit is set are meaningful. An unset bit means unavailable, even if the field is zero.
+
+| availability bit | meaning |
+|---|---|
+| `RTT` | RakNet's smoothed RTT in milliseconds, absent until an eligible ACK sample exists |
+| `RELIABILITY` | MTU, retransmission timeout, cumulative acknowledged, timed-out and retransmitted datagrams, ACK/NACK record counts |
+| `QUEUES` | outbound packet/payload bytes and high-water packet count, recovery and ordered-buffer occupancy, in-flight bytes and congestion window |
+| `LOSS_ESTIMATE` | `lost / (acknowledged + lost)`, scaled to parts per million, absent with no observations |
+| `RATES` | backend UDP datagrams and bytes per second over `rate_interval_ms`, sampled on demand |
+
+The loss estimate counts RakNet retransmission timeouts, which can repeat for one datagram and can result from
+delay or ACK loss. It is a timeout ratio, not an end-to-end loss measurement. NACK counts and ordered-buffer
+occupancy are measurements, not anomaly or out-of-order traffic counts. Retransmission counts also include
+NACK-triggered retries. Byte occupancies are payload accounting, not total allocated memory.
+
+Backend rates reuse the dedicated RakNet socket's existing counters, including control datagrams. The first
+query establishes a baseline; a subsequent query at least 250 ms later yields rates for that interval. Queries
+closer together report rates unavailable and leave the baseline alone. Samples are shared by plugins on that
+player and reset when the active backend changes. `sampled_at_ms` uses the awake clock and has no wall-clock epoch.
+Integer rates truncate fractions. There is no timer, per-packet counter, allocation, transport lock or background scan.
+
+Player-side rates are unavailable because its listener socket serves multiple players. Jitter, duplicate traffic,
+out-of-order counts and reliability anomalies are unavailable on both legs in the pinned RakNet API. Their bits
+remain unset. Bifrost does not synthesize them from unrelated counters.
+
+### Queued actions
+
+`disconnect(player, reason, done, user)` and `request_transfer(player, backend, done, user)` accept calls from any
+thread. `OK` means queued, not completed. Both share the existing 1024-item message/post/injection budget and use
+one bounded allocation per accepted action. They return `BUSY` before allocation when full, `STALE_HANDLE` for a
+retired handle, `UNSUPPORTED` before plugin initialization, `CANCELED` during shutdown, and `FAILED` on allocation
+failure. Bad pointer/length shapes, invalid UTF-8, reasons over 1024 bytes and unknown backend indices return
+`INVALID_ARGUMENT`. Empty reasons are allowed. Rejected submissions never call `done`.
+
+The worker drains actions in insertion order after the current callback, revalidates the handle, and invokes the
+optional completion exactly once. A player leaving before delivery produces `STALE_HANDLE`; shutdown cancels
+pending actions with `CANCELED` and `NO_WORKER`. User data must remain alive through completion. Queue insertion
+is thread-safe; simultaneous producers have no ordering guarantee before insertion. Plugins must stop their
+own submitting threads before shutdown returns, as with existing posts and packet injections.
+
+A disconnect completion reports the close being initiated, not a remote acknowledgment. Repeated attempts
+return `TOO_LATE` once closing, or `STALE_HANDLE` after detachment. Managed reasons use a Bedrock Disconnect
+packet through normal encryption/compression, bypassing packet listeners, before closing the reliable transport.
+Delivery is best effort and depends on the peer and connection phase. `FAILED` can mean the reason failed to encode
+or send; the transport still closes. In passthrough, the encrypted session is opaque, so the reason is ignored and
+only the RakNet disconnect is sent. It is never sent as unencrypted chat. Disconnect also invalidates queued injections.
+
+A transfer completion reports that the state machine started. Its eventual outcome still arrives through the
+existing transfer events. Worker delivery returns `UNSUPPORTED` in passthrough, `BUSY` during another transfer,
+`TOO_LATE` outside a connected in-game session or when already on that backend, `CANCELED` if a plugin vetoes,
+and `FAILED` for other dial/setup failures. The original callback-only `transfer` mailbox keeps its existing contract.
+Use `post` for other short worker-affine work and the existing bounded `send_packet` API for packet injection.
+
+### Phase events and existing hooks
+
+`CONNECTION_PHASE_CHANGED` appends one event kind. `worker`, `phase` and `previous_phase` are appended to
+`bifrost_event`; older hosts require a `struct_size` check before reading them. The snapshot is updated before
+dispatch. Each observed change emits once, in registration order on the player's worker. Initialization is
+reported by `PLAYER_CONNECTED`, not a duplicate phase event. The final disconnected phase precedes
+`PLAYER_DISCONNECTED`; the handle remains queryable until that callback returns.
+
+Existing connection, authentication, backend selection and transfer callback ordering remains intact. No movement,
+combat, interaction, dimension or respawn events are added: packet subscriptions remain the source for those
+notifications and avoid extra decoding or disabling the existing relay fast path. No network anomaly event is
+invented from unsupported measurements. Command name validation, autocomplete-only permissions, plugin-attributed
+logs and rate-limited slow-callback diagnostics retain their existing behavior; no new permission or alert framework is added.
+
 ## Versioning
 
 - `BIFROST_ABI_VERSION` changes only for a breaking change. Each side checks the other's `abi_version` and refuses
   a mismatch: Bifrost returns an error for the plugin, a plugin should return `INCOMPATIBLE`.
+- `BIFROST_API_REVISION` identifies the header's additive API revision, currently 2. It is not a host negotiation
+  field; use `BIFROST_HOST_HAS` for each optional function. Keep the host pointer rather than copying a newer
+  header's entire table from an older host. New player/network snapshot layouts are fixed in v1.
 - `bifrost_host` only grows at the end. A plugin must not compare `host->struct_size` with its own
   `sizeof(bifrost_host)`, or it would refuse older v1 hosts for no reason. Check the functions it needs with
   `BIFROST_HOST_HAS(host, fn)` (`host.has(.fn)` in Zig) and skip the optional ones that are missing.

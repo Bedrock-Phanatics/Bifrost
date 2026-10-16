@@ -13,6 +13,7 @@ const bench_handles = @import("handles.zig");
 const bench_decoded = @import("decoded.zig");
 const bench_injection = @import("injection.zig");
 const bench_links = @import("links.zig");
+const bench_players = @import("players.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -32,15 +33,16 @@ comptime {
         std.testing.refAllDecls(harness);
         _ = bench_handles;
         _ = bench_plugins;
+        _ = bench_players;
     }
 }
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|packet-dispatch|callback-latency|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|players|packet-dispatch|callback-latency|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "decode", "injection", "ids", "tasks", "handles", "links", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "players", "decode", "injection", "ids", "tasks", "handles", "links", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -138,6 +140,12 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "ids")) try idsScenario(&env);
         if (std.mem.eql(u8, name, "tasks")) try tasksScenario(&env);
         if (std.mem.eql(u8, name, "handles")) try handlesScenario(&env);
+        if (std.mem.eql(u8, name, "players")) {
+            const results = try bench_players.run(env.gpa, env.io, env.quick);
+            try env.out.print("\nPlayer info {d} B, network output {d} B, rate sampler {d} B per link.\n", .{ @sizeOf(bifrost.plugin_abi.PlayerInfo), @sizeOf(bifrost.plugin_abi.NetworkStats), @sizeOf(bifrost.Plugins.Network.Rates) });
+            try env.out.writeAll("\n## Player APIs\n\nMedian of seven samples, 50,000 calls per quick sample or 500,000 otherwise. Snapshots allocate nothing. Scheduling includes one allocation, queue insertion, drain, callback or action, and free, with no transport I/O. Transport statistics is the underlying RakNet collection baseline. Event cases have 0, 1 or 10 subscribers.\n\n| case | ns per call | allocations per call |\n|---|---|---|\n");
+            for (results) |result| try env.out.print("| {t} | {d:.1} | {d:.1} |\n", .{ result.case, result.ns_per_call, result.allocations_per_call });
+        }
         if (std.mem.eql(u8, name, "links")) {
             const results = try bench_links.run(env.gpa, env.io, env.quick);
             try env.out.writeAll("\n## Worker link lookup\n\nUniform live IDs, median of seven samples through Proxy.packet. Links have no managed session, so this measures lookup and the unsupported check; no queue or transport work. Link allocations are excluded from index heap. No allocations are permitted during lookup.\n\n| players | ns per lookup | lookups/s | index heap B |\n|---|---|---|---|\n");

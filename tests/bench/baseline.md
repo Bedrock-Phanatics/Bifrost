@@ -934,3 +934,102 @@ is made by this verification pass. The earlier codec, dispatch, queue, callback 
 retain their documented workloads and limits. macOS and ARM64 runtime tests, the 25x nightly soak, race
 sanitizers and exhaustive fuzzing were not run. This evidence does not establish the absence of all races,
 leaks or malformed-input failures.
+
+## Native player API revision 2
+
+Recorded 2026-10-14 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast, four driver threads.
+Implementation: `62cb902`, based on `main` at `a235fa0`. The requested `foundations` ref was absent from the remote.
+
+```sh
+zig build bench -Doptimize=ReleaseFast -- players packet-dispatch handles --quick
+```
+
+Player cases use the median of seven samples of 50,000 calls. Transport state is seeded with a 125 ms RTT,
+1,000 acknowledged datagrams and 10 timeout observations so networking snapshots exercise availability and
+loss-estimate calculation. These are synthetic benchmark inputs, not measurements of a live connection.
+Information and networking calls go through the actual host table and stable handle validation. The network
+case includes RakNet statistics collection, timestamp, output copying and loss calculation. The rate case
+advances 250 ms between samples. Posts include an empty completion; disconnects use a counting sink with no
+transport I/O. Both scheduling cases include allocation, insertion, drain and free. Allocation accounting is
+enabled, and each sample checks that live heap returns to its setup baseline.
+
+| operation | ns per call | allocations per call |
+|---|---|---|
+| copied player information | 37.1 | 0 |
+| underlying RakNet statistics | 7.5 | 0 |
+| host networking snapshot | 45.2 | 0 |
+| backend rate calculation | 16.3 | 0 |
+| worker post and completion | 110.2 | 1 |
+| disconnect action scheduling | 64.2 | 1 |
+| event dispatch, no subscribers | 2.6 | 0 |
+| event dispatch, one subscriber | 3.3 | 0 |
+| event dispatch, ten subscribers | 16.1 | 0 |
+
+The copied information output is 192 bytes and networking output is 240 bytes. The per-link rate sampler
+retains only four counter baselines and a timestamp, occupying 48 bytes. Networking collection runs only on
+request, with no background timer, per-packet counter or per-packet allocation. Player-state publication compares
+the current state at batch/service boundaries and locks the existing handle table only when that state changes.
+These microbenchmarks do not measure total managed-relay throughput or WAN latency.
+
+The dispatch and handle scenarios were also run before editing at `a235fa0`, with the same compiler, build mode
+and quick workload. Below are the pre-change and final samples. They are isolated runs, not a statistically
+controlled throughput claim. No tests ran alongside the final benchmark.
+
+| packet dispatch case | before ns/packet | after ns/packet |
+|---|---|---|
+| no plugins | 0.2 | 0.2 |
+| idle plugins | 0.2 | 0.2 |
+| one raw subscriber | 31.3 | 31.8 |
+| one validated subscriber | 60.5 | 56.6 |
+| ten subscribers on the hot packet | 151.4 | 155.5 |
+| one lazy typed reader | 77.1 | 76.8 |
+| ten shared typed readers | 266.5 | 271.7 |
+| typed text modification | 168.1 | 170.5 |
+| C++ filter with name lookup | 82.9 | 85.6 |
+
+The typed-modification callback remains above its existing 200 ns budget: 340.5 ns/callback in the final run
+versus 335.7 ns before this change. Other final dispatch cases passed their printed budgets. Worker ownership
+adds callback-local thread state; the zero-subscriber fast path remains unchanged.
+
+| lookup threads | churn | before ns/lookup | after ns/lookup |
+|---|---|---|---|
+| 1 | no | 5.1 | 5.1 |
+| 2 | no | 36.5 | 37.4 |
+| 4 | no | 308.5 | 322.3 |
+| 8 | no | 1128.5 | 1149.1 |
+| 1 | yes | 40.1 | 50.3 |
+| 2 | yes | 134.5 | 141.3 |
+| 4 | yes | 351.6 | 379.2 |
+| 8 | yes | 1125.7 | 1197.0 |
+
+The existing shared handle-table lock still limits heavily contended lookups. Player snapshots reuse that lock
+for a bounded copy; transport reads remain on the owning worker. No new locking scheme or dependency was added.
+
+Verification used `zig build test bench-test --test-timeout 120s --summary all`, with the listed optimization
+mode. The completed Windows Debug run used `--test-timeout 10m` for the existing cryptographic transfer stress.
+Two initial Debug runs were interrupted while investigating its duration; a direct player-filtered run and the
+subsequent full run passed. Final compact-sampler Debug network and benchmark checks also passed, 12/12.
+Linux used `--cache-dir /tmp/bifrost-player-api-cache`.
+
+| platform | mode | passed | skipped | failed |
+|---|---|---|---|---|
+| Windows | Debug | 266 | 3 | 0 |
+| Windows | ReleaseSafe | 266 | 3 | 0 |
+| Windows | ReleaseFast | 266 | 3 | 0 |
+| WSL2 Linux | ReleaseSafe | 268 | 1 | 0 |
+
+Each row includes all nine benchmark accounting/cleanup checks. The C++ packet-filter executable also passed.
+Windows skips three reuse-port tests; Linux skips the unsupported-platform rejection test. Native ReleaseSafe
+proxy and Maintenance, Greeter and PacketFilter builds passed on both platforms. Repository formatting,
+whitespace validation and final diff review passed.
+
+Regression coverage includes copied identity/authentication state, stale handles and slot reuse, transfer commit
+and shutdown after commit, managed disconnect reason delivery, concurrent producers, two real proxy workers,
+callback affinity, queue capacity, allocation failure, closed queues and shutdown cancellation. Real RakNet core
+tests delay ACKs by 1,500 ms and expire a reliable datagram to validate RTT, loss estimates and retransmissions.
+Unavailable metrics, rate intervals and backend rate-baseline resets are checked separately.
+
+Jitter, duplicate and out-of-order counts, reliability anomaly counts and shared-listener player rates remain
+explicitly unavailable. Passthrough disconnect reasons cannot be delivered inside opaque Bedrock encryption.
+This pass did not run macOS/ARM64 runtime tests, race sanitizers, a WAN fault emulator or an extended soak.
+It does not establish the absence of all concurrency or transport failures.

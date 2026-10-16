@@ -60,6 +60,9 @@ BIFROST_EXPORT size_t bifrost_fixture_layout(uint64_t *out, size_t capacity) {
     FIELD(bifrost_event, name);
     FIELD(bifrost_event, xuid);
     FIELD(bifrost_event, address);
+    FIELD(bifrost_event, worker);
+    FIELD(bifrost_event, phase);
+    FIELD(bifrost_event, previous_phase);
     SIZE(bifrost_transfer_decision);
     FIELD(bifrost_transfer_decision, struct_size);
     FIELD(bifrost_transfer_decision, action);
@@ -127,6 +130,10 @@ BIFROST_EXPORT size_t bifrost_fixture_layout(uint64_t *out, size_t capacity) {
     FIELD(bifrost_host, decode_packet);
     FIELD(bifrost_host, encode_packet);
     FIELD(bifrost_host, send_packet);
+    FIELD(bifrost_host, player_info);
+    FIELD(bifrost_host, network_stats);
+    FIELD(bifrost_host, disconnect);
+    FIELD(bifrost_host, request_transfer);
     SIZE(bifrost_plugin);
     FIELD(bifrost_plugin, struct_size);
     FIELD(bifrost_plugin, abi_version);

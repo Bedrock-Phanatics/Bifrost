@@ -1,5 +1,5 @@
 // Plugins run in-process, so a crash takes the proxy down. Callbacks run on several workers at once; never block.
-// From your own threads only log, counts, names, send_message and post work, the rest return wrong_thread.
+// From your own threads use log, counts, names, player_info and queued actions. Query network_stats on the player's worker.
 // Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns.
 
 const std = @import("std");
@@ -11,6 +11,83 @@ pub const max_manifest_bytes = 4096;
 pub const ManifestFn = *const fn (out: ?*Str) callconv(.c) Status;
 pub const no_backend: u32 = std.math.maxInt(u32);
 pub const no_worker: u32 = std.math.maxInt(u32);
+pub const api_revision: u32 = 2;
+
+pub const ConnectionState = enum(u32) { connected, closing, disconnected, _ };
+pub const AuthenticationState = enum(u32) { pending, authenticated, disabled, unavailable, rejected, _ };
+pub const SessionMode = enum(u32) { passthrough, managed, _ };
+pub const ConnectionPhase = enum(u32) { unknown, settings, login, handshake, resource_packs, joining, in_game, closing, disconnected, _ };
+pub const TransferState = enum(u32) { none, requested, dialing, logging_in, joining, preparing_client, syncing_client, closing_source, _ };
+
+pub const PlayerState = extern struct {
+    backend: u32 = no_backend,
+    connection: ConnectionState = .connected,
+    authentication: AuthenticationState = .pending,
+    mode: SessionMode = .passthrough,
+    phase: ConnectionPhase = .unknown,
+    transfer: TransferState = .none,
+};
+
+pub const PlayerInfo = extern struct {
+    struct_size: u32 = @sizeOf(PlayerInfo),
+    worker: u32 = no_worker,
+    state: PlayerState = .{},
+    connection_duration_ms: u64 = 0,
+    name_len: u32 = 0,
+    xuid_len: u32 = 0,
+    uuid_len: u32 = 0,
+    online: u32 = 0,
+    name: [64]u8 = @splat(0),
+    xuid: [32]u8 = @splat(0),
+    uuid: [36]u8 = @splat(0),
+};
+
+pub const NetworkMetric = struct {
+    pub const rtt: u64 = 1 << 0;
+    pub const reliability: u64 = 1 << 1;
+    pub const queues: u64 = 1 << 2;
+    pub const loss_estimate: u64 = 1 << 3;
+    pub const rates: u64 = 1 << 4;
+    pub const jitter: u64 = 1 << 5;
+    pub const duplicates: u64 = 1 << 6;
+    pub const out_of_order: u64 = 1 << 7;
+    pub const anomalies: u64 = 1 << 8;
+};
+
+pub const NetworkStats = extern struct {
+    struct_size: u32 = @sizeOf(NetworkStats),
+    mtu: u32 = 0,
+    available: u64 = 0,
+    sampled_at_ms: u64 = 0,
+    rtt_ms: u64 = 0,
+    jitter_ms: u64 = 0,
+    loss_estimate_ppm: u32 = 0,
+    retransmission_timeout_ms: u32 = 0,
+    acknowledged_datagrams: u64 = 0,
+    lost_datagrams: u64 = 0,
+    retransmitted_datagrams: u64 = 0,
+    ack_records_received: u64 = 0,
+    nack_records_received: u64 = 0,
+    ack_records_sent: u64 = 0,
+    nack_records_sent: u64 = 0,
+    queued_packets: u64 = 0,
+    queued_bytes: u64 = 0,
+    queued_packets_high_water: u64 = 0,
+    recovery_packets: u64 = 0,
+    recovery_bytes: u64 = 0,
+    ordered_packets: u64 = 0,
+    ordered_bytes: u64 = 0,
+    in_flight_bytes: u64 = 0,
+    congestion_window_bytes: u64 = 0,
+    incoming_packets_per_second: u64 = 0,
+    outgoing_packets_per_second: u64 = 0,
+    incoming_bytes_per_second: u64 = 0,
+    outgoing_bytes_per_second: u64 = 0,
+    duplicate_packets: u64 = 0,
+    out_of_order_packets: u64 = 0,
+    reliability_anomalies: u64 = 0,
+    rate_interval_ms: u64 = 0,
+};
 
 pub const Status = enum(i32) {
     ok = 0,
@@ -66,9 +143,10 @@ pub const EventKind = enum(u32) {
     transfer_requested,
     transfer_failed,
     transfer_completed,
+    connection_phase_changed,
     _,
 
-    pub const count = 9;
+    pub const count = 10;
 };
 
 pub const TransferFailure = enum(u32) {
@@ -91,6 +169,9 @@ pub const Event = extern struct {
     name: Str = .{},
     xuid: Str = .{},
     address: Str = .{},
+    worker: u32 = no_worker,
+    phase: ConnectionPhase = .unknown,
+    previous_phase: ConnectionPhase = .unknown,
 };
 
 pub const TransferAction = enum(u32) { proceed, cancel, redirect, _ };
@@ -227,6 +308,10 @@ pub const Host = extern struct {
     decode_packet: *const fn (context: *anyopaque, packet: ?*const Packet, packet_type: PacketType, out: ?*anyopaque, capacity: usize) callconv(.c) Status,
     encode_packet: *const fn (context: *anyopaque, packet: ?*Packet, packet_type: PacketType, data: ?*const anyopaque, size: usize) callconv(.c) Status,
     send_packet: *const fn (context: *anyopaque, player: Player, target: PacketTarget, bytes: Str, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
+    player_info: *const fn (context: *anyopaque, player: Player, out: ?*PlayerInfo, capacity: usize) callconv(.c) Status,
+    network_stats: *const fn (context: *anyopaque, player: Player, target: PacketTarget, out: ?*NetworkStats, capacity: usize) callconv(.c) Status,
+    disconnect: *const fn (context: *anyopaque, player: Player, reason: Str, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
+    request_transfer: *const fn (context: *anyopaque, player: Player, backend: u32, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
 
     pub fn has(self: *const Host, comptime field: std.meta.FieldEnum(Host)) bool {
         const name = @tagName(field);

@@ -10,6 +10,8 @@ const Managed = @import("../session/Managed.zig");
 const Upstream = Managed.Upstream;
 const self_id = @import("../session/self_id.zig");
 const Stats = @import("../proxy/Stats.zig");
+const Events = @import("../plugin/Events.zig");
+const abi = @import("../plugin/abi.zig");
 const content = @import("../content/policy.zig");
 const packs = @import("../content/packs.zig");
 const registries = @import("../content/registries.zig");
@@ -32,6 +34,8 @@ pub const Host = struct {
     notify: Notify,
     backend: *?*raknet.Client,
     backend_watch: *Watch(raknet.Client),
+    events: Events = .{},
+    source_backend: u32 = abi.no_backend,
 
     fn ends(self: Host) Managed.Ends {
         return .{ .io = self.io, .stats = self.stats, .player = self.player, .backend = self.backend.* };
@@ -273,6 +277,7 @@ fn endsRegistries(kind: ?bedwire.PacketKind) bool {
 fn on(self: *Transfer, host: Host, event: State.Event) void {
     const phase = self.state.phase;
     const step = self.state.apply(event, now(host.io));
+    if (step.action != .commit) self.publish(host);
     self.record(host.stats, step);
     switch (step.action) {
         .none, .stale => {},
@@ -300,6 +305,26 @@ fn on(self: *Transfer, host: Host, event: State.Event) void {
     if (self.result == .running and self.state.phase != phase) self.armTimer(host) catch self.on(host, .target_failed);
 }
 
+pub fn pluginState(self: *const Transfer) abi.TransferState {
+    return switch (self.state.phase) {
+        .dialing => .dialing,
+        .logging_in => .logging_in,
+        .joining => .joining,
+        .preparing_client => .preparing_client,
+        .syncing_client => .syncing_client,
+        .closing_source => .closing_source,
+    };
+}
+
+fn publish(self: *const Transfer, host: Host) void {
+    const plugins = host.events.plugins orelse return;
+    var info: abi.PlayerInfo = undefined;
+    if (!plugins.handles.copyInfo(host.managed.plugin_player, &info)) return;
+    info.state.transfer = self.pluginState();
+    info.state.backend = if (self.state.phase.committed()) @intCast(self.target.index()) else host.source_backend;
+    _ = plugins.handles.setState(host.managed.plugin_player, info.state);
+}
+
 fn commit(self: *Transfer, host: Host) !void {
     const managed = host.managed;
     self.watch.cancel(host.io);
@@ -308,6 +333,7 @@ fn commit(self: *Transfer, host: Host) !void {
     host.backend.* = self.client;
     self.client = null;
     self.upstream = managed.swapUpstream(self.upstream);
+    self.publish(host);
     var outbox: Managed.Outbox = .init(host.gpa);
     defer outbox.deinit();
     try managed.client_state.reset(&outbox);
