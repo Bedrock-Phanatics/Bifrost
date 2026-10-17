@@ -1078,3 +1078,52 @@ The echo payload is not a tracked packet, so this is almost entirely the opaque 
 A packet subscriber gives it up only in its own direction, while tracking needs both, so every batch is
 decompressed, decrypted and re-encoded each way. Heap per managed player was unchanged at 252.9 KiB with no
 entities. Tracking is therefore opt-in and costs nothing while no loaded plugin declares it.
+
+## Resource limits
+
+Recorded 2026-10-17 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast, same session for both columns.
+
+```sh
+zig build bench -Doptimize=ReleaseFast -- relay managed handshake connections
+```
+
+Before is a3dc0ec, after adds stage deadlines, the shared queue budget, login and player byte rates, the
+backlog pause and per-plugin quotas. Median round trips/s; both runs are single samples on a desktop, so treat
+differences under about 10% as noise. The after column was mostly higher, which is not a claimed speedup.
+
+| case | before | after |
+|---|---|---|
+| relay 512 B 1x1 | 5050 | 5430 |
+| relay 512 B 8x32 | 17424 | 19340 |
+| relay 20 KiB 8x12 | 1147 | 1250 |
+| managed 256 B 8x32, transfers possible | 8608 | 9127 |
+| managed 256 B 8x32, relayed | 12683 | 13214 |
+| managed 8 KiB 1x1, transfers possible | 730 | 777 |
+| managed 20 KiB 1x1, transfers possible | 271 | 301 |
+| managed 20 KiB 8x12, 1 decoded subscriber | 714 | 764 |
+| observed handshake p50 / p99 us | 6226 / 8885 | 5283 / 7044 |
+| joins/s, 2000 players wave 1 | 695 | 881 |
+| heap per held player | 269.6 KiB | 269.7 KiB |
+| heap after churn, fresh worker | 4659305 B | 4661673 B |
+
+The first after run used a 2 MiB/s default for `player_bytes_per_second`, and one benchmark player pushing about
+6 MiB/s of decoded echo got disconnected as a flood (0 round trips at 8 and 20 KiB 1x1 on the decoded paths). The
+default is now 8 MiB/s, and the table shows that run. Real clients send far less, but the limit shouldn't trip on
+a legitimate heavy sender.
+
+Reconnect churn lost a round of 32 cycles in both builds (2 of 6 baseline rounds, 1 of 9 after); one after round
+right behind a WSL test run lost 2385. Alternating runs of both builds showed the same pattern, so this is host
+UDP loss, not the change.
+
+Per turn the worker now reads the clock once and walks the (usually empty) backlog list; links are swept once a
+second. A decoded player batch adds one clock read and a token bucket update, and each backend poll reads the
+player's RakNet queue counts. Nothing on these paths allocates or takes a lock. The budget is one atomic shared
+by all workers, touched only when a packet is queued behind a dial, login or transfer.
+
+Stress coverage in `tests/integration/limits.zig` and the unit tests, all passing on Windows and Linux (WSL):
+4096 queues inside their own limits exhausting one budget and draining to zero; 8 threads hammering one budget;
+16 real players filling the shared budget so the 17th is refused while the rest stay; 20 connect, queue and leave
+cycles returning every byte; a silent client timed out at login; 6 parallel logins against 1 login a second;
+a 1 MiB-per-batch compression bomb ending only its sender; 600 queued backend messages held behind a player that
+stops acking for 1.5 s and then delivered in order; the same player cut off after `slow_player_timeout_ms`; a
+transfer refused past `max_concurrent`; and one plugin's message and injection quota leaving another's intact.
