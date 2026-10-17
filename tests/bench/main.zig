@@ -1127,7 +1127,7 @@ fn handlesScenario(env: *Env) !void {
     });
 }
 
-const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot, .phase_miss, .one_replace };
+const plugin_relays = [_]bench_plugins.Setup{ .none, .idle_10, .one_raw, .one_decoded, .ten_ids, .ten_hot, .phase_miss, .one_replace, .tracking };
 
 fn packetDispatch(env: *Env) !void {
     const dispatch = try bench_plugins.dispatch(env.gpa, env.io, env.quick);

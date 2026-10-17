@@ -26,6 +26,7 @@ pub const Setup = enum {
     packet_filter,
     native_chat_reader,
     packet_filter_chat,
+    tracking,
 
     pub fn describe(self: Setup) []const u8 {
         return switch (self) {
@@ -45,13 +46,14 @@ pub const Setup = enum {
             .packet_filter => "1 C++ packet filter reading raw text",
             .native_chat_reader => "1 native listener reading chat fields",
             .packet_filter_chat => "1 C++ chat filter with player-name lookup",
+            .tracking => "1 plugin tracking gameplay and entities",
         };
     }
 
     // Half the stream is the hot packet
     pub fn callbacksPerPacket(self: Setup) f64 {
         return switch (self) {
-            .none, .idle_10, .phase_miss => 0,
+            .none, .idle_10, .phase_miss, .tracking => 0,
             .one_raw, .one_decoded, .one_replace, .one_lazy, .typed_replace, .packet_filter, .native_chat_reader, .packet_filter_chat => 0.5,
             .ten_ids, .two_replace => 1,
             .ten_hot, .ten_independent, .ten_shared => 5,
@@ -60,7 +62,7 @@ pub const Setup = enum {
 
     pub fn budgetNs(self: Setup) f64 {
         return switch (self) {
-            .none, .idle_10, .phase_miss => 2,
+            .none, .idle_10, .phase_miss, .tracking => 2,
             .one_decoded, .one_replace, .two_replace, .one_lazy, .typed_replace, .packet_filter, .native_chat_reader, .packet_filter_chat => 200,
             else => 100,
         };
@@ -94,6 +96,12 @@ fn copy(_: ?*anyopaque, packet: *abi.Packet) callconv(.c) abi.PacketAction {
 
 fn idle(_: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
     named(plugin, "idle");
+    return .ok;
+}
+
+fn tracker(_: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+    named(plugin, "tracker");
+    plugin.capabilities = .{ .gameplay = true, .entities = true };
     return .ok;
 }
 
@@ -166,6 +174,7 @@ pub fn load(plugins: *bifrost.Plugins, io: std.Io, setup: Setup, hot: u10) !void
         .none => {},
         .idle_10 => for (0..10) |_| try plugins.add(idle, null),
         .one_raw => try plugins.add(raw, null),
+        .tracking => try plugins.add(tracker, null),
         .one_decoded => try plugins.add(decoded, null),
         .ten_hot => for (0..10) |_| try plugins.add(raw, null),
         .phase_miss => try plugins.add(beforeGame, null),

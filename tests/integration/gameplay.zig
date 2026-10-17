@@ -162,9 +162,13 @@ test "gameplay and entity tracking follow the client across moves, spawns and a 
     try std.testing.expectEqual(@as(u32, 0), Tracker.state.teleport_pending);
     try std.testing.expectEqual(@as(u64, 0), Tracker.state.available & abi.GameplayField.attributes);
 
-    try rig.player.relay(&.{try health(&buffers[0], target_id, 6)});
+    try rig.player.relay(&.{
+        try health(&buffers[0], target_id, 6),
+        try sample.typedPacket(&buffers[1], .{ .mob_effect = .{ .target_runtime_id = target_id, .event_id = .add, .effect_id = 3, .effect_amplifier = 0, .show_particles = false, .effect_duration_ticks = 100, .tick = 0, .ambient = false } }),
+    });
     try Tracker.query(0);
     try std.testing.expectEqual(@as(f32, 6), Tracker.state.attributes[@backingInt(abi.AttributeKind.health)].current);
+    try std.testing.expectEqual(@as(u64, 1 << 3), Tracker.state.effects[0]);
 
     const player = Tracker.handle();
     rig.player.destroy();

@@ -1060,5 +1060,21 @@ packet cases include the header decode the proxy already does, the full borrowed
 
 A full entity table holds 100,661 heap bytes per player; an empty one holds none. The player snapshot lives inline
 in the managed session (`bifrost_gameplay` is 232 bytes). Storage only grows when entities are added, so steady
-movement allocates nothing. These are microbenchmarks: they do not measure managed relay throughput with tracking
-on, which also gives up the opaque relay fast path while a tracking plugin is loaded.
+movement allocates nothing. These are microbenchmarks.
+
+End to end, `zig build bench -Doptimize=ReleaseFast -- plugins --quick` adds a `tracking` setup: one plugin
+declaring both capabilities, on the managed 512 B echo relay with one worker and one backend, run in the same
+session as the other setups.
+
+| setup | load | round trips/s | p50 us | p99 us | proxy CPU |
+|---|---|---|---|---|---|
+| 0 plugins | 1x1 | 3498 | 234 | 368 | 61% |
+| 0 plugins | 8x32 | 10782 | 20801 | 78859 | 92% |
+| 1 raw subscriber on the hot packet | 8x32 | 9362 | 23741 | 75985 | 100% |
+| 1 plugin tracking gameplay and entities | 1x1 | 2644 | 326 | 580 | 66% |
+| 1 plugin tracking gameplay and entities | 8x32 | 7180 | 29944 | 85024 | 100% |
+
+The echo payload is not a tracked packet, so this is almost entirely the opaque relay fast path being given up.
+A packet subscriber gives it up only in its own direction, while tracking needs both, so every batch is
+decompressed, decrypted and re-encoded each way. Heap per managed player was unchanged at 252.9 KiB with no
+entities. Tracking is therefore opt-in and costs nothing while no loaded plugin declares it.
