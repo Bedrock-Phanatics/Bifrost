@@ -5,6 +5,7 @@ const Notify = @import("../net/Notify.zig");
 const Observer = @import("../protocol/Observer.zig");
 const proxy_key = @import("../session/proxy_key.zig");
 const Admission = @import("Admission.zig");
+const Budget = @import("Budget.zig");
 const Proxy = @import("Proxy.zig");
 const Stats = @import("Stats.zig");
 const Plugins = @import("../plugin/Plugins.zig");
@@ -18,6 +19,7 @@ gpa: std.mem.Allocator,
 io: std.Io,
 config: Config,
 admission: Admission,
+budget: Budget,
 health: Health,
 watchers: []Notify,
 proxies: []*Proxy,
@@ -37,6 +39,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .io = io,
         .config = config,
         .admission = try .init(gpa, config.max_players, config.max_players_per_ip),
+        .budget = .init(std.math.cast(usize, config.total_pending_bytes) orelse std.math.maxInt(usize)),
         .health = undefined,
         .watchers = &.{},
         .proxies = &.{},
@@ -55,6 +58,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         proxy.* = try Proxy.create(gpa, io, worker_config, .{
             .auth = options.auth,
             .admission = &self.admission,
+            .budget = &self.budget,
             .health = &self.health,
             .proxy_key = options.proxy_key,
             .plugins = options.plugins,
@@ -121,6 +125,18 @@ fn report(self: *Workers) void {
             totals_now.backend_failures,
             totals_now.bytes_to_backend,
             totals_now.bytes_to_player,
+        });
+        const timeouts = totals_now.login_timeouts + totals_now.resource_pack_timeouts + totals_now.join_timeouts;
+        const refusals = self.budget.refusals.load(.monotonic);
+        if (timeouts + totals_now.logins_throttled + totals_now.player_floods + totals_now.slow_players + refusals + totals_now.sessions_rejected == 0) continue;
+        log.info("{d} rejected, {d} timed out, {d} logins throttled, {d} floods, {d} too slow, {d} queue refusals, {Bi:.1} queued", .{
+            totals_now.sessions_rejected,
+            timeouts,
+            totals_now.logins_throttled,
+            totals_now.player_floods,
+            totals_now.slow_players,
+            refusals,
+            self.budget.used.load(.monotonic),
         });
     }
 }

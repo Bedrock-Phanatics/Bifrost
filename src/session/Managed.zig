@@ -1,7 +1,9 @@
 const std = @import("std");
 const raknet = @import("raknet");
 const bedwire = @import("bedwire");
+const Budget = @import("../proxy/Budget.zig");
 const PacketQueue = @import("../proxy/PacketQueue.zig");
+const Rate = @import("../proxy/Rate.zig");
 const Stats = @import("../proxy/Stats.zig");
 const packs = @import("../content/packs.zig");
 pub const registries = @import("../content/registries.zig");
@@ -63,6 +65,9 @@ pub const Shared = struct {
     translated: std.heap.ArenaAllocator,
     hooks: ?Hooks = null,
     transfers: bool = true,
+    budget: ?*Budget = null,
+    logins: ?*Rate = null,
+    player_bytes_per_second: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, key: Ecdsa.KeyPair, keys: *const bedwire.auth.KeySet) !Shared {
         var pool: bedwire.BufferPool = try .init(gpa, limits, .{ .rx_slots = 1, .tx_slots = 1 });
@@ -118,6 +123,7 @@ plugin_player: abi.Player = .{},
 commands_sent: bool = false,
 // Player packets sent before the backend is ready
 early: PacketQueue,
+inbound: Rate = .unlimited,
 
 pub fn create(gpa: std.mem.Allocator, shared: *Shared, early_packets: u32, early_bytes: u32) !*Managed {
     const self = try gpa.create(Managed);
@@ -129,7 +135,8 @@ pub fn create(gpa: std.mem.Allocator, shared: *Shared, early_packets: u32, early
         .shared = shared,
         .player = player,
         .upstream = try .init(shared),
-        .early = .init(early_packets, early_bytes),
+        .early = .init(early_packets, early_bytes, shared.budget),
+        .inbound = .bytes(shared.player_bytes_per_second),
     };
     return self;
 }
@@ -435,6 +442,10 @@ pub fn fromPlayer(self: *Managed, ends: Ends, payload: []const u8) !void {
     ends.stats.bump(.managed_decoded_bytes, payload.len);
     var packets = try self.player.ingest(payload);
     defer packets.deinit();
+    if (!self.inbound.take(Packets.now(ends.io) / std.time.ns_per_ms, packets.reader.bytes.len)) {
+        ends.stats.bump(.player_floods, 1);
+        return error.Flooding;
+    }
     if (self.player_phase == .ready) return self.relayFromPlayer(ends, &packets);
 
     // Bedwire allows one packet per batch until encryption is up
@@ -501,6 +512,11 @@ fn answerSettings(self: *Managed, ends: Ends, packet: PlayerSession.Packet) !voi
 }
 
 fn authenticate(self: *Managed, ends: Ends, packet: PlayerSession.Packet) !void {
+    if (self.shared.logins) |logins| if (!logins.take(Packets.now(ends.io) / std.time.ns_per_ms, 1)) {
+        ends.stats.bump(.logins_throttled, 1);
+        self.sendDisconnect(ends, "Server is busy, try again shortly") catch {};
+        return error.ServerBusy;
+    };
     const policy: bedwire.TrustPolicy = .{ .oidc = .{ .now = std.Io.Clock.real.now(ends.io).toSeconds(), .keys = self.shared.keys } };
     var identity = self.player.authenticateLoginPacket(self.gpa, packet, policy) catch |err| {
         if (err == error.OutOfMemory) ends.stats.bump(.auth_unavailable, 1) else ends.stats.bump(.logins_rejected, 1);
@@ -710,7 +726,7 @@ test "failed managed batches release replacement storage before the next player"
     var shared: Shared = .{ .pool = undefined, .key = undefined, .keys = undefined, .batch = &storage, .translated = .init(gpa), .hooks = .{ .plugins = &plugins, .worker = 0 } };
     defer shared.translated.deinit();
     defer gpa.free(shared.scratch);
-    var managed: Managed = .{ .gpa = gpa, .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    var managed: Managed = .{ .gpa = gpa, .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0, null) };
     managed.player.state = .in_game;
     var header_buffer: [4]u8 = undefined;
     var writer = protocol.Writer.init(&header_buffer);
@@ -739,7 +755,7 @@ test "managed batches free storage when arena retention allocation fails" {
     defer shared.translated.deinit();
     _ = try shared.translated.allocator().alloc(u8, 512 * 1024);
     failing.fail_index = failing.alloc_index;
-    var managed: Managed = .{ .gpa = failing.allocator(), .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    var managed: Managed = .{ .gpa = failing.allocator(), .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0, null) };
     var batch: Batch = .{ .managed = &managed, .ends = undefined, .to_player = true };
     try batch.flush();
     try std.testing.expect(failing.has_induced_failure);
@@ -748,7 +764,7 @@ test "managed batches free storage when arena retention allocation fails" {
 }
 
 test "player milestones and container tracking use the delivered packet" {
-    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = undefined, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = undefined, .player = undefined, .upstream = undefined, .early = .init(0, 0, null) };
     managed.player.state = .resource_packs;
     var buffer: [32]u8 = undefined;
     const downloading = try encodeTyped(&buffer, .{ .resource_pack_client_response = .{ .response = .{ .downloading_finished = "" } } });
@@ -773,7 +789,7 @@ test "entity tracking alone keeps player batches on the opaque relay" {
     var shared: Shared = undefined;
     shared.transfers = false;
     shared.hooks = .{ .plugins = &plugins, .worker = 0 };
-    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0, null) };
     managed.player.state = .in_game;
     managed.upstream.phase = .ready;
     try std.testing.expect(managed.relayable(.from_player) and managed.relayable(.from_backend));
@@ -784,7 +800,7 @@ test "entity tracking alone keeps player batches on the opaque relay" {
 }
 
 test "typed plugin fields respect session phase and packet direction" {
-    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = undefined, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = undefined, .player = undefined, .upstream = undefined, .early = .init(0, 0, null) };
     var checker: Checker = .{ .managed = &managed, .to_player = false };
     managed.player.state = .resource_packs;
     try std.testing.expect(!checker.permits(.text));

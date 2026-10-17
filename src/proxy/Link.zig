@@ -14,7 +14,9 @@ const Events = @import("../plugin/Events.zig");
 const abi = @import("../plugin/abi.zig");
 const Network = @import("../plugin/Network.zig");
 const Handles = @import("../plugin/Handles.zig");
+const Budget = @import("Budget.zig");
 const PacketQueue = @import("PacketQueue.zig");
+const Rate = @import("Rate.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
 
@@ -24,6 +26,17 @@ const log = std.log.scoped(.link);
 const max_polls_per_turn = 4;
 // Each dial can take a full connect timeout; past this only health-checked backends are tried
 const max_dial_attempts = 3;
+pub const backlog_packets: usize = 256;
+pub const backlog_bytes: usize = 4 * 1024 * 1024;
+
+pub const Deadlines = struct {
+    login_ms: u32 = 30_000,
+    resource_packs_ms: u32 = 600_000,
+    join_ms: u32 = 120_000,
+    slow_player_ms: u32 = 5_000,
+};
+
+pub const Stage = enum { login, resource_packs, joining, playing };
 
 pub const Env = struct {
     gpa: std.mem.Allocator,
@@ -37,8 +50,14 @@ pub const Env = struct {
     connect_timeout_ms: u32,
     pending_packets: u32,
     pending_bytes: u32,
+    budget: ?*Budget = null,
+    logins: ?*Rate = null,
+    player_bytes_per_second: u32 = 0,
+    deadlines: Deadlines = .{},
     managed: ?*Managed.Shared = null,
     transfer: Transfer.Settings = .{ .limits = .{ .dial_ms = 5_000, .phase_ms = 5_000, .total_ms = 15_000 }, .queue_packets = 64, .queue_bytes = 1024 * 1024 },
+    transfers: ?*u32 = null,
+    max_transfers: u32 = std.math.maxInt(u32),
     next_epoch: ?*Transfer.State.Epoch = null,
     events: Events = .{},
 };
@@ -68,6 +87,11 @@ watch: Watch(raknet.Client) = .{},
 // Can't free the link while it's still on the ready stack
 queued: std.atomic.Value(bool) = .init(false),
 next_ready: ?*Link = null,
+stage: Stage = .login,
+stage_since_ms: u64,
+backlogged_since_ms: ?u64 = null,
+parked: bool = false,
+park_node: std.DoublyLinkedList.Node = .{},
 
 pub fn create(env: *const Env, session: *raknet.Session) !*Link {
     const self = try env.gpa.create(Link);
@@ -77,14 +101,16 @@ pub fn create(env: *const Env, session: *raknet.Session) !*Link {
     self.* = .{
         .env = env,
         .session = session,
-        .pending = .init(env.pending_packets, env.pending_bytes),
-        .observer = if (env.observer_pool) |pool| try Observer.init(pool) else null,
+        .pending = .init(env.pending_packets, env.pending_bytes, env.budget),
+        .observer = if (env.observer_pool) |pool| try Observer.init(pool, env.player_bytes_per_second) else null,
         .managed = managed,
+        .stage_since_ms = nowMs(env.io),
     };
     return self;
 }
 
 pub fn destroy(self: *Link) void {
+    self.env.scheduler.unpark(self);
     self.endTransfer(.player_left);
     self.env.events.disconnected(&self.player);
     self.cancelDial();
@@ -117,7 +143,7 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
     if (self.managed) |managed| {
         if (self.backend == null and self.dial_task == null) return error.BackendClosed;
         managed.fromPlayer(self.ends(self.session.?), payload) catch |err| {
-            if (managed.identity == null and managed.player_phase == .login) self.authentication = if (err == error.OutOfMemory) .unavailable else .rejected;
+            if (managed.identity == null and managed.player_phase == .login) self.authentication = if (err == error.OutOfMemory or err == error.ServerBusy) .unavailable else .rejected;
             return err;
         };
         if (!self.announced) if (managed.identity) |identity| self.announce(identity);
@@ -245,7 +271,9 @@ pub fn sendPacket(self: *Link, target: abi.PacketTarget, bytes: []const u8) abi.
     const session = self.session orelse return .stale_handle;
     if (!session.isConnected()) return .too_late;
     if (self.transfer != null) return .busy;
-    if (self.backend == null or self.backend_closing or self.backend_error != null or !managed.inGame()) return .too_late;
+    const client = self.backend orelse return .too_late;
+    if (self.backend_closing or self.backend_error != null or !managed.inGame()) return .too_late;
+    if (backlogged(if (target == .player) session.statistics() else client.statistics(), false)) return .busy;
     managed.inject(self.ends(session), target, bytes) catch |err| {
         if (err == error.NotInGame) return .too_late;
         self.fail(err);
@@ -292,7 +320,12 @@ pub fn service(self: *Link) error{Canceled}!void {
     const client = self.backend orelse return;
 
     var drained = false;
+    var paused = false;
     for (0..max_polls_per_turn) |_| {
+        if (self.playerBacklogged()) {
+            paused = true;
+            break;
+        }
         _ = client.poll(no_wait, self, onBackendMessage) catch |err| switch (err) {
             error.Timeout => {
                 drained = true;
@@ -308,12 +341,87 @@ pub fn service(self: *Link) error{Canceled}!void {
     }
     if (client.isClosed()) return if (self.backend_closing) self.dropBackend() else self.fail(error.ConnectionClosed);
     if (self.transfer) |transfer| if (self.session) |session| transfer.syncClient(self.transferHost(session)) catch |err| return self.fail(err);
+    if (paused) return self.pause();
+    self.backlogged_since_ms = null;
+    self.env.scheduler.unpark(self);
     self.watch.arm(self.env.io, client, Scheduler.linkNotify(self)) catch |err| return self.fail(err);
     if (!drained) self.env.scheduler.schedule(self);
 }
 
+// The backend isn't read until the player catches up, so RakNet's own flow control slows it down
+fn pause(self: *Link) void {
+    if (self.backlogged_since_ms == null) {
+        self.backlogged_since_ms = nowMs(self.env.io);
+        self.env.stats.bump(.backlog_pauses, 1);
+    }
+    self.env.scheduler.park(self);
+}
+
+pub fn playerBacklogged(self: *const Link) bool {
+    const session = self.session orelse return false;
+    if (session.state != .connected) return false;
+    return backlogged(session.statistics(), self.backlogged_since_ms != null);
+}
+
+fn backlogged(stats: raknet.SessionStatistics, draining: bool) bool {
+    // Resuming at half the mark keeps a busy player from flapping
+    const shift: u1 = @intFromBool(draining);
+    return stats.queued_packets >= backlog_packets >> shift or stats.queued_payload_bytes >= backlog_bytes >> shift;
+}
+
+pub fn checkDeadlines(self: *Link, now_ms: u64) void {
+    const session = self.session orelse return;
+    if (session.state != .connected) return;
+    const deadlines = self.env.deadlines;
+    if (self.backlogged_since_ms) |since| if (now_ms -| since >= deadlines.slow_player_ms) {
+        self.env.stats.bump(.slow_players, 1);
+        log.debug("player {d} can't keep up, closing", .{self.id});
+        _ = self.disconnect("Connection too slow");
+        return;
+    };
+    const stage = self.currentStage();
+    if (stage != self.stage) {
+        self.stage = stage;
+        self.stage_since_ms = now_ms;
+        return;
+    }
+    const limit_ms = switch (stage) {
+        .login => deadlines.login_ms,
+        .resource_packs => deadlines.resource_packs_ms,
+        .joining => deadlines.join_ms,
+        .playing => return,
+    };
+    if (now_ms -| self.stage_since_ms < limit_ms) return;
+    const stats = self.env.stats;
+    switch (stage) {
+        .login => stats.bump(.login_timeouts, 1),
+        .resource_packs => stats.bump(.resource_pack_timeouts, 1),
+        .joining, .playing => stats.bump(.join_timeouts, 1),
+    }
+    log.debug("player {d} timed out in {t}", .{ self.id, stage });
+    _ = self.disconnect("Timed out");
+}
+
+fn currentStage(self: *const Link) Stage {
+    if (self.managed) |managed| {
+        if (managed.upstream.phase != .ready) return .login;
+        return switch (managed.player.state) {
+            .transport_ready, .network_settings, .authenticating, .encrypted_handshake => .login,
+            .resource_packs => .resource_packs,
+            .waiting_for_start_game, .spawn_ready => .joining,
+            .in_game, .closing, .disconnected => .playing,
+        };
+    }
+    if (self.observer) |observer| if (observer.watching) return .login;
+    return .playing;
+}
+
+fn nowMs(io: std.Io) u64 {
+    return @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
+}
+
 fn observe(self: *Link, observer: *Observer, direction: bedwire.TapDirection, payload: []const u8) Observer.Event {
-    const event = observer.observe(.{ .gpa = self.env.gpa, .io = self.env.io, .auth = self.env.auth }, direction, payload);
+    const event = observer.observe(.{ .gpa = self.env.gpa, .io = self.env.io, .auth = self.env.auth, .now_ms = nowMs(self.env.io), .logins = self.env.logins }, direction, payload);
     const stats = self.env.stats;
     switch (event) {
         .none => {},
@@ -328,6 +436,11 @@ fn observe(self: *Link, observer: *Observer, direction: bedwire.TapDirection, pa
             self.authentication = .unavailable;
             stats.bump(.auth_unavailable, 1);
         },
+        .login_throttled => {
+            self.authentication = .unavailable;
+            stats.bump(.logins_throttled, 1);
+        },
+        .flooded => stats.bump(.player_floods, 1),
     }
     return event;
 }
@@ -377,9 +490,11 @@ fn startTransfer(self: *Link, requested: Backend.Id) !void {
     if (target.index() >= self.env.router.backends.len) return error.UnknownBackend;
     if (target == self.backend_id) return error.AlreadyThere;
     if (self.env.health) |health| if (health.status(target) == .unhealthy) return error.BackendDown;
+    if (self.env.transfers) |count| if (count.* >= self.env.max_transfers) return error.TooManyTransfers;
     const epoch = self.env.next_epoch.?;
     epoch.* +%= 1;
     self.transfer = try Transfer.create(self.transferHost(session), target, self.env.router.get(target).address, epoch.*, self.env.transfer);
+    if (self.env.transfers) |count| count.* += 1;
     self.env.scheduler.schedule(self);
 }
 
@@ -402,6 +517,7 @@ fn endTransfer(self: *Link, event: ?Transfer.State.Event) void {
     const transfer = self.transfer orelse return;
     const source = self.backend_id;
     self.transfer = null;
+    if (self.env.transfers) |count| count.* -= 1;
     if (event) |cause| transfer.end(self.env.io, self.env.stats, cause);
     if (transfer.state.phase.committed()) {
         self.backend_id = transfer.target;

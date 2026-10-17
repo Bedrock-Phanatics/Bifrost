@@ -7,6 +7,8 @@ const Scheduler = @This();
 io: std.Io,
 wake: std.Io.Event = .unset,
 ready: std.atomic.Value(?*Link) = .init(null),
+// Worker only: links waiting for their player to drain
+backlogged: std.DoublyLinkedList = .{},
 
 pub fn schedule(self: *Scheduler, link: *Link) void {
     if (link.queued.swap(true, .acq_rel)) return;
@@ -23,6 +25,29 @@ pub fn takeReady(self: *Scheduler) ?*Link {
 
 pub fn hasReady(self: *const Scheduler) bool {
     return self.ready.load(.monotonic) != null;
+}
+
+pub fn park(self: *Scheduler, link: *Link) void {
+    if (link.parked) return;
+    link.parked = true;
+    self.backlogged.append(&link.park_node);
+}
+
+pub fn unpark(self: *Scheduler, link: *Link) void {
+    if (!link.parked) return;
+    link.parked = false;
+    self.backlogged.remove(&link.park_node);
+}
+
+pub fn resumeDrained(self: *Scheduler) void {
+    var node = self.backlogged.first;
+    while (node) |current| {
+        node = current.next;
+        const link: *Link = @fieldParentPtr("park_node", current);
+        if (link.playerBacklogged()) continue;
+        self.unpark(link);
+        self.schedule(link);
+    }
 }
 
 pub fn wakeNotify(self: *Scheduler) Notify {

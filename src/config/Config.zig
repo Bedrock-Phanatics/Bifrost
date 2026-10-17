@@ -25,6 +25,13 @@ max_players_per_ip: u32 = 0,
 connect_timeout_ms: u32 = 5_000,
 pending_packets: u32 = 64,
 pending_bytes: u32 = 1024 * 1024,
+total_pending_bytes: u64 = 256 * 1024 * 1024,
+login_timeout_ms: u32 = 30_000,
+resource_pack_timeout_ms: u32 = 600_000,
+join_timeout_ms: u32 = 120_000,
+slow_player_timeout_ms: u32 = 5_000,
+logins_per_second: u32 = 100,
+player_bytes_per_second: u32 = 8 * 1024 * 1024,
 slow_plugin_callback_ms: u32 = 5,
 plugin_task_threads: u8 = 4,
 handshake_rate_per_ip: u32 = 2000,
@@ -32,6 +39,7 @@ health_interval_ms: u32 = 5_000,
 health_timeout_ms: u32 = 1_000,
 transfer_phase_timeout_ms: u32 = 5_000,
 transfer_timeout_ms: u32 = 15_000,
+max_transfers: u32 = 64,
 content_policy: content.Policy = .initial,
 auth: Auth = .off,
 keys_file_storage: [max_path_len]u8 = undefined,
@@ -142,7 +150,9 @@ pub fn validate(self: *const Config) error{ NoBackends, InvalidLimit, MissingKey
     if (self.workers > 1 and !multi_worker_supported) return error.InvalidLimit;
     if (self.max_players == 0 or self.connect_timeout_ms < min_connect_timeout_ms) return error.InvalidLimit;
     if (self.max_players_per_ip > self.max_players) return error.InvalidLimit;
-    if (self.pending_packets == 0 or self.pending_bytes == 0) return error.InvalidLimit;
+    if (self.pending_packets == 0 or self.pending_bytes == 0 or self.total_pending_bytes < self.pending_bytes) return error.InvalidLimit;
+    if (self.login_timeout_ms == 0 or self.resource_pack_timeout_ms == 0 or self.join_timeout_ms == 0 or self.slow_player_timeout_ms == 0) return error.InvalidLimit;
+    if (self.logins_per_second == 0 or self.player_bytes_per_second == 0 or self.max_transfers == 0) return error.InvalidLimit;
     if (self.health_timeout_ms == 0 or self.health_timeout_ms >= self.health_interval_ms) return error.InvalidLimit;
     if (self.transfer_phase_timeout_ms == 0 or self.transfer_timeout_ms < self.transfer_phase_timeout_ms) return error.InvalidLimit;
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const bedwire = @import("bedwire");
+const Rate = @import("../proxy/Rate.zig");
 
 const Observer = @This();
 const log = std.log.scoped(.observer);
@@ -20,6 +21,8 @@ pub const Context = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     auth: Auth,
+    now_ms: u64 = 0,
+    logins: ?*Rate = null,
 };
 
 pub const Event = enum {
@@ -29,9 +32,14 @@ pub const Event = enum {
     login_verified,
     login_rejected,
     auth_unavailable,
+    login_throttled,
+    flooded,
 
     pub fn rejects(self: Event) bool {
-        return self == .login_rejected or self == .auth_unavailable;
+        return switch (self) {
+            .login_rejected, .auth_unavailable, .login_throttled, .flooded => true,
+            .none, .encrypted, .gave_up, .login_verified => false,
+        };
     }
 };
 
@@ -39,6 +47,7 @@ tap: bedwire.Tap,
 watching: bool = true,
 verified: bool = false,
 identity: ?bedwire.Identity = null,
+inbound: Rate,
 
 pub fn loadKeys(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bedwire.auth.KeySet {
     const json = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(limits.max_jwks_bytes));
@@ -50,8 +59,8 @@ pub fn initPool(gpa: std.mem.Allocator) !bedwire.BufferPool {
     return bedwire.BufferPool.init(gpa, limits, bedwire.PoolConfig.observer());
 }
 
-pub fn init(pool: *bedwire.BufferPool) !Observer {
-    return .{ .tap = try bedwire.Tap.init(.{ .pool = pool }) };
+pub fn init(pool: *bedwire.BufferPool, player_bytes_per_second: u32) !Observer {
+    return .{ .tap = try bedwire.Tap.init(.{ .pool = pool }), .inbound = .bytes(player_bytes_per_second) };
 }
 
 pub fn deinit(self: *Observer) void {
@@ -63,6 +72,10 @@ pub fn observe(self: *Observer, ctx: Context, direction: bedwire.TapDirection, p
     std.debug.assert(self.watching);
     var packets = self.tap.observe(direction, payload) catch |err| return self.giveUp(ctx, err);
     defer packets.deinit();
+    if (direction == .client_to_server and !self.inbound.take(ctx.now_ms, packets.reader.bytes.len)) {
+        self.watching = false;
+        return .flooded;
+    }
 
     var event: Event = .none;
     while (packets.next()) |packet| {
@@ -80,6 +93,7 @@ pub fn observe(self: *Observer, ctx: Context, direction: bedwire.TapDirection, p
 }
 
 fn verify(self: *Observer, ctx: Context, packet: bedwire.Tap.Packet) Event {
+    if (ctx.logins) |logins| if (!logins.take(ctx.now_ms, 1)) return .login_throttled;
     const policy: bedwire.TrustPolicy = .{ .oidc = .{
         .now = std.Io.Clock.real.now(ctx.io).toSeconds(),
         .keys = ctx.auth.verify,

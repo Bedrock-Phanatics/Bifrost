@@ -83,6 +83,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
         return fail(diag, .{ .section = "health", .name = "timeout_ms" }, "must be shorter than interval_ms", .{});
     if (config.auth == .verify and config.keysFile() == null)
         return fail(diag, .{ .section = "auth", .name = "keys_file" }, "is required when mode = \"verify\"", .{});
+    if (config.total_pending_bytes < config.pending_bytes)
+        return fail(diag, .{ .section = "limits", .name = "total_pending_bytes" }, "can't be less than pending_bytes", .{});
     if (config.transfer_timeout_ms < config.transfer_phase_timeout_ms)
         return fail(diag, .{ .section = "transfer", .name = "timeout_ms" }, "can't be shorter than phase_timeout_ms", .{});
     if (config.session_mode == .managed) {
@@ -176,6 +178,20 @@ fn readLimits(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
             config.pending_packets = try integer(u32, diag, key, value, 1, 4096);
         } else if (eql(key.name.?, "pending_bytes")) {
             config.pending_bytes = try integer(u32, diag, key, value, 1, 64 * 1024 * 1024);
+        } else if (eql(key.name.?, "total_pending_bytes")) {
+            config.total_pending_bytes = try integer(u64, diag, key, value, 64 * 1024, 16 * 1024 * 1024 * 1024);
+        } else if (eql(key.name.?, "login_timeout_ms")) {
+            config.login_timeout_ms = try integer(u32, diag, key, value, 1_000, 600_000);
+        } else if (eql(key.name.?, "resource_pack_timeout_ms")) {
+            config.resource_pack_timeout_ms = try integer(u32, diag, key, value, 1_000, 3_600_000);
+        } else if (eql(key.name.?, "join_timeout_ms")) {
+            config.join_timeout_ms = try integer(u32, diag, key, value, 1_000, 600_000);
+        } else if (eql(key.name.?, "slow_player_timeout_ms")) {
+            config.slow_player_timeout_ms = try integer(u32, diag, key, value, 100, 60_000);
+        } else if (eql(key.name.?, "logins_per_second")) {
+            config.logins_per_second = try integer(u32, diag, key, value, 1, 100_000);
+        } else if (eql(key.name.?, "player_bytes_per_second")) {
+            config.player_bytes_per_second = try integer(u32, diag, key, value, 64 * 1024, 1024 * 1024 * 1024);
         } else if (eql(key.name.?, "slow_plugin_callback_ms")) {
             config.slow_plugin_callback_ms = try integer(u32, diag, key, value, 1, 60_000);
         } else if (eql(key.name.?, "plugin_task_threads")) {
@@ -224,6 +240,8 @@ fn readTransfer(config: *Config, section: *const toml.Table, diag: *Diagnostic) 
             config.transfer_phase_timeout_ms = try integer(u32, diag, key, value, 100, 60_000);
         } else if (eql(key.name.?, "timeout_ms")) {
             config.transfer_timeout_ms = try integer(u32, diag, key, value, 100, 300_000);
+        } else if (eql(key.name.?, "max_concurrent")) {
+            config.max_transfers = try integer(u32, diag, key, value, 1, 100_000);
         } else if (eql(key.name.?, "content")) {
             const text = try string(diag, key, value);
             config.content_policy = std.meta.stringToEnum(@TypeOf(config.content_policy), text) orelse
@@ -337,6 +355,13 @@ test "full config reads every key" {
         \\slow_plugin_callback_ms = 20
         \\plugin_task_threads = 2
         \\handshake_rate_per_ip = 50
+        \\total_pending_bytes = 8388608
+        \\login_timeout_ms = 10000
+        \\resource_pack_timeout_ms = 900000
+        \\join_timeout_ms = 60000
+        \\slow_player_timeout_ms = 3000
+        \\logins_per_second = 25
+        \\player_bytes_per_second = 1048576
         \\
         \\[[backend]]
         \\name = "lobby"
@@ -355,6 +380,13 @@ test "full config reads every key" {
     try std.testing.expectEqual(@as(u32, 20), config.slow_plugin_callback_ms);
     try std.testing.expectEqual(@as(u8, 2), config.plugin_task_threads);
     try std.testing.expectEqual(@as(u32, 50), config.handshake_rate_per_ip);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), config.total_pending_bytes);
+    try std.testing.expectEqual(@as(u32, 10_000), config.login_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 900_000), config.resource_pack_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 60_000), config.join_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 3_000), config.slow_player_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 25), config.logins_per_second);
+    try std.testing.expectEqual(@as(u32, 1024 * 1024), config.player_bytes_per_second);
     try std.testing.expectEqual(@as(u16, 2000), config.backends()[0].address.getPort());
     try std.testing.expectEqualStrings("lobby", config.backends()[0].name());
     try std.testing.expectEqual(@as(u16, 3000), config.backends()[1].address.getPort());
@@ -384,6 +416,9 @@ test "invalid values name the offending key" {
     try expectInvalid("[server]\nmotd = \"\"\n" ++ backend, "server.motd: must be 1 to 256 bytes");
     try expectInvalid("[limits]\nconnect_timeout_ms = \"5s\"\n" ++ backend, "limits.connect_timeout_ms: expected an integer");
     try expectInvalid("[limits]\nconnect_timeout_ms = 100\n" ++ backend, "limits.connect_timeout_ms: must be between 500 and 60000");
+    try expectInvalid("[limits]\npending_bytes = 1048576\ntotal_pending_bytes = 65536\n" ++ backend, "limits.total_pending_bytes: can't be less than pending_bytes");
+    try expectInvalid("[limits]\nlogin_timeout_ms = 10\n" ++ backend, "limits.login_timeout_ms: must be between 1000 and 600000");
+    try expectInvalid("[limits]\nlogins_per_second = 0\n" ++ backend, "limits.logins_per_second: must be between 1 and 100000");
     try expectInvalid("server = 1\n" ++ backend, "server: expected a table");
     try expectInvalid("[[backend]]\n", "backend[0].address: is required");
     try expectInvalid("[[backend]]\naddress = \"127.0.0.1:0\"\n", "backend[0].address: needs a non-zero port, got \"127.0.0.1:0\"");
@@ -425,9 +460,11 @@ test "session section selects managed mode" {
 test "transfer section sets the timeouts" {
     var diag: Diagnostic = .{};
     const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
-    const config = try parse(std.testing.allocator, "[transfer]\nphase_timeout_ms = 2000\ntimeout_ms = 9000\n" ++ backend, &diag);
+    const config = try parse(std.testing.allocator, "[transfer]\nphase_timeout_ms = 2000\ntimeout_ms = 9000\nmax_concurrent = 8\n" ++ backend, &diag);
     try std.testing.expectEqual(@as(u32, 2000), config.transfer_phase_timeout_ms);
     try std.testing.expectEqual(@as(u32, 9000), config.transfer_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 8), config.max_transfers);
+    try expectInvalid("[transfer]\nmax_concurrent = 0\n" ++ backend, "transfer.max_concurrent: must be between 1 and 100000");
     try expectInvalid("[transfer]\nphase_timeout_ms = 50\n" ++ backend, "transfer.phase_timeout_ms: must be between 100 and 60000");
     try expectInvalid("[transfer]\nphase_timeout_ms = 6000\ntimeout_ms = 5000\n" ++ backend, "transfer.timeout_ms: can't be shorter than phase_timeout_ms");
     try expectInvalid("[transfer]\nretries = 1\n" ++ backend, "transfer.retries: unknown key");

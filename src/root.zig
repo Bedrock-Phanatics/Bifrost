@@ -9,6 +9,7 @@ pub const parseConfig = loader.parse;
 pub const Proxy = @import("proxy/Proxy.zig");
 pub const Workers = @import("proxy/Workers.zig");
 pub const Admission = @import("proxy/Admission.zig");
+pub const Budget = @import("proxy/Budget.zig");
 pub const Stats = @import("proxy/Stats.zig");
 pub const Backend = @import("backend/Backend.zig");
 pub const Health = @import("backend/Health.zig");
@@ -33,6 +34,9 @@ test {
     _ = @import("backend/Router.zig");
     _ = @import("protocol/advertisement.zig");
     _ = @import("proxy/PacketQueue.zig");
+    _ = Budget;
+    _ = @import("proxy/Rate.zig");
+    _ = @import("transfer/Queue.zig");
     _ = @import("session/proxy_key.zig");
     _ = @import("transfer/State.zig");
     _ = @import("content/nbt.zig");

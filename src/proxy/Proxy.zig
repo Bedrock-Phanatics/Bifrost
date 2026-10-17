@@ -12,6 +12,8 @@ const Managed = @import("../session/Managed.zig");
 const proxy_key = @import("../session/proxy_key.zig");
 const advertisement = @import("../protocol/advertisement.zig");
 const Admission = @import("Admission.zig");
+const Budget = @import("Budget.zig");
+const Rate = @import("Rate.zig");
 const Backend = @import("../backend/Backend.zig");
 const Transfer = @import("../transfer/Transfer.zig");
 pub const Link = @import("Link.zig");
@@ -26,6 +28,8 @@ const log = std.log.scoped(.proxy);
 
 const max_listener_failures = 32;
 const mailbox_capacity = 64;
+const sweep_interval_ms = 1_000;
+const rejection_log_interval_ms = 10_000;
 
 pub const TransferRequest = struct { player: u64, target: Backend.Id };
 
@@ -37,6 +41,13 @@ listener: *raknet.Server,
 scheduler: Scheduler,
 admission: *Admission,
 own_admission: Admission,
+budget: *Budget,
+own_budget: Budget,
+logins: Rate,
+transfers: u32 = 0,
+next_sweep_ms: u64 = 0,
+rejections_logged_ms: u64 = 0,
+rejections_unlogged: u64 = 0,
 observer_pool: ?bedwire.BufferPool,
 managed: ?Managed.Shared,
 env: Link.Env,
@@ -56,6 +67,7 @@ mailbox_len: usize = 0,
 pub const Options = struct {
     auth: Observer.Auth = .off,
     admission: ?*Admission = null,
+    budget: ?*Budget = null,
     health: ?*Health = null,
     proxy_key: ?proxy_key.Ecdsa.KeyPair = null,
     plugins: ?*Plugins = null,
@@ -69,6 +81,8 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
 
     var raknet_config: raknet.Config = .{};
     raknet_config.listener.maximum_connections = config.max_players;
+    // Room above Link.backlog_packets, since one backend poll can add a few hundred more before the next check
+    raknet_config.session.maximum_queued_outbound_packets = 1024;
     var ad_buffer: [advertisement_capacity]u8 = undefined;
     const listener = try raknet.Server.listen(gpa, io, config.bind, .{
         .advertisement = renderAdvertisement(&config, &ad_buffer, 0),
@@ -106,11 +120,20 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .scheduler = .{ .io = io },
         .admission = undefined,
         .own_admission = own_admission,
+        .budget = undefined,
+        .own_budget = .init(std.math.cast(usize, config.total_pending_bytes) orelse std.math.maxInt(usize)),
+        .logins = .init(config.logins_per_second, 2 * @as(u64, config.logins_per_second)),
         .observer_pool = observer_pool,
         .managed = managed,
         .env = undefined,
     };
     self.admission = options.admission orelse &self.own_admission;
+    self.budget = options.budget orelse &self.own_budget;
+    if (self.managed) |*shared| {
+        shared.budget = self.budget;
+        shared.logins = &self.logins;
+        shared.player_bytes_per_second = config.player_bytes_per_second;
+    }
     if (options.plugins) |plugins| {
         plugins.attachWorker(options.worker, self.scheduler.wakeNotify());
         if (self.managed) |*shared| shared.hooks = .{ .plugins = plugins, .worker = options.worker };
@@ -128,6 +151,15 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .connect_timeout_ms = config.connect_timeout_ms,
         .pending_packets = config.pending_packets,
         .pending_bytes = config.pending_bytes,
+        .budget = self.budget,
+        .logins = &self.logins,
+        .player_bytes_per_second = config.player_bytes_per_second,
+        .deadlines = .{
+            .login_ms = config.login_timeout_ms,
+            .resource_packs_ms = config.resource_pack_timeout_ms,
+            .join_ms = config.join_timeout_ms,
+            .slow_player_ms = config.slow_player_timeout_ms,
+        },
         .managed = if (self.managed) |*shared| shared else null,
         .transfer = .{
             .limits = .{
@@ -138,7 +170,10 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
             .queue_packets = config.pending_packets,
             .queue_bytes = config.pending_bytes,
             .content_policy = config.content_policy,
+            .budget = self.budget,
         },
+        .transfers = &self.transfers,
+        .max_transfers = config.max_transfers,
         .next_epoch = &self.next_epoch,
         .events = .{ .plugins = options.plugins, .worker = options.worker },
     };
@@ -220,7 +255,7 @@ pub fn action(self: *Proxy, link_id: u64, disconnect: bool, backend: u32, reason
     if (backend >= self.router.backends.len) return .invalid_argument;
     link.requestTransfer(.of(backend)) catch |err| return switch (err) {
         error.NotManaged => .unsupported,
-        error.TransferInProgress => .busy,
+        error.TransferInProgress, error.TooManyTransfers => .busy,
         error.NotInGame, error.AlreadyThere => .too_late,
         error.CanceledByPlugin => .canceled,
         else => .failed,
@@ -272,7 +307,10 @@ fn turn(self: *Proxy) void {
         log.err("listener watch failed: {t}", .{err});
         return self.stop();
     };
-    self.scheduler.wake.wait(self.io) catch return self.stop();
+    self.scheduler.wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(sweep_interval_ms), .clock = .awake } }) catch |err| switch (err) {
+        error.Timeout => {},
+        error.Canceled => return self.stop(),
+    };
     // Reset before checking, or we could miss a wake
     self.scheduler.wake.reset();
 
@@ -281,8 +319,18 @@ fn turn(self: *Proxy) void {
     self.env.events.drain(self.io, self);
     const listener_ready = self.listener_watch.take(self.io);
     if (listener_ready or self.listener_busy) self.pollListener();
+    self.scheduler.resumeDrained();
+    const now_ms = nowMs(self.io);
+    if (now_ms >= self.next_sweep_ms) {
+        self.next_sweep_ms = now_ms + sweep_interval_ms;
+        for (self.links.values()) |link| link.checkDeadlines(now_ms);
+    }
     self.serviceReady() catch return self.stop();
     if (self.listener_busy or self.scheduler.hasReady()) self.scheduler.wake.set(self.io);
+}
+
+fn nowMs(io: std.Io) u64 {
+    return @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
 }
 
 const advertisement_capacity = Config.max_motd_len + 32;
@@ -337,8 +385,13 @@ fn serviceReady(self: *Proxy) error{Canceled}!void {
 fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationFailure}!void {
     const self: *Proxy = @ptrCast(@alignCast(context));
     self.accept(session) catch |err| {
-        log.warn("rejecting player: {t}", .{err});
         self.stats.bump(.sessions_rejected, 1);
+        const now_ms = nowMs(self.io);
+        if (now_ms -| self.rejections_logged_ms >= rejection_log_interval_ms or self.rejections_logged_ms == 0) {
+            log.warn("rejecting player: {t} ({d} more since the last warning)", .{ err, self.rejections_unlogged });
+            self.rejections_logged_ms = now_ms;
+            self.rejections_unlogged = 0;
+        } else self.rejections_unlogged += 1;
         // Returning an error here drops the player without telling them
         session.close();
     };

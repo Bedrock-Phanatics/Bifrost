@@ -11,6 +11,17 @@ max_players_per_ip = 0
 connect_timeout_ms = 5000
 pending_packets = 64
 pending_bytes = 1048576
+# Shared by every player and worker, see docs/limits.md
+total_pending_bytes = 268435456
+login_timeout_ms = 30000
+resource_pack_timeout_ms = 600000
+join_timeout_ms = 120000
+# How long a player may leave the proxy unable to send to them before it gives up
+slow_player_timeout_ms = 5000
+# Per worker; extra logins are told the server is busy before any signature is checked
+logins_per_second = 100
+# Decompressed bytes a player may send, with a burst of 4x (at least 4 MiB)
+player_bytes_per_second = 8388608
 # Plugin callbacks slower than this get a warning, at most every 10 s per plugin
 slow_plugin_callback_ms = 5
 plugin_task_threads = 4
@@ -35,6 +46,8 @@ mode = "passthrough"
 [transfer]
 phase_timeout_ms = 5000
 timeout_ms = 15000
+# Per worker
+max_concurrent = 64
 # "initial" keeps the first backend's packs for the whole session; "match" also needs every target to offer the same
 content = "initial"
 

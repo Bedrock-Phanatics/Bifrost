@@ -9,6 +9,7 @@ const no_wait = @import("../net/watch.zig").no_wait;
 const Managed = @import("../session/Managed.zig");
 const Upstream = Managed.Upstream;
 const self_id = @import("../session/self_id.zig");
+const Budget = @import("../proxy/Budget.zig");
 const Stats = @import("../proxy/Stats.zig");
 const Events = @import("../plugin/Events.zig");
 const abi = @import("../plugin/abi.zig");
@@ -49,6 +50,7 @@ pub const Settings = struct {
     queue_packets: u32,
     queue_bytes: u32,
     content_policy: content.Policy = .initial,
+    budget: ?*Budget = null,
 };
 
 const Seen = packed struct {
@@ -91,7 +93,7 @@ pub fn create(host: Host, target: Backend.Id, address: std.Io.net.IpAddress, epo
         .state = .init(epoch, settings.limits, now(host.io)),
         .target = target,
         .upstream = try .init(host.managed.shared),
-        .queue = .{ .max_packets = @min(settings.queue_packets, max_queued_packets), .max_bytes = settings.queue_bytes },
+        .queue = .{ .max_packets = @min(settings.queue_packets, max_queued_packets), .max_bytes = settings.queue_bytes, .budget = settings.budget },
         .content_policy = settings.content_policy,
         .managed = host.managed,
     };

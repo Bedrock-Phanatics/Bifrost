@@ -35,6 +35,13 @@ managed_decoded_batches: u64 = 0,
 managed_decoded_bytes: u64 = 0,
 managed_relay_incompatible: u64 = 0,
 session_memory_bytes: u64 = 0,
+login_timeouts: u64 = 0,
+resource_pack_timeouts: u64 = 0,
+join_timeouts: u64 = 0,
+logins_throttled: u64 = 0,
+player_floods: u64 = 0,
+backlog_pauses: u64 = 0,
+slow_players: u64 = 0,
 
 // Only the worker writes these, so a plain atomic store is enough
 pub fn bump(self: *Stats, comptime field: std.meta.FieldEnum(Stats), amount: u64) void {
