@@ -1,126 +1,71 @@
+
 # Bifrost
 
-A Minecraft: Bedrock Edition reverse proxy written in Zig 0.17.0.
+A high-performance Minecraft: Bedrock Edition proxy written in Zig, designed for efficiency, extensibility, and low-latency networking.
 
-```sh
+Built with **Zig 0.17.0**.
+
+## Features
+
+- **High Performance** — Efficient networking with low memory overhead.
+- **Multi-Backend Support** — Connect players to multiple backend servers.
+- **Seamless Transfers** — Move players between backends without reconnecting.
+- **Session Modes** — Passthrough and managed session handling.
+- **Native Plugins** — Extend functionality using Zig, C, or C++.
+- **Packet Handling** — Intercept, modify, and filter packets through plugins.
+- **Configurable** — Simple TOML configuration.
+
+## Getting Started
+
+### Requirements
+
+- Zig 0.17.0
+- Linux or Windows
+
+### Build
+
+```bash
+git clone https://github.com/Bedrock-Phanatics/Bifrost.git
+cd Bifrost
 zig build -Doptimize=ReleaseSafe
+```
+
+### Run
+
+```bash
 ./zig-out/bin/bifrost
 ```
 
-Settings live in [`config/bifrost.toml`](config/bifrost.toml). More than one `workers` needs Linux (`SO_REUSEPORT`).
+Configure the proxy through [`config/bifrost.toml`](config/bifrost.toml).
 
-## Compatibility
+## Session Modes
 
-No backend has been checked with a real Bedrock client yet, so none are listed as supported. Backends go here once
-they pass that testing; until then the only evidence is the automated tests, which run against Bifrost's own fake
-RakNet players and backends.
+| Mode | Description |
+|------|-------------|
+| `passthrough` | Relays encrypted sessions with minimal overhead. |
+| `managed` | Enables packet processing, backend transfers, and advanced plugin functionality. |
 
-## Session modes
+## Plugin Development
 
-`passthrough` (the default) relays each player's own encrypted session byte for byte. It works with any game version,
-but Bifrost can't see inside the session: there are no transfers, packet hooks, plugin commands or chat messages, and
-plugins only hear about connects, backend choices and disconnects.
+Bifrost supports compiled native plugins through a stable C ABI.
 
-`managed` ends the player's session at Bifrost and opens a separate one to the backend. It only speaks Minecraft
-1.26.51 (protocol 2193), and players on any other version are turned away:
+Plugins are distributed as shared libraries (`.so`, `.dll`, or `.dylib`) with embedded `plugin.toml` metadata.
 
-- Players must pass Microsoft authentication (`[auth] mode = "verify"`) before Bifrost speaks for them.
-- Bifrost logs in to backends with a certificate chain signed by its proxy key (`proxy_key_file`, created on first
-  start and logged). The identity carries the player's name and UUID, `online = false` and no XUID: it never claims
-  to be Microsoft-authenticated, and the player's Microsoft token never reaches a backend.
-- A backend must trust exactly that key as its issuer and keep offline logins disabled. A backend that does not
-  will refuse managed players.
-
-Managed players can be moved between backends with `Proxy.requestTransfer` or from a plugin. Bifrost logs in to the
-target while the player stays on the old backend, and only switches once the target has started the game. Anything
-that fails before the switch leaves the player where they were. The switch clears what the old backend left on the
-client and moves it across with a dimension change, so the new world arrives without stale chunks.
-
-`[transfer] content = "initial"` keeps the packs the player accepted from their first backend for the whole session;
-Bifrost answers each target's pack negotiation itself. `"match"` also refuses targets whose packs differ.
-
-## Plugins
-
-Native plugins are single compiled shared libraries directly under `plugins/`, with `plugin.toml` embedded
-at build time ([`docs/plugins.md`](docs/plugins.md)). They load at startup in filename order and
-unload in reverse once every worker has stopped. A plugin exports `bifrost_plugin_get_manifest` and `bifrost_plugin_init` and talks to Bifrost only
-through the C ABI in [`include/bifrost_plugin.h`](include/bifrost_plugin.h); Zig plugins can use the `bifrost_plugin`
-module instead. `zig build` installs three single-file examples into `zig-out/plugins/`:
-[`examples/maintenance.zig`](examples/maintenance.zig) keeps players off any backend named `maintenance`,
-[`examples/greeter/Greeter.cpp`](examples/greeter/Greeter.cpp) logs a welcome, and
-[`examples/packets/PacketFilter.cpp`](examples/packets/PacketFilter.cpp) limits chat size, corrects chat authors
-and caps requested chunk radius in C++23.
-
-Plugins get lifecycle and transfer events, can cancel or redirect a transfer before it starts, and can request
-transfers themselves. In managed mode they can also hook individual packets (pass, cancel or replace), register
-commands, lazily read or modify text and chunk-radius fields through the native ABI, send players chat messages
-and run slow work on task threads. Callbacks run on worker threads and must not
-block; callbacks slower than `[limits] slow_plugin_callback_ms` are logged. Player handles stop working once the
-player leaves. [`docs/plugin-abi.md`](docs/plugin-abi.md) has the full contract: threads, memory, every host
-function and its statuses, and how the frozen v1 ABI may grow. Plugins run in-process, so one that crashes takes
-the proxy down. Library constructors can run before manifest validation.
+- [Plugin Development](docs/plugins.md)
+- [Plugin ABI Reference](docs/plugin-abi.md)
+- [Example Plugins](examples/)
 
 ## Development
 
-```sh
-zig build test                        # unit and integration tests
-zig build test -Doptimize=ReleaseSafe
-zig build test -Dtest-filter=plugins  # focus on named tests
-zig build bench-test                 # benchmark counters and cleanup
-zig build fuzz-test --fuzz=1M         # bounded native packet fuzzing on Linux
+```bash
+zig build test
+zig build bench -Doptimize=ReleaseFast
 ```
 
-| path | contents |
-|---|---|
-| `src/` | the proxy, one folder per subsystem |
-| `include/`, `examples/` | the plugin C header and example plugins |
-| `tests/integration/` | end-to-end tests against real RakNet peers |
-| `tests/support/` | fake players, backends and fixtures shared by tests and benchmarks |
-| `tests/bench/` | the benchmark suite and its baseline |
+## License
 
-## Benchmarks
+Licensed under the [GNU AGPLv3](LICENSE).
 
-```sh
-zig build bench -Doptimize=ReleaseFast                          # full suite, about 5 minutes
-zig build bench -Doptimize=ReleaseFast -- relay workers --quick # pick scenarios, shorter runs
-zig build bench -Doptimize=ReleaseFast -Dscheduling=pinned      # proxy without ZIO work stealing
-zig build bench -Doptimize=ReleaseFast -- managed               # passthrough vs managed sessions
-zig build bench -Doptimize=ReleaseFast -- packet-dispatch decode --quick # native packet dispatch and codec
-zig build bench -Doptimize=ReleaseFast -- callback-latency --quick # isolated native callback percentiles
-zig build bench -Doptimize=ReleaseFast -- injection-transport --quick # managed packet injection
-zig build bench -Doptimize=ReleaseFast -- injection-workers --quick --driver-threads 8 # Linux injection across workers
-```
+---
 
-[`tests/bench/baseline.md`](tests/bench/baseline.md) records the numbers later changes are compared against.
-
-The suite starts the real proxy (`Workers` on the same runtime as `bifrost`) as a child process, and drives it with
-RakNet clients and echo backends from the parent. Scenarios: `relay`, `fairness`, `managed`, `deflate`, `plugins`,
-`ids`, `tasks`, `handles`, `handshake`, `connections`, `workers`, `backends`. The optional `injection-transport`
-scenario measures verified delivery through the native packet queue and encrypted managed transport in both directions.
-`injection-workers` compares one, two and four workers with 32 players on Linux, one request in flight per player,
-and at least two seconds per measured interval. It verifies worker distribution and progress by every player.
-`callback-latency` reports p50/p95/p99/max callback times with an empty-callback timing baseline, separating
-the first shared reader from later readers. Its repeated-packet measurements include clock overhead and exclude transport.
-RSS and CPU counters support Linux and Windows. Kernel drop counts and reuse-port worker distribution need Linux.
-
-Results from one run (2026-10-10, 1.0.0-rc.1): WSL2 Ubuntu on 12 logical CPUs, ReleaseFast, 1 worker, loopback, with
-the clients and backends on the same machine as the proxy. Treat them as relative numbers, not capacity planning. The
-baseline file has the full tables, including plugin dispatch costs and the scheduling and fairness audit.
-
-| workload | result |
-|---|---|
-| raw relay, 512 B, 1 message in flight | 10.3k round trips/s, p50 80 us, p99 175 us |
-| raw relay, 512 B, 8 players x 32 in flight | 44.6k round trips/s (21.8 MiB/s each way), proxy at one full core |
-| raw relay, 20 KiB fragmented, 8 players x 12 in flight | 3.2k round trips/s, 62.5 MiB/s each way |
-| managed relay, 512 B, 1 message in flight | 3.5k round trips/s, p50 257 us, p99 425 us |
-| managed relay, 512 B, 8 players x 32 in flight | 26.1k round trips/s; 14.7k at 256 B when every batch is decoded |
-| joins | 1.4 ms per player passthrough, 13.0 ms managed |
-| transfer, one player | p50 33.1 ms, p99 33.8 ms; live heap flat over 200 transfers |
-| transfers, 8 players at once | whole batch in p50 77.2 ms, p99 87.5 ms; live heap flat over 50 rounds |
-| memory per connected player | 228.3 KiB RSS passthrough; 252.5 KiB heap managed |
-| reconnect churn, 32 clients | 600 to 1,600 cycles/s; live heap identical after every round |
-| idle proxy | 4.0 MiB RSS, 0.1% CPU with connected but silent players |
-
-On Linux, `net.core.rmem_max` (often 208 KiB) silently caps the 4 MiB receive buffer RakNet asks for. Bursts of joins
-or leaves then overflow it: the bench reports these drops, and they show up as about 500 ms RakNet retries on joins
-and leaves only cleaned up by the 10 s idle timeout. Raise `net.core.rmem_max` on real deployments.
+Maintained by [Bedrock Phanatics](https://github.com/Bedrock-Phanatics).
