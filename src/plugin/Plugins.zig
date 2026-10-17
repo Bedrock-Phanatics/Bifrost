@@ -28,7 +28,9 @@ pub const Options = struct {
     max_tasks: u32 = 128,
     max_tasks_per_plugin: u32 = 32,
     max_messages: u32 = 1024,
+    max_messages_per_plugin: u32 = 256,
     max_injection_bytes: u32 = 4 * 1024 * 1024,
+    max_injection_bytes_per_plugin: u32 = 1024 * 1024,
 };
 
 pub const Tracking = struct {
@@ -109,6 +111,7 @@ const Loaded = struct {
     metadata: Metadata = .{},
     metrics: []Packets.Metrics = &.{},
     outstanding: std.atomic.Value(u32) = .init(0),
+    quota: Work.Quota = .{},
     ready: std.atomic.Value(bool) = .init(false),
 
     fn label(self: *const Loaded) []const u8 {
@@ -378,16 +381,16 @@ fn settle(self: *Plugins, item: Work.Item, owner: ?Owner, sink: anytype) void {
     switch (item) {
         .action => |action| {
             defer {
+                self.releaseMessage(action.quota);
                 self.gpa.destroy(action);
-                Work.release(&self.messages);
             }
             const status = self.deliverAction(action, owner, sink);
             if (action.then) |*then| self.complete(then, status, owner);
         },
         .message => |message| {
             defer {
+                self.releaseMessage(message.quota);
                 self.gpa.destroy(message);
-                Work.release(&self.messages);
             }
             if (@TypeOf(sink) == @TypeOf(null)) return;
             const route = self.handles.route(message.player) orelse return;
@@ -396,22 +399,50 @@ fn settle(self: *Plugins, item: Work.Item, owner: ?Owner, sink: anytype) void {
         .task => |task| self.finish(task, self.liveStatus(task.then.player, owner), owner),
         .packet => |packet| {
             defer {
-                const length: u32 = @intCast(packet.len);
+                self.releaseInjection(packet.quota, @intCast(packet.len));
                 packet.destroy(self.gpa);
-                _ = self.injection_bytes.fetchSub(length, .acq_rel);
-                Work.release(&self.messages);
             }
             const status = self.deliverPacket(packet, owner, sink);
             if (packet.then) |*then| self.complete(then, status, owner);
         },
         .post => |post| {
             defer {
+                self.releaseMessage(post.quota);
                 self.gpa.destroy(post);
-                Work.release(&self.messages);
             }
-            self.complete(post, self.liveStatus(post.player, owner), owner);
+            self.complete(&post.then, self.liveStatus(post.then.player, owner), owner);
         },
     }
+}
+
+fn reserveMessage(loaded: *Loaded) bool {
+    const owner = loaded.owner;
+    if (!Work.reserve(&loaded.quota.messages, owner.options.max_messages_per_plugin)) return false;
+    if (Work.reserve(&owner.messages, owner.options.max_messages)) return true;
+    Work.release(&loaded.quota.messages);
+    return false;
+}
+
+fn releaseMessage(self: *Plugins, quota: *Work.Quota) void {
+    Work.release(&quota.messages);
+    Work.release(&self.messages);
+}
+
+fn reserveInjection(loaded: *Loaded, length: u32) bool {
+    const owner = loaded.owner;
+    if (!reserveMessage(loaded)) return false;
+    if (Work.reserveBytes(&loaded.quota.injection_bytes, owner.options.max_injection_bytes_per_plugin, length)) {
+        if (Work.reserveBytes(&owner.injection_bytes, owner.options.max_injection_bytes, length)) return true;
+        _ = loaded.quota.injection_bytes.fetchSub(length, .acq_rel);
+    }
+    owner.releaseMessage(&loaded.quota);
+    return false;
+}
+
+fn releaseInjection(self: *Plugins, quota: *Work.Quota, length: u32) void {
+    _ = quota.injection_bytes.fetchSub(length, .acq_rel);
+    _ = self.injection_bytes.fetchSub(length, .acq_rel);
+    self.releaseMessage(quota);
 }
 
 fn deliverAction(self: *Plugins, action: *Work.Action, owner: ?Owner, sink: anytype) abi.Status {
@@ -733,16 +764,16 @@ fn hostSendMessage(context: *anyopaque, player: abi.Player, text: abi.Str) callc
     if (bytes.len == 0 or !std.unicode.utf8ValidateSlice(bytes)) return .invalid_argument;
     const route = owner.handles.route(player) orelse return .stale_handle;
     if (route.worker >= owner.queues.len) return .invalid_argument;
-    if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
+    if (!reserveMessage(loaded)) return .busy;
     const message = owner.gpa.create(Work.Message) catch {
-        Work.release(&owner.messages);
+        owner.releaseMessage(&loaded.quota);
         return .failed;
     };
-    message.* = .{ .player = player, .len = bytes.len, .text = undefined };
+    message.* = .{ .quota = &loaded.quota, .player = player, .len = bytes.len, .text = undefined };
     @memcpy(message.text[0..bytes.len], bytes);
     if (owner.queues[route.worker].post(.{ .message = message })) return .ok;
     owner.gpa.destroy(message);
-    Work.release(&owner.messages);
+    owner.releaseMessage(&loaded.quota);
     return .unsupported;
 }
 
@@ -753,15 +784,15 @@ fn hostPost(context: *anyopaque, player: abi.Player, callback: ?abi.TaskDoneFn, 
     if (!loaded.ready.load(.acquire) or owner.stopping.load(.acquire)) return .unsupported;
     const route = owner.handles.route(player) orelse return .stale_handle;
     if (route.worker >= owner.queues.len) return .invalid_argument;
-    if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
-    const post = owner.gpa.create(Work.Done) catch {
-        Work.release(&owner.messages);
+    if (!reserveMessage(loaded)) return .busy;
+    const post = owner.gpa.create(Work.Post) catch {
+        owner.releaseMessage(&loaded.quota);
         return .failed;
     };
-    post.* = .{ .done = done, .user = user, .player = player, .name = loaded.label(), .metrics = loaded.metrics };
+    post.* = .{ .quota = &loaded.quota, .then = .{ .done = done, .user = user, .player = player, .name = loaded.label(), .metrics = loaded.metrics } };
     if (owner.queues[route.worker].post(.{ .post = post })) return .ok;
     owner.gpa.destroy(post);
-    Work.release(&owner.messages);
+    owner.releaseMessage(&loaded.quota);
     return .unsupported;
 }
 
@@ -776,22 +807,16 @@ fn hostSendPacket(context: *anyopaque, player: abi.Player, target: abi.PacketTar
     if (status != .ok) return status;
     const route = owner.handles.route(player) orelse return .stale_handle;
     if (route.worker >= owner.queues.len) return .invalid_argument;
-    if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
     const length: u32 = @intCast(bytes.len);
-    if (!Work.reserveBytes(&owner.injection_bytes, owner.options.max_injection_bytes, length)) {
-        Work.release(&owner.messages);
-        return .busy;
-    }
+    if (!reserveInjection(loaded, length)) return .busy;
     const then: ?Work.Done = if (callback) |done| .{ .done = done, .user = user, .player = player, .name = loaded.label(), .metrics = loaded.metrics } else null;
-    const packet = Work.Injection.create(owner.gpa, player, target, route.epoch, bytes.slice(), then) catch {
-        _ = owner.injection_bytes.fetchSub(length, .acq_rel);
-        Work.release(&owner.messages);
+    const packet = Work.Injection.create(owner.gpa, &loaded.quota, player, target, route.epoch, bytes.slice(), then) catch {
+        owner.releaseInjection(&loaded.quota, length);
         return .failed;
     };
     if (owner.queues[route.worker].post(.{ .packet = packet })) return .ok;
     packet.destroy(owner.gpa);
-    _ = owner.injection_bytes.fetchSub(length, .acq_rel);
-    Work.release(&owner.messages);
+    owner.releaseInjection(&loaded.quota, length);
     return .canceled;
 }
 
@@ -889,12 +914,13 @@ fn queueAction(loaded: *Loaded, player: abi.Player, kind: @FieldType(Work.Action
     if (owner.stopping.load(.acquire)) return .canceled;
     const route = owner.handles.route(player) orelse return .stale_handle;
     if (route.worker >= owner.queues.len) return .invalid_argument;
-    if (!Work.reserve(&owner.messages, owner.options.max_messages)) return .busy;
+    if (!reserveMessage(loaded)) return .busy;
     const action = owner.gpa.create(Work.Action) catch {
-        Work.release(&owner.messages);
+        owner.releaseMessage(&loaded.quota);
         return .failed;
     };
     action.* = .{
+        .quota = &loaded.quota,
         .player = player,
         .kind = kind,
         .backend = backend,
@@ -904,7 +930,7 @@ fn queueAction(loaded: *Loaded, player: abi.Player, kind: @FieldType(Work.Action
     @memcpy(action.reason[0..reason.len], reason);
     if (owner.queues[route.worker].post(.{ .action = action })) return .ok;
     owner.gpa.destroy(action);
-    Work.release(&owner.messages);
+    owner.releaseMessage(&loaded.quota);
     return .canceled;
 }
 
@@ -1585,6 +1611,57 @@ test "packet injection copies, preserves FIFO, bounds bytes and reports delivery
     try testing.expectEqual(abi.PacketTarget.player, sink.targets[2]);
     try testing.expectEqual(abi.Status.too_late, sink.statuses[1]);
     try testing.expectEqual(abi.Status.too_late, sink.statuses[2]);
+}
+
+test "one plugin can't take another's share of the message and injection queues" {
+    const Pair = struct {
+        var hosts: [2]abi.Host = undefined;
+
+        fn entry(comptime index: usize) abi.InitFn {
+            return struct {
+                fn run(host: *const abi.Host, plugin: *abi.Plugin) callconv(.c) abi.Status {
+                    plugin.name = .of(if (index == 0) "noisy" else "quiet");
+                    plugin.plugin_version = .of("1");
+                    plugin.capabilities = .{ .packets = true };
+                    hosts[index] = host.*;
+                    return .ok;
+                }
+            }.run;
+        }
+    };
+    var plugins: Plugins = try .init(testing.allocator, &.{}, .{ .max_messages = 8, .max_messages_per_plugin = 3, .max_injection_bytes = 64, .max_injection_bytes_per_plugin = 24 });
+    defer plugins.deinit();
+    try plugins.add(Pair.entry(0), null);
+    try plugins.add(Pair.entry(1), null);
+    const noisy = Pair.hosts[0];
+    const quiet = Pair.hosts[1];
+    var sink: InjectProbe = .{};
+    var delivery: Delivery = .{ .worker = 0 };
+    const player = try plugins.handles.acquire(testing.allocator, .{ .context = &sink, .link = 1, .transfer = routedTransfer });
+    const text = [_]u8{ 9, 0, 0, 0, 2, 'h', 'i', 0, 0, 0 };
+
+    for (0..2) |_| try testing.expectEqual(abi.Status.ok, noisy.send_packet(noisy.context, player, .player, .of(&text), null, null));
+    try testing.expectEqual(abi.Status.busy, noisy.send_packet(noisy.context, player, .player, .of(&text), null, null));
+    try testing.expectEqual(abi.Status.ok, noisy.post(noisy.context, player, Delivery.done, &delivery));
+    try testing.expectEqual(abi.Status.busy, noisy.post(noisy.context, player, Delivery.done, &delivery));
+    try testing.expectEqual(abi.Status.busy, noisy.send_message(noisy.context, player, .of("hi")));
+
+    for (0..2) |_| try testing.expectEqual(abi.Status.ok, quiet.send_packet(quiet.context, player, .player, .of(&text), null, null));
+    try testing.expectEqual(abi.Status.ok, quiet.post(quiet.context, player, Delivery.done, &delivery));
+    try testing.expectEqual(@as(u32, 6), plugins.messages.load(.monotonic));
+    try testing.expectEqual(@as(u32, 40), plugins.injection_bytes.load(.monotonic));
+
+    plugins.drain(0, testing.io, &sink);
+    try testing.expectEqual(@as(usize, 4), sink.delivered);
+    try testing.expectEqual(@as(u32, 2), delivery.ok.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), plugins.messages.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), plugins.injection_bytes.load(.monotonic));
+    for (plugins.loaded.items) |loaded| {
+        try testing.expectEqual(@as(u32, 0), loaded.quota.messages.load(.monotonic));
+        try testing.expectEqual(@as(u32, 0), loaded.quota.injection_bytes.load(.monotonic));
+    }
+    try testing.expectEqual(abi.Status.ok, noisy.post(noisy.context, player, Delivery.done, &delivery));
+    plugins.handles.release(player);
 }
 
 test "packet injection rejects stale routes and transfers and cancels on shutdown" {

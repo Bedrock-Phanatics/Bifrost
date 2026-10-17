@@ -24,6 +24,16 @@ pub const Done = struct {
     metrics: []Packets.Metrics,
 };
 
+pub const Quota = struct {
+    messages: std.atomic.Value(u32) = .init(0),
+    injection_bytes: std.atomic.Value(u32) = .init(0),
+};
+
+pub const Post = struct {
+    then: Done,
+    quota: *Quota,
+};
+
 pub const Task = struct {
     run: abi.TaskFn,
     outstanding: *std.atomic.Value(u32),
@@ -31,6 +41,7 @@ pub const Task = struct {
 };
 
 pub const Message = struct {
+    quota: *Quota,
     player: abi.Player,
     len: usize,
     text: [max_message_bytes]u8,
@@ -39,12 +50,13 @@ pub const Message = struct {
 pub const Item = union(enum) {
     task: *Task,
     message: *Message,
-    post: *Done,
+    post: *Post,
     packet: *Injection,
     action: *Action,
 };
 
 pub const Action = struct {
+    quota: *Quota,
     player: abi.Player,
     kind: enum { disconnect, transfer },
     backend: u32 = abi.no_backend,
@@ -54,16 +66,17 @@ pub const Action = struct {
 };
 
 pub const Injection = struct {
+    quota: *Quota,
     player: abi.Player,
     target: abi.PacketTarget,
     epoch: u64,
     len: usize,
     then: ?Done,
 
-    pub fn create(gpa: std.mem.Allocator, player: abi.Player, target: abi.PacketTarget, epoch: u64, data: []const u8, then: ?Done) !*Injection {
+    pub fn create(gpa: std.mem.Allocator, quota: *Quota, player: abi.Player, target: abi.PacketTarget, epoch: u64, data: []const u8, then: ?Done) !*Injection {
         const allocation = try gpa.alignedAlloc(u8, .of(Injection), @sizeOf(Injection) + data.len);
         const self: *Injection = @ptrCast(allocation.ptr);
-        self.* = .{ .player = player, .target = target, .epoch = epoch, .len = data.len, .then = then };
+        self.* = .{ .quota = quota, .player = player, .target = target, .epoch = epoch, .len = data.len, .then = then };
         @memcpy(self.bytes(), data);
         return self;
     }
