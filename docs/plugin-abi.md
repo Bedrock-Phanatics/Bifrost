@@ -295,9 +295,11 @@ remain unset. Bifrost does not synthesize them from unrelated counters.
 API revision 3 adds `player_gameplay`, `find_entity` and `list_entities`. Bifrost is a proxy: it has no world, no
 physics and no say in the game, so everything here is what it saw on the wire, never authoritative state. Tracking is
 off unless a loaded plugin declares `BIFROST_CAPABILITY_GAMEPLAY` (the player) or `BIFROST_CAPABILITY_ENTITIES`
-(other entities). While either is declared, in-game batches are decoded instead of relayed opaquely and the listed
-packets are decoded once more. Where the opaque relay would otherwise apply, it is given up in both directions, which cost a quarter to a third of
-managed echo throughput in the plugin relay benchmark. With neither declared, the proxy does no extra work. Calls from a plugin without the matching
+(other entities). The listed packets are then decoded once more, about 50 to 90 ns each. With more than one
+backend every batch is already decoded for transfers, so that is the whole cost. With a single backend, in-game
+batches can otherwise skip decoding entirely; `GAMEPLAY` gives that up in both directions and `ENTITIES` only for
+backend batches, which cost a quarter to a third of managed echo throughput in the plugin relay benchmark. With
+neither declared, the proxy does no extra work. Calls from a plugin without the matching
 capability, or for a passthrough player, return `UNSUPPORTED`. Like `network_stats` they need the player's worker
 (`WRONG_THREAD` otherwise), return `STALE_HANDLE` for a retired handle and `TOO_LATE` while closing. Copies are taken
 from packets after plugins and runtime-ID translation, so ids always match what the client and packet hooks see.

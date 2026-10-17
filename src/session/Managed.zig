@@ -389,7 +389,8 @@ pub fn backendConnected(self: *Managed, ends: Ends) !void {
 fn relayable(self: *const Managed, direction: abi.Direction) bool {
     if (self.shared.transfers or !self.inGame()) return false;
     const hooks = self.shared.hooks orelse return true;
-    if (hooks.plugins.tracking.any()) return false;
+    const tracked = hooks.plugins.tracking;
+    if (tracked.player or (tracked.entities and direction == .from_backend)) return false;
     if (hooks.plugins.packetTable(direction)) |table| if (table.in_game) return false;
     return !hooks.plugins.hasCommands();
 }
@@ -764,6 +765,22 @@ test "player milestones and container tracking use the delivered packet" {
     const closed = try encodeTyped(&buffer, .{ .container_close = .{ .container_id = 1, .container_type = 0, .server_initiated_close = false } });
     try std.testing.expectEqual(@as(?bedwire.State, null), try managed.sentToBackend(.container_close, closed));
     try std.testing.expectEqual(null, managed.client_state.container);
+}
+
+test "entity tracking alone keeps player batches on the opaque relay" {
+    var plugins: Plugins = try .init(std.testing.allocator, &.{}, .{});
+    defer plugins.deinit();
+    var shared: Shared = undefined;
+    shared.transfers = false;
+    shared.hooks = .{ .plugins = &plugins, .worker = 0 };
+    var managed: Managed = .{ .gpa = std.testing.allocator, .shared = &shared, .player = undefined, .upstream = undefined, .early = .init(0, 0) };
+    managed.player.state = .in_game;
+    managed.upstream.phase = .ready;
+    try std.testing.expect(managed.relayable(.from_player) and managed.relayable(.from_backend));
+    plugins.tracking = .{ .entities = true };
+    try std.testing.expect(managed.relayable(.from_player) and !managed.relayable(.from_backend));
+    plugins.tracking = .{ .player = true };
+    try std.testing.expect(!managed.relayable(.from_player) and !managed.relayable(.from_backend));
 }
 
 test "typed plugin fields respect session phase and packet direction" {
