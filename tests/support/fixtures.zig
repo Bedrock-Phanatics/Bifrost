@@ -8,6 +8,7 @@ const IpAddress = std.Io.net.IpAddress;
 pub const loopback: IpAddress = .{ .ip4 = .loopback(0) };
 pub const nowhere: IpAddress = .{ .ip4 = .loopback(9) };
 pub const kick = "\xfekick";
+pub const burst = "\xfeburst";
 
 pub fn millis(ms: i64) std.Io.Timeout {
     return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
@@ -50,20 +51,29 @@ pub const Backend = struct {
     received: std.atomic.Value(u32) = .init(0),
     connects: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
+    burst_count: u32,
+    burst_bytes: u32,
 
     pub const Options = struct {
         advertisement: []const u8 = "MCPE;backend",
         greeting: ?[]const u8 = null,
         replies: []const []const u8 = &.{},
         serving: bool = true,
+        // Sent back in one go when a player sends `burst`, each with its little-endian u32 index after the 0xfe
+        burst_count: u32 = 0,
+        burst_bytes: u32 = 1024,
     };
 
     pub fn start(self: *Backend, io: std.Io, options: Options) !void {
+        var raknet_config: raknet.Config = .{};
+        raknet_config.session.maximum_queued_outbound_packets = 8192;
         self.* = .{
             .io = io,
-            .listener = try raknet.Server.listen(gpa, io, loopback, .{ .advertisement = options.advertisement, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000 }),
+            .listener = try raknet.Server.listen(gpa, io, loopback, .{ .advertisement = options.advertisement, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000, .config = raknet_config }),
             .greeting = options.greeting,
             .replies = options.replies,
+            .burst_count = options.burst_count,
+            .burst_bytes = options.burst_bytes,
         };
         errdefer self.listener.destroy();
         if (options.serving) try self.serve();
@@ -111,6 +121,14 @@ pub const Backend = struct {
         const self: *Backend = @ptrCast(@alignCast(context));
         _ = self.received.fetchAdd(1, .release);
         if (std.mem.eql(u8, payload.bytes, kick)) return session.close();
+        if (std.mem.eql(u8, payload.bytes, burst)) {
+            var message: [64 * 1024]u8 = @splat(0xfe);
+            for (0..self.burst_count) |i| {
+                std.mem.writeInt(u32, message[1..5], @intCast(i), .little);
+                session.send(message[0..self.burst_bytes], .reliable_ordered, 0) catch return error.ApplicationFailure;
+            }
+            return;
+        }
         var reply = payload.bytes;
         if (self.replied < self.replies.len) {
             reply = self.replies[self.replied];

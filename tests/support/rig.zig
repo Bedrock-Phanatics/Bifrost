@@ -33,6 +33,7 @@ pub const Rig = struct {
         plugins: ?*bifrost.Plugins = null,
         b_name: ?[]const u8 = null,
         health: bool = false,
+        max_transfers: u32 = 64,
     };
 
     pub fn start(self: *Rig, options: Options) !void {
@@ -52,6 +53,7 @@ pub const Rig = struct {
         proxy_config.transfer_phase_timeout_ms = options.phase_timeout_ms;
         proxy_config.transfer_timeout_ms = options.timeout_ms;
         proxy_config.content_policy = options.content_policy;
+        proxy_config.max_transfers = options.max_transfers;
         if (options.b_name) |name| proxy_config.backend_storage[1] = try .init(name, proxy_config.backend_storage[1].address);
         self.config = proxy_config;
         self.health = .init(self.config.backends(), 60_000, 100);
