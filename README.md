@@ -36,7 +36,8 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/bifrost
 ```
 
-Configure the proxy through [`config/bifrost.toml`](config/bifrost.toml).
+Configure the proxy through [`config/bifrost.toml`](config/bifrost.toml). [Resource limits](docs/limits.md)
+explains the timeouts, budgets and rate limits.
 
 ## Session Modes
 

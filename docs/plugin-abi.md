@@ -103,7 +103,7 @@ of memory.
 | `transfer(player, backend)` | asks to move a player; while running, the outcome arrives as `TRANSFER_COMPLETED` or `TRANSFER_FAILED` | `INVALID_ARGUMENT` for an unknown backend; `STALE_HANDLE`; `BUSY` when the worker's transfer mailbox is full; `UNSUPPORTED` during init; `CANCELED` while shutting down |
 | `worker_count()` | number of workers | none |
 | `spawn_task(player, run, done, user)` | runs `run` on a shared task thread, then `done` once | `UNSUPPORTED` without `TASKS`, during init or while shutting down; `INVALID_ARGUMENT` for no `run` or `done`; `BUSY` past 128 tasks in total or 32 per plugin |
-| `send_message(player, text)` | sends the player a chat message, managed mode only | `UNSUPPORTED` in passthrough or while shutting down; `INVALID_ARGUMENT` for empty, over 1024 bytes or not UTF-8; `STALE_HANDLE`; `BUSY` past 1024 queued messages and posts |
+| `send_message(player, text)` | sends the player a chat message, managed mode only | `UNSUPPORTED` in passthrough or while shutting down; `INVALID_ARGUMENT` for empty, over 1024 bytes or not UTF-8; `STALE_HANDLE`; `BUSY` past 1024 queued messages, posts, injections and actions in total or 256 per plugin |
 | `post(player, done, user)` | runs `done` once on the player's worker | `INVALID_ARGUMENT` for no `done`; `STALE_HANDLE`; `BUSY` as for `send_message`; `UNSUPPORTED` during init or while shutting down |
 
 `done` from `spawn_task` and `post` always runs exactly once. Its `bifrost_task_result.status` is `OK` on the
@@ -200,14 +200,16 @@ fields into a callback's replacement buffer in C++ before submitting it. Input b
 `OK` means accepted into the owning worker's FIFO queue, not delivered to the peer. A supplied `done` runs once
 with a `bifrost_task_result`: `OK` means the normal reliable-ordered channel-0 send accepted the packet;
 `STALE_HANDLE` means the player disconnected; `CANCELED` means a backend selection or transfer changed the route,
-the queue closed, or shutdown started; `BUSY` means a transfer is active; `TOO_LATE` means the session is not in
+the queue closed, or shutdown started; `BUSY` means a transfer is active or the peer is too far behind to take more
+(the same RakNet backlog that pauses relaying, see [limits](limits.md)); `TOO_LATE` means the session is not in
 game; `FAILED` means encoding or transport failed. Shutdown completions run before plugin shutdown with
 `worker == BIFROST_NO_WORKER`. Keep callback state alive until completion. Rejected submissions never call `done`.
 
 Submission returns `INVALID_ARGUMENT` for malformed packets, invalid targets or sizes, `UNSUPPORTED` for an
 unsupported packet, missing capability, passthrough mode or initialization, `STALE_HANDLE` for an expired player,
 `CANCELED` during shutdown or on a closed queue, `FAILED` on allocation failure, or `BUSY` when either bound is
-full. Injections share the 1024-item limit with messages and posts and have a separate 4 MiB copied-payload budget;
+full. Injections share the 1024-item limit (256 per plugin) with messages and posts and have a separate 4 MiB
+copied-payload budget, of which one plugin may hold 1 MiB;
 reserved bytes and queue items are released on every delivery and failure path. Metadata is bounded by item count.
 
 The worker drains a snapshot of the queue after transfer requests and before its next network service. Calls
@@ -356,7 +358,8 @@ Not provided, and why:
 ### Queued actions
 
 `disconnect(player, reason, done, user)` and `request_transfer(player, backend, done, user)` accept calls from any
-thread. `OK` means queued, not completed. Both share the existing 1024-item message/post/injection budget and use
+thread. `OK` means queued, not completed. Both share the existing 1024-item message/post/injection budget, 256 per
+plugin, and use
 one bounded allocation per accepted action. They return `BUSY` before allocation when full, `STALE_HANDLE` for a
 retired handle, `UNSUPPORTED` before plugin initialization, `CANCELED` during shutdown, and `FAILED` on allocation
 failure. Bad pointer/length shapes, invalid UTF-8, reasons over 1024 bytes and unknown backend indices return
@@ -376,7 +379,8 @@ or send; the transport still closes. In passthrough, the encrypted session is op
 only the RakNet disconnect is sent. It is never sent as unencrypted chat. Disconnect also invalidates queued injections.
 
 A transfer completion reports that the state machine started. Its eventual outcome still arrives through the
-existing transfer events. Worker delivery returns `UNSUPPORTED` in passthrough, `BUSY` during another transfer,
+existing transfer events. Worker delivery returns `UNSUPPORTED` in passthrough, `BUSY` during another transfer or
+when the worker already runs `[transfer] max_concurrent` transfers,
 `TOO_LATE` outside a connected in-game session or when already on that backend, `CANCELED` if a plugin vetoes,
 and `FAILED` for other dial/setup failures. The original callback-only `transfer` mailbox keeps its existing contract.
 Use `post` for other short worker-affine work and the existing bounded `send_packet` API for packet injection.
