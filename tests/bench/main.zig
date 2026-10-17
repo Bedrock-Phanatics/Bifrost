@@ -14,6 +14,7 @@ const bench_decoded = @import("decoded.zig");
 const bench_injection = @import("injection.zig");
 const bench_links = @import("links.zig");
 const bench_players = @import("players.zig");
+const bench_gameplay = @import("gameplay.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -34,15 +35,16 @@ comptime {
         _ = bench_handles;
         _ = bench_plugins;
         _ = bench_players;
+        _ = bench_gameplay;
     }
 }
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|players|packet-dispatch|callback-latency|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|players|gameplay|packet-dispatch|callback-latency|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "players", "decode", "injection", "ids", "tasks", "handles", "links", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "players", "gameplay", "decode", "injection", "ids", "tasks", "handles", "links", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -145,6 +147,11 @@ pub fn main(init: std.process.Init) !void {
             try env.out.print("\nPlayer info {d} B, network output {d} B, rate sampler {d} B per link.\n", .{ @sizeOf(bifrost.plugin_abi.PlayerInfo), @sizeOf(bifrost.plugin_abi.NetworkStats), @sizeOf(bifrost.Plugins.Network.Rates) });
             try env.out.writeAll("\n## Player APIs\n\nMedian of seven samples, 50,000 calls per quick sample or 500,000 otherwise. Snapshots allocate nothing. Scheduling includes one allocation, queue insertion, drain, callback or action, and free, with no transport I/O. Transport statistics is the underlying RakNet collection baseline. Event cases have 0, 1 or 10 subscribers.\n\n| case | ns per call | allocations per call |\n|---|---|---|\n");
             for (results) |result| try env.out.print("| {t} | {d:.1} | {d:.1} |\n", .{ result.case, result.ns_per_call, result.allocations_per_call });
+        }
+        if (std.mem.eql(u8, name, "gameplay")) {
+            const outcome = try bench_gameplay.run(env.gpa, env.io, env.quick);
+            try env.out.print("\n## Gameplay tracking\n\nMedian of seven samples, 20,000 calls per quick sample or 200,000 otherwise, against a full table of {d} entities using {d} heap bytes. Tracked cases include the header decode the proxy already does, the full borrowed decode and the update. Header only and untracked kind are what a packet costs with tracking off. Spawn remove is one RemoveActor scan and one AddPainting. List entities copies all {d}.\n\n| case | ns per call | allocations per call |\n|---|---|---|\n", .{ outcome.memory.entities, outcome.memory.heap_bytes, outcome.memory.entities });
+            for (outcome.results) |result| try env.out.print("| {t} | {d:.1} | {d:.1} |\n", .{ result.case, result.ns_per_call, result.allocations_per_call });
         }
         if (std.mem.eql(u8, name, "links")) {
             const results = try bench_links.run(env.gpa, env.io, env.quick);

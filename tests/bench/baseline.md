@@ -1033,3 +1033,32 @@ Jitter, duplicate and out-of-order counts, reliability anomaly counts and shared
 explicitly unavailable. Passthrough disconnect reasons cannot be delivered inside opaque Bedrock encryption.
 This pass did not run macOS/ARM64 runtime tests, race sanitizers, a WAN fault emulator or an extended soak.
 It does not establish the absence of all concurrency or transport failures.
+
+## Gameplay and entity tracking
+
+Recorded 2026-10-16 on Windows x86_64, 12 logical CPUs, Zig 0.17.0, ReleaseFast.
+
+```sh
+zig build bench -Doptimize=ReleaseFast -- gameplay
+```
+
+Median of seven samples of 200,000 calls, against one player's table filled to its 1,024-entity bound. Tracked
+packet cases include the header decode the proxy already does, the full borrowed decode and the state update.
+`header only` and `untracked kind` are what the same packets cost with tracking off. Spawn and remove is one
+`RemoveActor`, which scans the table, then one `AddPainting`. Listing copies all 1,024 entries.
+
+| case | ns per call | allocations per call |
+|---|---|---|
+| header only, tracking off | 2.1 | 0 |
+| untracked kind check | 2.1 | 0 |
+| `PlayerAuthInput` tracked | 80.7 | 0 |
+| `MoveActorDelta` tracked | 73.9 | 0 |
+| `MoveActorAbsolute` tracked | 49.1 | 0 |
+| `RemoveActor` and `AddPainting` at the bound | 913.3 | 0 |
+| `player_gameplay` snapshot | 14.5 | 0 |
+| `list_entities`, 1,024 entries | 12,523.5 | 0 |
+
+A full entity table holds 100,661 heap bytes per player; an empty one holds none. The player snapshot lives inline
+in the managed session (`bifrost_gameplay` is 232 bytes). Storage only grows when entities are added, so steady
+movement allocates nothing. These are microbenchmarks: they do not measure managed relay throughput with tracking
+on, which also gives up the opaque relay fast path while a tracking plugin is loaded.
