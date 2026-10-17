@@ -12,7 +12,14 @@ pub const Route = struct {
     link: u64,
     transfer: *const fn (context: *anyopaque, link: u64, backend: u32) abi.Status,
     network: ?*const fn (context: *anyopaque, link: u64, target: abi.PacketTarget, out: *abi.NetworkStats) abi.Status = null,
+    gameplay: ?*const fn (context: *anyopaque, link: u64, query: Query) abi.Status = null,
     io: ?std.Io = null,
+};
+
+pub const Query = union(enum) {
+    player: *abi.Gameplay,
+    entity: struct { runtime_id: u64, out: *abi.Entity },
+    entities: struct { out: []abi.Entity, total: *usize, complete: ?*u32 },
 };
 
 const Slot = struct {

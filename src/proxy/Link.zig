@@ -13,6 +13,7 @@ const Transfer = @import("../transfer/Transfer.zig");
 const Events = @import("../plugin/Events.zig");
 const abi = @import("../plugin/abi.zig");
 const Network = @import("../plugin/Network.zig");
+const Handles = @import("../plugin/Handles.zig");
 const PacketQueue = @import("PacketQueue.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -183,6 +184,14 @@ pub fn networkStats(self: *Link, target: abi.PacketTarget, out: *abi.NetworkStat
         else => return .invalid_argument,
     }
     return .ok;
+}
+
+pub fn gameplay(self: *Link, query: Handles.Query) abi.Status {
+    const session = self.session orelse return .stale_handle;
+    if (!session.isConnected()) return .too_late;
+    const managed = self.managed orelse return .unsupported;
+    const now_ms = @import("../plugin/Packets.zig").now(self.env.io) / std.time.ns_per_ms;
+    return managed.gameplay.answer(query, now_ms, managed.client_state.effects);
 }
 
 pub fn playerState(self: *const Link) abi.PlayerState {

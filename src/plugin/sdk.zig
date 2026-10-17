@@ -5,6 +5,9 @@ pub const Player = abi.Player;
 pub const PlayerInfo = abi.PlayerInfo;
 pub const NetworkStats = abi.NetworkStats;
 pub const NetworkMetric = abi.NetworkMetric;
+pub const Gameplay = abi.Gameplay;
+pub const Entity = abi.Entity;
+pub const Entities = struct { entities: []Entity, total: usize, complete: bool };
 pub const Event = abi.Event;
 pub const EventKind = abi.EventKind;
 pub const TransferDecision = abi.TransferDecision;
@@ -22,7 +25,7 @@ pub const CommandOptions = struct {
 };
 pub const TaskResult = abi.TaskResult;
 
-pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy, WrongThread, Canceled };
+pub const Error = error{ Failed, Incompatible, StaleHandle, InvalidArgument, Unsupported, TooLate, Busy, WrongThread, Canceled, NotFound };
 
 pub const Host = struct {
     raw: *const abi.Host,
@@ -142,6 +145,28 @@ pub const Host = struct {
         return stats;
     }
 
+    pub fn gameplay(self: Host, player: Player) Error!Gameplay {
+        if (!self.raw.has(.player_gameplay)) return error.Unsupported;
+        var state: Gameplay = undefined;
+        try check(self.raw.player_gameplay(self.raw.context, player, &state, @sizeOf(Gameplay)));
+        return state;
+    }
+
+    pub fn findEntity(self: Host, player: Player, runtime_id: u64) Error!Entity {
+        if (!self.raw.has(.find_entity)) return error.Unsupported;
+        var found: Entity = undefined;
+        try check(self.raw.find_entity(self.raw.context, player, runtime_id, &found, @sizeOf(Entity)));
+        return found;
+    }
+
+    pub fn listEntities(self: Host, player: Player, buffer: []Entity) Error!Entities {
+        if (!self.raw.has(.list_entities)) return error.Unsupported;
+        var total: usize = 0;
+        var complete: u32 = 0;
+        try check(self.raw.list_entities(self.raw.context, player, buffer.ptr, buffer.len, &total, &complete));
+        return .{ .entities = buffer[0..@min(total, buffer.len)], .total = total, .complete = complete != 0 };
+    }
+
     pub fn disconnect(self: Host, player: Player, reason: []const u8, done: ?abi.TaskDoneFn, user: ?*anyopaque) Error!void {
         if (!self.raw.has(.disconnect)) return error.Unsupported;
         try check(self.raw.disconnect(self.raw.context, player, .of(reason), done, user));
@@ -219,6 +244,7 @@ fn check(status: abi.Status) Error!void {
         .busy => error.Busy,
         .wrong_thread => error.WrongThread,
         .canceled => error.Canceled,
+        .not_found => error.NotFound,
         else => error.Failed,
     };
 }

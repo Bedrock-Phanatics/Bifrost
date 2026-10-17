@@ -31,6 +31,15 @@ pub const Options = struct {
     max_injection_bytes: u32 = 4 * 1024 * 1024,
 };
 
+pub const Tracking = struct {
+    player: bool = false,
+    entities: bool = false,
+
+    pub fn any(self: Tracking) bool {
+        return self.player or self.entities;
+    }
+};
+
 pub const Totals = struct {
     calls: u64 = 0,
     total_ns: u64 = 0,
@@ -127,6 +136,8 @@ pool: ?*Pool = null,
 outstanding: std.atomic.Value(u32) = .init(0),
 messages: std.atomic.Value(u32) = .init(0),
 injection_bytes: std.atomic.Value(u32) = .init(0),
+// Set while plugins load, before any worker reads it
+tracking: Tracking = .{},
 
 pub fn init(gpa: std.mem.Allocator, backends: []const Backend, options: Options) !Plugins {
     if (options.task_threads == 0 or options.task_threads > Pool.max_threads) return error.InvalidOptions;
@@ -266,6 +277,8 @@ pub fn load(self: *Plugins, entry: abi.InitFn, library: ?Library, manifest: ?*co
     plugin.name = .of(meta.name());
     plugin.plugin_version = .of(meta.version());
     self.loaded.appendAssumeCapacity(loaded);
+    if (plugin.capabilities.gameplay) self.tracking.player = true;
+    if (plugin.capabilities.entities) self.tracking.entities = true;
     loaded.ready.store(true, .release);
     if (meta.package.len != 0) {
         log.info("loaded plugin {s} {s} from {s}: {s}", .{ meta.name(), meta.version(), meta.package, meta.description() });
@@ -574,6 +587,9 @@ fn hostFor(loaded: *Loaded) abi.Host {
         .network_stats = hostNetworkStats,
         .disconnect = hostDisconnect,
         .request_transfer = hostRequestTransfer,
+        .player_gameplay = hostPlayerGameplay,
+        .find_entity = hostFindEntity,
+        .list_entities = hostListEntities,
     };
 }
 
@@ -826,6 +842,33 @@ fn hostNetworkStats(context: *anyopaque, player: abi.Player, target: abi.PacketT
     if (Work.context != @as(*const anyopaque, owner) or Work.worker != route.worker) return .wrong_thread;
     const network = route.network orelse return .unsupported;
     return network(route.context, route.link, target, result);
+}
+
+fn hostPlayerGameplay(context: *anyopaque, player: abi.Player, out: ?*abi.Gameplay, capacity: usize) callconv(.c) abi.Status {
+    const result = out orelse return .invalid_argument;
+    if (capacity < @sizeOf(abi.Gameplay)) return .invalid_argument;
+    return gameplayQuery(from(context), .gameplay, player, .{ .player = result });
+}
+
+fn hostFindEntity(context: *anyopaque, player: abi.Player, runtime_id: u64, out: ?*abi.Entity, capacity: usize) callconv(.c) abi.Status {
+    const result = out orelse return .invalid_argument;
+    if (capacity < @sizeOf(abi.Entity)) return .invalid_argument;
+    return gameplayQuery(from(context), .entities, player, .{ .entity = .{ .runtime_id = runtime_id, .out = result } });
+}
+
+fn hostListEntities(context: *anyopaque, player: abi.Player, out: ?[*]abi.Entity, count: usize, total: ?*usize, whole: ?*u32) callconv(.c) abi.Status {
+    const tracked = total orelse return .invalid_argument;
+    const entities: []abi.Entity = if (count == 0) &.{} else (out orelse return .invalid_argument)[0..count];
+    return gameplayQuery(from(context), .entities, player, .{ .entities = .{ .out = entities, .total = tracked, .complete = whole } });
+}
+
+fn gameplayQuery(loaded: *Loaded, comptime capability: std.meta.FieldEnum(abi.Capabilities), player: abi.Player, query: Handles.Query) abi.Status {
+    if (!@field(loaded.plugin.capabilities, @tagName(capability))) return .unsupported;
+    const owner = loaded.owner;
+    const route = owner.handles.route(player) orelse return .stale_handle;
+    if (Work.context != @as(*const anyopaque, owner) or Work.worker != route.worker) return .wrong_thread;
+    const gameplay = route.gameplay orelse return .unsupported;
+    return gameplay(route.context, route.link, query);
 }
 
 fn hostDisconnect(context: *anyopaque, player: abi.Player, reason: abi.Str, done: ?abi.TaskDoneFn, user: ?*anyopaque) callconv(.c) abi.Status {

@@ -7,6 +7,7 @@ const packs = @import("../content/packs.zig");
 pub const registries = @import("../content/registries.zig");
 pub const Upstream = @import("Upstream.zig");
 const ClientState = @import("ClientState.zig");
+pub const Gameplay = @import("Gameplay.zig");
 pub const Outbox = @import("Outbox.zig");
 pub const self_id = @import("self_id.zig");
 const commands = @import("commands.zig");
@@ -102,6 +103,7 @@ initial_packs: packs.Fingerprint = .{},
 initial_registries: registries.Fingerprint = .{},
 transferred: bool = false,
 client_state: ClientState = .{},
+gameplay: Gameplay = .{},
 client_dimension: i32 = Handoff.overworld,
 // New backend packets wait here until the client is in their dimension
 hold: ?*Queue = null,
@@ -138,6 +140,7 @@ pub fn destroy(self: *Managed) void {
     if (self.identity) |*identity| identity.deinit();
     if (self.client_data) |json| self.gpa.free(json);
     self.client_state.deinit(self.gpa);
+    self.gameplay.deinit(self.gpa);
     self.early.deinit(self.gpa);
     self.gpa.destroy(self);
 }
@@ -195,6 +198,7 @@ fn idSwap(self: *const Managed) ?self_id.Swap {
 fn newBatch(self: *Managed, ends: Ends, to_player: bool) Batch {
     var batch: Batch = .{ .managed = self, .ends = ends, .to_player = to_player };
     const hooks = self.shared.hooks orelse return batch;
+    if (hooks.plugins.tracking.player) self.gameplay.now_ms = Packets.now(ends.io) / std.time.ns_per_ms;
     if (hooks.plugins.packetTable(if (to_player) .from_backend else .from_player)) |table| {
         if (self.player.state != .in_game or table.in_game) batch.table = table;
     }
@@ -328,20 +332,30 @@ pub fn sendOutbox(self: *Managed, ends: Ends, outbox: *const Outbox) !void {
     }
 }
 
+fn tracking(self: *const Managed) Gameplay.Tracking {
+    const hooks = self.shared.hooks orelse return .{};
+    return hooks.plugins.tracking;
+}
+
 // Proxy state follows what was delivered, after plugins had their say
 fn sentToPlayer(self: *Managed, kind: ?bedwire.PacketKind, packet: []const u8) !void {
-    if (kind == .change_dimension) self.client_dimension = (try typed(try decode(packet), .change_dimension)).dimension_id;
-    if (!ClientState.tracks(kind)) return;
-    const decoded = decode(packet) catch {
-        self.client_state.untracked = true;
+    const client = ClientState.tracks(kind);
+    const gameplay = Gameplay.fromBackend(kind, self.tracking());
+    if (kind != .change_dimension and !client and !gameplay) return;
+    const decoded = decode(packet) catch |err| {
+        if (kind == .change_dimension) return err;
+        if (client) self.client_state.untracked = true;
         return;
     };
-    self.client_state.observe(self.gpa, decoded) catch {
+    if (kind == .change_dimension) self.client_dimension = (try typed(decoded, .change_dimension)).dimension_id;
+    if (gameplay) self.gameplay.sent(self.gpa, decoded);
+    if (client) self.client_state.observe(self.gpa, decoded) catch {
         self.client_state.untracked = true;
     };
 }
 
 fn sentToBackend(self: *Managed, kind: ?bedwire.PacketKind, packet: []const u8) !?bedwire.State {
+    if (Gameplay.fromPlayer(kind) and self.tracking().player) if (decode(packet)) |decoded| self.gameplay.reported(decoded) else |_| {};
     switch (kind orelse return null) {
         .request_chunk_radius => {
             const request = try typed(try decode(packet), .request_chunk_radius);
@@ -371,10 +385,11 @@ pub fn backendConnected(self: *Managed, ends: Ends) !void {
     try self.upstream.connected(self.upstreamContext(ends, ends.backend.?));
 }
 
-// ClientState, the chunk radius and plugin commands have to see every batch
+// ClientState, the chunk radius, gameplay tracking and plugin commands have to see every batch
 fn relayable(self: *const Managed, direction: abi.Direction) bool {
     if (self.shared.transfers or !self.inGame()) return false;
     const hooks = self.shared.hooks orelse return true;
+    if (hooks.plugins.tracking.any()) return false;
     if (hooks.plugins.packetTable(direction)) |table| if (table.in_game) return false;
     return !hooks.plugins.hasCommands();
 }

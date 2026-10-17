@@ -24,7 +24,8 @@ need; subscriptions and commands can't be added later. Returning anything but `O
 startup. Bifrost refuses a plugin whose `abi_version` differs from `BIFROST_ABI_VERSION`, whose `struct_size` is
 smaller than it knows, or that asks for a capability bit it doesn't know. It also refuses one that subscribes to
 events, hooks packets or registers commands without declaring `EVENTS`, `PACKETS` or `COMMANDS`, and `spawn_task`
-returns `UNSUPPORTED` without `TASKS`. Whatever a refused plugin registered is dropped with it. `spawn_task` and
+returns `UNSUPPORTED` without `TASKS`. `GAMEPLAY` and `ENTITIES` switch on the matching tracking described in
+[Gameplay and entity information](#gameplay-and-entity-information). Whatever a refused plugin registered is dropped with it. `spawn_task` and
 `post` also return `UNSUPPORTED` until initialization, metadata validation and registration all succeed, including
 from `shutdown` when loading fails, so no queued callback can outlive a refused plugin.
 
@@ -69,7 +70,7 @@ never inside it.
 | host function | where it may be called |
 |---|---|
 | `log`, `worker_count`, `backend_count`, `backend_name`, `player_name`, `player_info`, `send_message`, `send_packet`, `post`, `disconnect`, `request_transfer` | any thread |
-| `network_stats` | a callback on this player's worker, use `post` from other threads |
+| `network_stats`, `player_gameplay`, `find_entity`, `list_entities` | a callback on this player's worker, use `post` from other threads |
 | `transfer`, `spawn_task` | inside a callback Bifrost is running |
 | `subscribe`, `subscribe_packet`, `register_command`, `register_command_info`, `set_description` | inside `bifrost_plugin_init` |
 
@@ -289,6 +290,66 @@ Player-side rates are unavailable because its listener socket serves multiple pl
 out-of-order counts and reliability anomalies are unavailable on both legs in the pinned RakNet API. Their bits
 remain unset. Bifrost does not synthesize them from unrelated counters.
 
+### Gameplay and entity information
+
+API revision 3 adds `player_gameplay`, `find_entity` and `list_entities`. Bifrost is a proxy: it has no world, no
+physics and no say in the game, so everything here is what it saw on the wire, never authoritative state. Tracking is
+off unless a loaded plugin declares `BIFROST_CAPABILITY_GAMEPLAY` (the player) or `BIFROST_CAPABILITY_ENTITIES`
+(other entities). While either is declared, in-game batches are decoded instead of relayed opaquely and the listed
+packets are decoded once more; with neither, the proxy does no extra work. Calls from a plugin without the matching
+capability, or for a passthrough player, return `UNSUPPORTED`. Like `network_stats` they need the player's worker
+(`WRONG_THREAD` otherwise), return `STALE_HANDLE` for a retired handle and `TOO_LATE` while closing. Copies are taken
+from packets after plugins and runtime-ID translation, so ids always match what the client and packet hooks see.
+
+`player_gameplay(player, out, capacity)` fills a `bifrost_gameplay`. Only fields whose `available` bit is set mean
+anything, and a field is cleared rather than kept when it can no longer be trusted.
+
+| bit | fields | source |
+|---|---|---|
+| `POSITION` | `position`, `pitch`, `yaw`, `head_yaw`, `position_source`, `position_at_ms`, `teleport_pending` | backend `StartGame`, `MovePlayer`, `Respawn`, `ChangeDimension`, `CorrectPlayerMovePrediction` for the player, or the client's `PlayerAuthInput` |
+| `VELOCITY` | `velocity` | the client's position delta for its last tick |
+| `DIMENSION` | `dimension` | `StartGame`, `ChangeDimension`, the transfer target |
+| `GAME_MODE` | `game_mode` (Bedrock `GameType`) | `StartGame`, `SetPlayerGameType`, `UpdatePlayerGameType`, `SetDefaultGameType`, resolved from "default" |
+| `MOVEMENT` | `movement` (`BIFROST_MOVEMENT_*`) | the client's input flags; swimming, gliding, crawling and flying follow its start and stop flags |
+| `ATTRIBUTES` | `attributes`, `attributes_available` | `UpdateAttributes` for the player, for the eight vanilla names in `bifrost_attribute_kind` |
+| `EFFECTS` | `effects`, a 256-bit set of effect ids | `MobEffect` adds and removes for the player |
+
+`position_source` says who last set the position. `BACKEND` is where the backend put the player; `CLIENT` is where
+the client says it is, which a server-authoritative backend may still reject. After a backend teleport, dimension
+change or transfer, `teleport_pending` is 1 and client reports are ignored until the client handles the teleport,
+acknowledges the dimension or finishes the transfer sync. Bedrock player positions are at eye height.
+`sampled_at_ms` and `position_at_ms` use the awake clock, so their difference is the age of the position.
+
+A transfer resets the snapshot to the target's spawn, dimension and game mode, and clears velocity and attributes
+until the target sends them. Bifrost also sends the client the target's game mode, since the client otherwise keeps
+the old backend's. Effects come from the same tracking that clears them on transfer. Disconnecting frees everything.
+
+`find_entity(player, runtime_id, out, capacity)` and `list_entities(player, out, count, total, complete)` describe
+other entities as the client was told about them: `AddActor`, `AddPlayer`, `AddItemActor` and `AddPainting` add them,
+`MoveActorAbsolute`, `MoveActorDelta` and `MovePlayer` move them and `RemoveActor` removes them. A dimension change or
+transfer drops them all, since the backend sends them again. `find_entity` returns `NOT_FOUND` for an id it does not
+track. `list_entities` copies up to `count` in no particular order and sets `total`; `complete` is 0 when a spawn did
+not fit. Up to 1024 entities are tracked per player, about 100 KiB at worst, and up to 128 identifiers of at most
+64 bytes are kept; a longer or extra identifier leaves `identifier_len` at 0. `bifrost_entity` is frozen because
+`list_entities` fills an array of them.
+
+Not provided, and why:
+
+- Blocks, chunks and collision. Answering them needs a world cache and block palette per player, which costs far
+  more memory than a proxy should spend, and still would not match the backend's view. Plugins that need world
+  queries should ask the backend.
+- Bounding boxes, entity attributes, metadata and velocity. They live in actor metadata that Bifrost would have to
+  decode on every `SetActorData`; nothing reads them today.
+- Setbacks and forced movement. With server-authoritative movement the backend owns the position. A `MovePlayer` from
+  the proxy would teleport the client while the backend still has it elsewhere, so the backend corrects it straight
+  back, and around transfers or dimension changes it can strand the client. Corrections belong to the backend.
+- Backend integration. Authoritative positions, world queries and corrections need a protocol a backend implements,
+  and no Bifrost backend counterpart exists yet, so none is defined. The intended contract: an optional, versioned
+  channel per backend connection; requests are asynchronous with bounded per-player and global queues, answered on
+  the player's worker; every answer carries the backend, the transfer epoch it belongs to and a timestamp, and is
+  dropped when the player has since transferred or left; a backend that never answers costs a timeout, not a stalled
+  callback; and normal Bedrock servers, which never answer, keep working exactly as now.
+
 ### Queued actions
 
 `disconnect(player, reason, done, user)` and `request_transfer(player, backend, done, user)` accept calls from any
@@ -335,7 +396,7 @@ logs and rate-limited slow-callback diagnostics retain their existing behavior; 
 
 - `BIFROST_ABI_VERSION` changes only for a breaking change. Each side checks the other's `abi_version` and refuses
   a mismatch: Bifrost returns an error for the plugin, a plugin should return `INCOMPATIBLE`.
-- `BIFROST_API_REVISION` identifies the header's additive API revision, currently 2. It is not a host negotiation
+- `BIFROST_API_REVISION` identifies the header's additive API revision, currently 3. It is not a host negotiation
   field; use `BIFROST_HOST_HAS` for each optional function. Keep the host pointer rather than copying a newer
   header's entire table from an older host. New player/network snapshot layouts are fixed in v1.
 - `bifrost_host` only grows at the end. A plugin must not compare `host->struct_size` with its own
@@ -347,7 +408,7 @@ logs and rate-limited slow-callback diagnostics retain their existing behavior; 
 - Structs a plugin writes into (`bifrost_plugin`, `bifrost_transfer_decision`, `bifrost_packet`) never grow in v1,
   because a newer plugin writing a field into an older host's smaller struct would corrupt it. New outputs arrive as
   new host functions instead.
-- Typed outputs (`bifrost_text`, `bifrost_chunk_radius`) also keep their v1 layouts. New layouts require new packet types.
+- Typed outputs (`bifrost_text`, `bifrost_chunk_radius`) and `bifrost_entity` also keep their v1 layouts. New layouts require new packet types.
 - Structs you pass in (`bifrost_command_info`) carry `struct_size` so Bifrost knows which fields you set; fill it in.
 - Enums and status codes can gain values; treat unknown ones as "not for me" rather than as errors.
 

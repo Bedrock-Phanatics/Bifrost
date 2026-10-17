@@ -1,5 +1,5 @@
 // Plugins run in-process, so a crash takes the proxy down. Callbacks run on several workers at once; never block.
-// From your own threads use log, counts, names, player_info and queued actions. Query network_stats on the player's worker.
+// From your own threads use log, counts, names, player_info and queued actions. Query network_stats, gameplay and entities on the player's worker.
 // Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns.
 
 const std = @import("std");
@@ -11,7 +11,7 @@ pub const max_manifest_bytes = 4096;
 pub const ManifestFn = *const fn (out: ?*Str) callconv(.c) Status;
 pub const no_backend: u32 = std.math.maxInt(u32);
 pub const no_worker: u32 = std.math.maxInt(u32);
-pub const api_revision: u32 = 2;
+pub const api_revision: u32 = 3;
 
 pub const ConnectionState = enum(u32) { connected, closing, disconnected, _ };
 pub const AuthenticationState = enum(u32) { pending, authenticated, disabled, unavailable, rejected, _ };
@@ -89,6 +89,81 @@ pub const NetworkStats = extern struct {
     rate_interval_ms: u64 = 0,
 };
 
+pub const Vec3 = extern struct { x: f32 = 0, y: f32 = 0, z: f32 = 0 };
+
+pub const GameplayField = struct {
+    pub const position: u64 = 1 << 0;
+    pub const velocity: u64 = 1 << 1;
+    pub const dimension: u64 = 1 << 2;
+    pub const game_mode: u64 = 1 << 3;
+    pub const movement: u64 = 1 << 4;
+    pub const attributes: u64 = 1 << 5;
+    pub const effects: u64 = 1 << 6;
+};
+
+pub const PositionSource = enum(u32) { none, backend, client, _ };
+
+pub const Movement = struct {
+    pub const sneaking: u32 = 1 << 0;
+    pub const sprinting: u32 = 1 << 1;
+    pub const jumping: u32 = 1 << 2;
+    pub const swimming: u32 = 1 << 3;
+    pub const gliding: u32 = 1 << 4;
+    pub const crawling: u32 = 1 << 5;
+    pub const flying: u32 = 1 << 6;
+    pub const in_vehicle: u32 = 1 << 7;
+};
+
+pub const AttributeKind = enum(u32) {
+    health,
+    absorption,
+    hunger,
+    saturation,
+    exhaustion,
+    movement,
+    level,
+    experience,
+    _,
+
+    pub const count = 8;
+};
+
+pub const Attribute = extern struct { min: f32 = 0, max: f32 = 0, current: f32 = 0 };
+
+// What the proxy saw on the wire, never what the backend decided
+pub const Gameplay = extern struct {
+    struct_size: u32 = @sizeOf(Gameplay),
+    position_source: PositionSource = .none,
+    available: u64 = 0,
+    sampled_at_ms: u64 = 0,
+    position_at_ms: u64 = 0,
+    runtime_id: u64 = 0,
+    unique_id: i64 = 0,
+    position: Vec3 = .{},
+    velocity: Vec3 = .{},
+    pitch: f32 = 0,
+    yaw: f32 = 0,
+    head_yaw: f32 = 0,
+    dimension: i32 = 0,
+    game_mode: i32 = 0,
+    movement: u32 = 0,
+    teleport_pending: u32 = 0,
+    attributes_available: u32 = 0,
+    attributes: [AttributeKind.count]Attribute = @splat(.{}),
+    effects: [4]u64 = @splat(0),
+};
+
+pub const Entity = extern struct {
+    runtime_id: u64 = 0,
+    unique_id: i64 = 0,
+    position: Vec3 = .{},
+    pitch: f32 = 0,
+    yaw: f32 = 0,
+    head_yaw: f32 = 0,
+    identifier_len: u32 = 0,
+    identifier: [64]u8 = @splat(0),
+};
+
 pub const Status = enum(i32) {
     ok = 0,
     failed = -1,
@@ -100,6 +175,7 @@ pub const Status = enum(i32) {
     busy = -7,
     wrong_thread = -8,
     canceled = -9,
+    not_found = -10,
     _,
 };
 
@@ -126,9 +202,11 @@ pub const Capabilities = packed struct(u64) {
     commands: bool = false,
     packets: bool = false,
     tasks: bool = false,
-    _: u60 = 0,
+    gameplay: bool = false,
+    entities: bool = false,
+    _: u58 = 0,
 
-    pub const supported: Capabilities = .{ .events = true, .commands = true, .packets = true, .tasks = true };
+    pub const supported: Capabilities = .{ .events = true, .commands = true, .packets = true, .tasks = true, .gameplay = true, .entities = true };
 };
 
 pub const LogLevel = enum(u32) { err, warn, info, debug, _ };
@@ -312,6 +390,9 @@ pub const Host = extern struct {
     network_stats: *const fn (context: *anyopaque, player: Player, target: PacketTarget, out: ?*NetworkStats, capacity: usize) callconv(.c) Status,
     disconnect: *const fn (context: *anyopaque, player: Player, reason: Str, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
     request_transfer: *const fn (context: *anyopaque, player: Player, backend: u32, done: ?TaskDoneFn, user: ?*anyopaque) callconv(.c) Status,
+    player_gameplay: *const fn (context: *anyopaque, player: Player, out: ?*Gameplay, capacity: usize) callconv(.c) Status,
+    find_entity: *const fn (context: *anyopaque, player: Player, runtime_id: u64, out: ?*Entity, capacity: usize) callconv(.c) Status,
+    list_entities: *const fn (context: *anyopaque, player: Player, out: ?[*]Entity, count: usize, total: ?*usize, complete: ?*u32) callconv(.c) Status,
 
     pub fn has(self: *const Host, comptime field: std.meta.FieldEnum(Host)) bool {
         const name = @tagName(field);
@@ -339,6 +420,7 @@ test "structs plugins write into are frozen" {
         .{ Packet, &[_][]const u8{ "struct_size", "direction", "id", "worker", "player", "bytes", "replacement", "replacement_capacity", "replacement_len" } },
         .{ Text, &[_][]const u8{ "message_type", "localize", "has_filtered_message", "parameter_count", "source", "message", "xuid", "platform_id", "filtered_message", "parameters" } },
         .{ ChunkRadius, &[_][]const u8{ "radius", "max_radius" } },
+        .{ Entity, &[_][]const u8{ "runtime_id", "unique_id", "position", "pitch", "yaw", "head_yaw", "identifier_len", "identifier" } },
     };
     inline for (frozen) |pair| {
         const names = comptime std.meta.fieldNames(pair[0]);

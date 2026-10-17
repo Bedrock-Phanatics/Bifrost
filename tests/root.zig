@@ -14,6 +14,7 @@ test {
     _ = @import("integration/plugins.zig");
     _ = @import("integration/chaos.zig");
     _ = @import("integration/runtime_ids.zig");
+    _ = @import("integration/gameplay.zig");
 }
 
 test "the shipped config parses" {

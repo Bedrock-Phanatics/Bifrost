@@ -9,12 +9,12 @@ extern "C" {
 #endif
 
 /* Plugins run in-process, so a crash takes the proxy down. Callbacks run on several workers at once; never block.
-   From your own threads use log, counts, names, player_info and queued actions. Query network_stats on the player's worker.
+   From your own threads use log, counts, names, player_info and queued actions. Query network_stats, gameplay and entities on the player's worker.
    Stop your threads before shutdown returns. Anything passed in is only valid until the callback returns.
    The full contract is in docs/plugin-abi.md. */
 
 #define BIFROST_ABI_VERSION 1u
-#define BIFROST_API_REVISION 2u
+#define BIFROST_API_REVISION 3u
 #define BIFROST_NO_BACKEND UINT32_MAX
 #define BIFROST_NO_WORKER UINT32_MAX
 
@@ -43,6 +43,7 @@ enum {
     BIFROST_STATUS_BUSY = -7,
     BIFROST_STATUS_WRONG_THREAD = -8,
     BIFROST_STATUS_CANCELED = -9,
+    BIFROST_STATUS_NOT_FOUND = -10,
 };
 
 /* Only valid until the call returns */
@@ -134,10 +135,87 @@ typedef struct bifrost_network_stats {
     uint64_t rate_interval_ms;
 } bifrost_network_stats;
 
+typedef struct bifrost_vec3 {
+    float x;
+    float y;
+    float z;
+} bifrost_vec3;
+
+#define BIFROST_GAMEPLAY_POSITION (UINT64_C(1) << 0)
+#define BIFROST_GAMEPLAY_VELOCITY (UINT64_C(1) << 1)
+#define BIFROST_GAMEPLAY_DIMENSION (UINT64_C(1) << 2)
+#define BIFROST_GAMEPLAY_GAME_MODE (UINT64_C(1) << 3)
+#define BIFROST_GAMEPLAY_MOVEMENT (UINT64_C(1) << 4)
+#define BIFROST_GAMEPLAY_ATTRIBUTES (UINT64_C(1) << 5)
+#define BIFROST_GAMEPLAY_EFFECTS (UINT64_C(1) << 6)
+
+typedef uint32_t bifrost_position_source;
+enum { BIFROST_POSITION_NONE, BIFROST_POSITION_BACKEND, BIFROST_POSITION_CLIENT };
+
+#define BIFROST_MOVEMENT_SNEAKING (UINT32_C(1) << 0)
+#define BIFROST_MOVEMENT_SPRINTING (UINT32_C(1) << 1)
+#define BIFROST_MOVEMENT_JUMPING (UINT32_C(1) << 2)
+#define BIFROST_MOVEMENT_SWIMMING (UINT32_C(1) << 3)
+#define BIFROST_MOVEMENT_GLIDING (UINT32_C(1) << 4)
+#define BIFROST_MOVEMENT_CRAWLING (UINT32_C(1) << 5)
+#define BIFROST_MOVEMENT_FLYING (UINT32_C(1) << 6)
+#define BIFROST_MOVEMENT_IN_VEHICLE (UINT32_C(1) << 7)
+
+typedef uint32_t bifrost_attribute_kind;
+enum {
+    BIFROST_ATTRIBUTE_HEALTH, BIFROST_ATTRIBUTE_ABSORPTION, BIFROST_ATTRIBUTE_HUNGER, BIFROST_ATTRIBUTE_SATURATION,
+    BIFROST_ATTRIBUTE_EXHAUSTION, BIFROST_ATTRIBUTE_MOVEMENT, BIFROST_ATTRIBUTE_LEVEL, BIFROST_ATTRIBUTE_EXPERIENCE,
+    BIFROST_ATTRIBUTE_COUNT
+};
+
+typedef struct bifrost_attribute {
+    float min;
+    float max;
+    float current;
+} bifrost_attribute;
+
+/* What the proxy saw on the wire, never what the backend decided. See docs/plugin-abi.md for sources. */
+typedef struct bifrost_gameplay {
+    uint32_t struct_size;
+    bifrost_position_source position_source;
+    uint64_t available;
+    uint64_t sampled_at_ms;
+    uint64_t position_at_ms;
+    uint64_t runtime_id;
+    int64_t unique_id;
+    bifrost_vec3 position;
+    bifrost_vec3 velocity;
+    float pitch;
+    float yaw;
+    float head_yaw;
+    int32_t dimension;
+    int32_t game_mode;
+    uint32_t movement;
+    uint32_t teleport_pending;
+    uint32_t attributes_available;
+    bifrost_attribute attributes[BIFROST_ATTRIBUTE_COUNT];
+    uint64_t effects[4];
+} bifrost_gameplay;
+
+/* Frozen, since list_entities fills an array of them */
+typedef struct bifrost_entity {
+    uint64_t runtime_id;
+    int64_t unique_id;
+    bifrost_vec3 position;
+    float pitch;
+    float yaw;
+    float head_yaw;
+    uint32_t identifier_len;
+    uint8_t identifier[64];
+} bifrost_entity;
+
 #define BIFROST_CAPABILITY_EVENTS (UINT64_C(1) << 0)
 #define BIFROST_CAPABILITY_COMMANDS (UINT64_C(1) << 1)
 #define BIFROST_CAPABILITY_PACKETS (UINT64_C(1) << 2)
 #define BIFROST_CAPABILITY_TASKS (UINT64_C(1) << 3)
+/* Tracking only runs while a loaded plugin declares it */
+#define BIFROST_CAPABILITY_GAMEPLAY (UINT64_C(1) << 4)
+#define BIFROST_CAPABILITY_ENTITIES (UINT64_C(1) << 5)
 
 typedef uint32_t bifrost_log_level;
 enum {
@@ -346,6 +424,11 @@ typedef struct bifrost_host {
     bifrost_status (*network_stats)(void *context, bifrost_player player, bifrost_packet_target target, bifrost_network_stats *out, size_t capacity) BIFROST_NOEXCEPT;
     bifrost_status (*disconnect)(void *context, bifrost_player player, bifrost_str reason, bifrost_task_done_fn done, void *user) BIFROST_NOEXCEPT;
     bifrost_status (*request_transfer)(void *context, bifrost_player player, uint32_t backend, bifrost_task_done_fn done, void *user) BIFROST_NOEXCEPT;
+    /* These three need the matching capability and run on the player's worker. Managed players only. */
+    bifrost_status (*player_gameplay)(void *context, bifrost_player player, bifrost_gameplay *out, size_t capacity) BIFROST_NOEXCEPT;
+    bifrost_status (*find_entity)(void *context, bifrost_player player, uint64_t runtime_id, bifrost_entity *out, size_t capacity) BIFROST_NOEXCEPT;
+    /* Copies up to count, sets total to how many are tracked and complete to 0 if some spawns did not fit */
+    bifrost_status (*list_entities)(void *context, bifrost_player player, bifrost_entity *out, size_t count, size_t *total, uint32_t *complete) BIFROST_NOEXCEPT;
 } bifrost_host;
 
 /* Older hosts have a shorter table, so use this instead of sizeof */

@@ -16,6 +16,7 @@ const Backend = @import("../backend/Backend.zig");
 const Transfer = @import("../transfer/Transfer.zig");
 pub const Link = @import("Link.zig");
 const Plugins = @import("../plugin/Plugins.zig");
+const Handles = Plugins.Handles;
 const abi = @import("../plugin/abi.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
@@ -233,6 +234,12 @@ fn routeNetwork(context: *anyopaque, link_id: u64, target: abi.PacketTarget, out
     return link.networkStats(target, out);
 }
 
+fn routeGameplay(context: *anyopaque, link_id: u64, query: Handles.Query) abi.Status {
+    const self: *Proxy = @ptrCast(@alignCast(context));
+    const link = self.findLink(link_id) orelse return .too_late;
+    return link.gameplay(query);
+}
+
 fn routeTransfer(context: *anyopaque, link: u64, backend: u32) abi.Status {
     const self: *Proxy = @ptrCast(@alignCast(context));
     self.requestTransfer(link, .of(backend)) catch |err| return switch (err) {
@@ -345,7 +352,7 @@ fn accept(self: *Proxy, session: *raknet.Session) !void {
     errdefer link.destroy();
     link.id = std.math.add(u64, self.next_player, 1) catch return error.PlayerIdExhausted;
     self.next_player = link.id;
-    link.player = self.env.events.connected(.{ .context = self, .worker = self.env.events.worker, .link = link.id, .transfer = routeTransfer, .network = routeNetwork, .io = self.io }, session.address, if (self.env.events.plugins != null) link.playerState() else .{});
+    link.player = self.env.events.connected(.{ .context = self, .worker = self.env.events.worker, .link = link.id, .transfer = routeTransfer, .network = routeNetwork, .gameplay = routeGameplay, .io = self.io }, session.address, if (self.env.events.plugins != null) link.playerState() else .{});
     if (link.managed) |managed| managed.plugin_player = link.player;
 
     try link.connect();

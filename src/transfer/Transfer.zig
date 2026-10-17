@@ -78,6 +78,7 @@ target_packs: packs.Fingerprint = .{},
 target_registries: registries.Fingerprint = .{},
 target_spawn: ?Handoff.Target = null,
 target_ids: self_id.Ids = .{},
+target_modes: struct { player: i32, world: i32 } = .{ .player = 0, .world = 0 },
 handoff: ?Handoff = null,
 managed: *Managed,
 mismatch: ?content.Mismatch = null,
@@ -231,6 +232,7 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
                 const start = try Managed.typed(decoded, .start_game);
                 self.target_spawn = .{ .dimension = start.settings.spawn_settings.dimension, .position = finite(start.position) };
                 self.target_ids = .{ .runtime = start.runtime_id, .unique = start.entity_id };
+                self.target_modes = .{ .player = @backingInt(start.game_type), .world = @backingInt(start.settings.game_type) };
                 self.seen.started = true;
             }
             continue;
@@ -337,7 +339,11 @@ fn commit(self: *Transfer, host: Host) !void {
     var outbox: Managed.Outbox = .init(host.gpa);
     defer outbox.deinit();
     try managed.client_state.reset(&outbox);
-    self.handoff = try .begin(managed.client_dimension, self.target_spawn.?, &outbox);
+    // The client keeps its old game mode unless told, and the target never sends it again
+    if (Managed.Gameplay.gameMode(self.target_modes.player, self.target_modes.world)) |mode| try outbox.emit(.{ .set_player_game_type = .{ .player_game_type = @fromBackingInt(mode) } });
+    const spawn = self.target_spawn.?;
+    managed.gameplay.transferred(now(host.io) / std.time.ns_per_ms, spawn.dimension, spawn.position, self.target_modes.player, self.target_modes.world);
+    self.handoff = try .begin(managed.client_dimension, spawn, &outbox);
     managed.syncing = true;
     managed.dimension_acks = 0;
     managed.target_spawned = self.seen.spawned;
@@ -373,6 +379,7 @@ pub fn syncClient(self: *Transfer, host: Host) !void {
     if (!self.handoff.?.arrived() or !managed.target_spawned) return;
     managed.syncing = false;
     managed.client_dimension = self.handoff.?.target.dimension;
+    managed.gameplay.synced();
     try managed.spawnTarget(host.ends());
     self.on(host, .client_synced);
 }

@@ -443,6 +443,10 @@ test "the C header matches the Zig ABI" {
         .{ abi.PlayerState, header.bifrost_player_state },
         .{ abi.PlayerInfo, header.bifrost_player_info },
         .{ abi.NetworkStats, header.bifrost_network_stats },
+        .{ abi.Vec3, header.bifrost_vec3 },
+        .{ abi.Attribute, header.bifrost_attribute },
+        .{ abi.Gameplay, header.bifrost_gameplay },
+        .{ abi.Entity, header.bifrost_entity },
     }) |pair| {
         try std.testing.expectEqual(@sizeOf(pair[0]), @sizeOf(pair[1]));
         inline for (comptime std.meta.fieldNames(pair[0])) |field| {
@@ -466,13 +470,12 @@ test "the C header matches the Zig ABI" {
     try expectConstants(abi.SessionMode, "BIFROST_MODE_");
     try expectConstants(abi.ConnectionPhase, "BIFROST_CONNECTION_PHASE_");
     try expectConstants(abi.TransferState, "BIFROST_TRANSFER_STATE_");
-    inline for (comptime std.meta.declarations(abi.NetworkMetric)) |decl| {
-        const name = comptime upper: {
-            var buffer: [decl.len]u8 = undefined;
-            break :upper "BIFROST_NETWORK_" ++ std.ascii.upperString(&buffer, decl);
-        };
-        try std.testing.expectEqual(@field(abi.NetworkMetric, decl), @field(header, name));
-    }
+    try expectConstants(abi.PositionSource, "BIFROST_POSITION_");
+    try expectConstants(abi.AttributeKind, "BIFROST_ATTRIBUTE_");
+    try std.testing.expectEqual(abi.AttributeKind.count, header.BIFROST_ATTRIBUTE_COUNT);
+    try expectFlags(abi.NetworkMetric, "BIFROST_NETWORK_");
+    try expectFlags(abi.GameplayField, "BIFROST_GAMEPLAY_");
+    try expectFlags(abi.Movement, "BIFROST_MOVEMENT_");
     try std.testing.expectEqual(abi.api_revision, header.BIFROST_API_REVISION);
     try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .validated = true })), header.BIFROST_PACKET_VALIDATED);
     try std.testing.expectEqual(@as(u32, @bitCast(abi.PacketFlags{ .fields = true })), header.BIFROST_PACKET_FIELDS);
@@ -480,6 +483,18 @@ test "the C header matches the Zig ABI" {
     try std.testing.expectEqual(abi.no_backend, header.BIFROST_NO_BACKEND);
     try std.testing.expectEqual(abi.no_worker, header.BIFROST_NO_WORKER);
     try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .packets = true })), header.BIFROST_CAPABILITY_PACKETS);
+    try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .gameplay = true })), header.BIFROST_CAPABILITY_GAMEPLAY);
+    try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .entities = true })), header.BIFROST_CAPABILITY_ENTITIES);
+}
+
+fn expectFlags(comptime Flags: type, comptime prefix: []const u8) !void {
+    inline for (comptime std.meta.declarations(Flags)) |decl| {
+        const name = comptime upper: {
+            var buffer: [decl.len]u8 = undefined;
+            break :upper prefix ++ std.ascii.upperString(&buffer, decl);
+        };
+        try std.testing.expectEqual(@field(Flags, decl), @field(header, name));
+    }
 }
 
 fn expectConstants(comptime Enum: type, comptime prefix: []const u8) !void {
