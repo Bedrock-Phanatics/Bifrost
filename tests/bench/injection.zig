@@ -69,7 +69,8 @@ fn enqueue(player: abi.Player, bytes: []const u8, scheduler: *Scheduler) !void {
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
     var heap: harness.CountingAllocator = .{ .backing = gpa };
-    var plugins: bifrost.Plugins = try .init(heap.allocator(), &.{}, .{});
+    // A batch of 32 at 64 KiB is 2 MiB, past the default per-plugin quota
+    var plugins: bifrost.Plugins = try .init(heap.allocator(), &.{}, .{ .max_injection_bytes_per_plugin = 4 * 1024 * 1024 });
     defer plugins.deinit();
     try plugins.add(init, null);
     var scheduler: Scheduler = .{ .io = io };
@@ -141,4 +142,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![4]Result {
     }
     if (sink.delivered != expected) return error.MissingInjection;
     return results;
+}
+
+test "relay benchmark injection delivers every queued packet at every size" {
+    const results = try run(std.testing.allocator, std.testing.io, true);
+    for (results) |result| try std.testing.expectEqual(@as(u64, 0), result.retained_heap);
 }

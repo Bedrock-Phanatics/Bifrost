@@ -36,6 +36,7 @@ comptime {
         _ = bench_plugins;
         _ = bench_players;
         _ = bench_gameplay;
+        _ = bench_injection;
     }
 }
 
