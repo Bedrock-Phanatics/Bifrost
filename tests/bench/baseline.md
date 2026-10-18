@@ -1127,3 +1127,40 @@ cycles returning every byte; a silent client timed out at login; 6 parallel logi
 a 1 MiB-per-batch compression bomb ending only its sender; 600 queued backend messages held behind a player that
 stops acking for 1.5 s and then delivered in order; the same player cut off after `slow_player_timeout_ms`; a
 transfer refused past `max_concurrent`; and one plugin's message and injection quota leaving another's intact.
+
+## Final audit, 1.2.1-rc.3
+
+Recorded 2026-10-17 on WSL2 Ubuntu, 12 logical CPUs, Zig 0.17.0, ReleaseFast, work-stealing scheduling.
+`zig build bench -Doptimize=ReleaseFast` ran every default scenario. The injection scenario had been failing since
+the per-plugin quota landed, because one 32-packet batch at 64 KiB is 2 MiB against a 1 MiB plugin quota; the
+benchmark now raises its own quota and `bench-test` runs it.
+
+Passthrough against f9f55c9, the last commit before managed sessions, plugins and limits. Two alternating runs of
+`-- relay` in one session, round trips/s:
+
+| case | f9f55c9 run 1 / 2 | 1.2.1-rc.3 run 1 / 2 |
+|---|---|---|
+| 64 B 1x1 | 8716 / 7274 | 9069 / 8517 |
+| 512 B 1x1 | 9089 / 8312 | 6743 / 8857 |
+| 512 B 8x32 | 40562 / 39102 | 30678 / 39576 |
+| 8 KiB 1x1 | 5168 / 4660 | 3518 / 4231 |
+| 20 KiB 8x12 | 3008 / 2483 | 2417 / 2015 |
+| fresh proxy RSS | 3456 KiB | 4224 KiB |
+
+Small payloads are at parity once the noisy first run is set aside. Payloads of 8 KiB and up are 10 to 20% lower
+in both runs. A perf profile of the proxy during `relay` puts Bifrost's own frames (`Proxy.turn`,
+`Proxy.onMessage`, `Link.onBackendMessage`) at about 3% of proxy CPU; the rest is RakNet reliability and
+fragmentation, zio and syscalls, and the RakNet pin has moved since f9f55c9. Fresh RSS grew by 768 KiB.
+
+Plugin costs from the same full run, ns per packet: no plugins 0.2, ten plugins without subscriptions 0.2, one raw
+subscriber 34.7, one decoded subscriber 60.9, ten subscribers on other ids 64.7, one replacement 76.5, lazy typed
+read 85.6, typed text modification 179.5. Managed echo at 512 B 8x32 runs 21464 round trips/s with no plugins,
+20969 with ten idle plugins, 15142 with one raw subscriber and 10719 with gameplay and entity tracking. Player APIs:
+`player_info` 35.3 ns, network snapshot 38.5 ns, worker post 96.8 ns with one allocation. Joins/s at 2000 players
+1073 and 1017 over two waves, 221.2 KiB RSS and 269.7 KiB heap per held player, and churn rounds return to the same
+heap.
+
+Linux injection queue, ns per packet: 32 B 118.7, 1 KiB 168.0, 16 KiB 9765.6, 64 KiB 51886.7. The large cases are
+glibc giving the heap top back after each drained batch and faulting it in again; with
+`MALLOC_TRIM_THRESHOLD_=268435456 MALLOC_MMAP_THRESHOLD_=268435456` they drop to 645.4 and 3074.8. The proxy links
+glibc on Linux, so bursts of large injections pay this in production too. Text-sized injections are unaffected.
