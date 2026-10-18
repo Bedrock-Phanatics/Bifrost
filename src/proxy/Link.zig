@@ -19,6 +19,7 @@ const PacketQueue = @import("PacketQueue.zig");
 const Rate = @import("Rate.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
+const trace = @import("../trace.zig");
 
 const Link = @This();
 const log = std.log.scoped(.link);
@@ -124,7 +125,10 @@ pub fn destroy(self: *Link) void {
 pub fn connect(self: *Link) (error{NoBackendAvailable} || std.Io.ConcurrentError)!void {
     defer self.publishState();
     std.debug.assert(self.dial_task == null and self.backend == null);
-    const id = self.env.router.pick(self.tried, self.tried.count() >= max_dial_attempts) orelse return error.NoBackendAvailable;
+    const span = trace.zone(@src(), "routing");
+    const picked = self.env.router.pick(self.tried, self.tried.count() >= max_dial_attempts);
+    span.end();
+    const id = picked orelse return error.NoBackendAvailable;
     self.tried.add(id);
     self.backend_id = id;
     self.env.events.backendSelected(self.player, id.index());
@@ -318,6 +322,8 @@ pub fn service(self: *Link) error{Canceled}!void {
     };
     _ = self.watch.take(self.env.io);
     const client = self.backend orelse return;
+    const span = trace.zone(@src(), "backend io");
+    defer span.end();
 
     var drained = false;
     var paused = false;
@@ -544,6 +550,8 @@ fn ends(self: *Link, session: *raknet.Session) Managed.Ends {
 // Errors wait for the poll to end; returning one would drop the backend without telling it
 fn onBackendMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
     const self: *Link = @ptrCast(@alignCast(context));
+    const span = trace.zone(@src(), "backend packet");
+    defer span.end();
     defer self.publishState();
     if (self.backend_error != null) return;
     const session = self.session orelse return;

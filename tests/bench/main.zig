@@ -285,6 +285,7 @@ fn snapshot(io: std.Io, workers: *bifrost.Workers, heap: *const harness.Counting
         .session_bytes = totals.session_memory_bytes,
         .relayed = totals.managed_relayed_batches,
         .decoded = totals.managed_decoded_batches,
+        .allocations = heap.allocations.load(.monotonic),
         .workers = workers.proxies.len,
     };
     for (workers.proxies, 0..) |proxy, i| {
@@ -403,6 +404,7 @@ const RelayResult = struct {
     latency: Percentiles,
     lost: usize,
     cpu_pct: f64,
+    allocations: f64,
 };
 
 const RelayJob = struct {
@@ -472,6 +474,7 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
     var round_trips: [8]f64 = undefined;
     var throughput: [8]f64 = undefined;
     var lost: usize = 0;
+    var total_messages: u64 = 0;
     var cpu_before: Snapshot = .{};
     var measuring_since: u64 = 0;
     const iterations = env.iterations();
@@ -499,6 +502,7 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
             messages += job.recorder.messages;
             bytes += job.recorder.bytes;
             lost += @intFromBool(job.lost);
+            total_messages += job.recorder.messages;
             try latencies.appendSlice(gpa, job.recorder.latencies_ns.items);
         }
         const seconds = @as(f64, @floatFromInt(duration_ms)) / 1000;
@@ -513,6 +517,7 @@ fn relay(env: *Env, proxy: *Proxy, players: []Player, size: usize, window: usize
         .mib_s = .of(throughput[0..iterations]),
         .latency = .of(latencies.items),
         .lost = lost,
+        .allocations = @as(f64, @floatFromInt(cpu_after.allocations - cpu_before.allocations)) / @as(f64, @floatFromInt(@max(total_messages, 1))),
     };
 }
 
@@ -636,20 +641,20 @@ fn relayScenario(env: *Env) !void {
         \\1 worker, 1 backend. "1x1" is one player with one message in flight; "8xN" is 8 players with N in flight each.
         \\Round trips/s and MiB/s (one way) are median [min-max] over iterations; latency is round-trip in us.
         \\
-        \\| payload | load | round trips/s | MiB/s | p50 | p95 | p99 | proxy CPU | lost |
-        \\|---|---|---|---|---|---|---|---|---|
+        \\| payload | load | round trips/s | MiB/s | p50 | p95 | p99 | proxy CPU | allocs/rt | lost |
+        \\|---|---|---|---|---|---|---|---|---|---|
         \\
     , .{});
     for ([_]usize{ 64, 512, 8 * 1024, 20 * 1024 }) |size| {
         for ([_]bool{ false, true }) |loaded| {
             const window = if (loaded) windowFor(size) else 1;
             const result = try relay(env, &proxy, if (loaded) players else players[0..1], size, window);
-            try env.out.print("| {Bi} | {s}{d} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} [{d:.1}-{d:.1}] | {d:.0} | {d:.0} | {d:.0} | {d:.0}% | {d} |\n", .{
+            try env.out.print("| {Bi} | {s}{d} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} [{d:.1}-{d:.1}] | {d:.0} | {d:.0} | {d:.0} | {d:.0}% | {d:.2} | {d} |\n", .{
                 size,                      if (loaded) "8x" else "1x", window,
                 result.round_trips.median, result.round_trips.min,     result.round_trips.max,
                 result.mib_s.median,       result.mib_s.min,           result.mib_s.max,
                 result.latency.p50,        result.latency.p95,         result.latency.p99,
-                result.cpu_pct,            result.lost,
+                result.cpu_pct,            result.allocations,         result.lost,
             });
             try env.out.flush();
         }
@@ -1006,19 +1011,19 @@ fn managedScenario(env: *Env) !void {
         \\Two backends make transfers possible, so every batch is decoded for client state tracking; active transfers and
         \\runtime ID mapping always take that path. The decoded subscriber listens to player packets only.
         \\
-        \\| payload | load | setup | round trips/s | MiB/s | p50 us | p95 us | p99 us | proxy CPU | relayed |
-        \\|---|---|---|---|---|---|---|---|---|---|
+        \\| payload | load | setup | round trips/s | MiB/s | p50 us | p95 us | p99 us | proxy CPU | allocs/rt | relayed |
+        \\|---|---|---|---|---|---|---|---|---|---|---|
         \\
     , .{});
     for (managed_sizes, 0..) |size, s| for (0..2) |loaded| for (managed_setups, rows) |setup, setup_rows| {
         const row = setup_rows[s][loaded];
         const result = row.result;
-        try env.out.print("| {Bi} | {s}{d} | {s} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} | {d:.0} | {d:.0} | {d:.0} | {d:.0}% | {d:.0}% |\n", .{
+        try env.out.print("| {Bi} | {s}{d} | {s} | {d:.0} [{d:.0}-{d:.0}] | {d:.1} | {d:.0} | {d:.0} | {d:.0} | {d:.0}% | {d:.2} | {d:.0}% |\n", .{
             size,                   if (loaded == 1) "8x" else "1x", if (loaded == 1) windowFor(size) else 1,
             setup.name,             result.round_trips.median,       result.round_trips.min,
             result.round_trips.max, result.mib_s.median,             result.latency.p50,
             result.latency.p95,     result.latency.p99,              result.cpu_pct,
-            row.relayed_pct,
+            result.allocations,     row.relayed_pct,
         });
     };
     try env.out.print("\nJoin time per player:", .{});

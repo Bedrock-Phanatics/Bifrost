@@ -10,6 +10,7 @@ const Managed = @import("../session/Managed.zig");
 const Upstream = Managed.Upstream;
 const self_id = @import("../session/self_id.zig");
 const Budget = @import("../proxy/Budget.zig");
+const trace = @import("../trace.zig");
 const Stats = @import("../proxy/Stats.zig");
 const Events = @import("../plugin/Events.zig");
 const abi = @import("../plugin/abi.zig");
@@ -125,6 +126,8 @@ pub fn end(self: *Transfer, io: std.Io, stats: *Stats, event: State.Event) void 
 }
 
 pub fn service(self: *Transfer, host: Host) error{Canceled}!Result {
+    const span = trace.zone(@src(), "transfer");
+    defer span.end();
     if (self.dial_task) |*task| if (self.dial.finished()) |result| {
         task.await(host.io);
         self.dial_task = null;

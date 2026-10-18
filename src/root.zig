@@ -69,4 +69,5 @@ test {
     _ = @import("plugin/injection.zig");
     _ = @import("plugin/Work.zig");
     _ = @import("plugin/sdk.zig");
+    _ = @import("trace.zig");
 }

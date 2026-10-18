@@ -59,11 +59,27 @@ pub fn build(b: *std.Build) void {
             .{ .name = "bedwire", .module = ctx.bedwire },
         },
     });
+    addTracy(ctx);
 
     addProxy(ctx);
     const plugin = addPluginSdk(ctx);
     addTests(ctx, plugin);
     addBench(ctx, plugin.packet_filter);
+}
+
+fn addTracy(ctx: Context) void {
+    const b = ctx.b;
+    const enabled = b.option(bool, "tracy", "Build with Tracy profiler zones") orelse false;
+    const options = b.addOptions();
+    options.addOption(bool, "tracy", enabled);
+    ctx.bifrost.addImport("build_options", options.createModule());
+    if (!enabled) return;
+    const tracy = b.lazyDependency("tracy", .{}) orelse return;
+    ctx.bifrost.link_libcpp = true;
+    ctx.bifrost.addCSourceFile(.{ .file = tracy.path("public/TracyClient.cpp"), .flags = &.{ "-DTRACY_ENABLE", "-fno-sanitize=undefined", "-w" } });
+    if (ctx.target.result.os.tag == .windows) {
+        for ([_][]const u8{ "ws2_32", "dbghelp", "advapi32", "user32", "secur32" }) |name| ctx.bifrost.linkSystemLibrary(name, .{});
+    }
 }
 
 fn addProxy(ctx: Context) void {

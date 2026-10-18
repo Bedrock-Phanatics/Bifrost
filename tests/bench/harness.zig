@@ -41,10 +41,11 @@ pub const Snapshot = struct {
     session_bytes: u64 = 0,
     relayed: u64 = 0,
     decoded: u64 = 0,
+    allocations: u64 = 0,
     per_worker: [max_workers]u64 = @splat(0),
     workers: usize = 0,
 
-    const scalar_fields = 14;
+    const scalar_fields = 15;
 
     pub fn write(self: Snapshot, w: *std.Io.Writer) !void {
         inline for (@typeInfo(Snapshot).@"struct".field_names[0..scalar_fields]) |name| try w.print("{d} ", .{@field(self, name)});

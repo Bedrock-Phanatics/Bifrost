@@ -63,6 +63,9 @@ zig build test
 zig build bench -Doptimize=ReleaseFast
 ```
 
+`-Dtracy=true` builds with [Tracy](https://github.com/wolfpld/tracy) v0.13 profiler zones. Leave it off for
+production; disabled zones compile to nothing and Tracy isn't fetched.
+
 ## License
 
 Licensed under the [GNU AGPLv3](LICENSE).

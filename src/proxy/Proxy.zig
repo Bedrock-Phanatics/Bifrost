@@ -22,6 +22,7 @@ const Handles = Plugins.Handles;
 const abi = @import("../plugin/abi.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
+const trace = @import("../trace.zig");
 
 const Proxy = @This();
 const log = std.log.scoped(.proxy);
@@ -316,7 +317,11 @@ fn turn(self: *Proxy) void {
 
     if (self.health_changed.swap(false, .acquire)) self.refreshAdvertisement();
     self.drainMailbox();
-    self.env.events.drain(self.io, self);
+    {
+        const span = trace.zone(@src(), "plugin queue");
+        defer span.end();
+        self.env.events.drain(self.io, self);
+    }
     const listener_ready = self.listener_watch.take(self.io);
     if (listener_ready or self.listener_busy) self.pollListener();
     self.scheduler.resumeDrained();
@@ -347,6 +352,8 @@ fn refreshAdvertisement(self: *Proxy) void {
 }
 
 fn pollListener(self: *Proxy) void {
+    const span = trace.zone(@src(), "raknet receive");
+    defer span.end();
     const result = self.listener.poll(no_wait, .{
         .context = self,
         .connected = onConnected,
@@ -420,6 +427,8 @@ fn linkOf(session: *const raknet.Session) ?*Link {
 
 fn onMessage(_: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
     const link = linkOf(session) orelse return error.ApplicationFailure;
+    const span = trace.zone(@src(), "player packet");
+    defer span.end();
     link.forwardToBackend(payload.bytes) catch |err| {
         log.debug("dropping player: {t}", .{err});
         _ = link.disconnect("");

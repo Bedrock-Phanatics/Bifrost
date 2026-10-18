@@ -1,5 +1,6 @@
 const std = @import("std");
 const Work = @import("Work.zig");
+const trace = @import("../trace.zig");
 
 const Pool = @This();
 
@@ -78,6 +79,7 @@ fn pop(self: *Pool) ?*Work.Task {
 }
 
 fn loop(self: *Pool) void {
+    trace.threadName("plugin worker");
     while (true) {
         const seen = self.signal.load(.acquire);
         self.enter();
@@ -85,7 +87,11 @@ fn loop(self: *Pool) void {
         const task = if (stopping) null else self.pop();
         self.leave();
         if (stopping) return;
-        if (task) |next| self.run(self.context, next) else io.futexWaitUncancelable(u32, &self.signal.raw, seen);
+        if (task) |next| {
+            const span = trace.zone(@src(), "plugin task");
+            defer span.end();
+            self.run(self.context, next);
+        } else io.futexWaitUncancelable(u32, &self.signal.raw, seen);
     }
 }
 

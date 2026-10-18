@@ -2,6 +2,7 @@ const std = @import("std");
 const protocol = @import("bedwire").protocol;
 const abi = @import("abi.zig");
 const Work = @import("Work.zig");
+const trace = @import("../trace.zig");
 pub const Decoded = @import("Decoded.zig");
 
 const log = std.log.scoped(.plugin);
@@ -122,6 +123,8 @@ pub const Result = union(enum) {
 
 // The replacement lives in scratch until the next run
 pub fn run(table: *const Table, call: Call, id: u10, bytes: []const u8, scratch: []u8, checker: anytype) Result {
+    const span = trace.zone(@src(), "plugin dispatch");
+    defer span.end();
     const range = table.ranges[id];
     const fields = if (call.in_game) range.fields_in_game else range.fields_before_game;
     return if (fields) dispatch(true, table, call, id, bytes, scratch, checker) else dispatch(false, table, call, id, bytes, scratch, checker);

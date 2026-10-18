@@ -18,6 +18,7 @@ const Handoff = @import("../transfer/Handoff.zig");
 const Plugins = @import("../plugin/Plugins.zig");
 const Packets = Plugins.Packets;
 const abi = @import("../plugin/abi.zig");
+const trace = @import("../trace.zig");
 
 const protocol = bedwire.protocol;
 const Current = protocol.Current;
@@ -227,6 +228,8 @@ const Batch = struct {
         // Plugins and ClientState see the client's ids in both directions
         const ids = self.managed.idSwap();
         if (self.to_player) if (ids) |swap| {
+            const span = trace.zone(@src(), "packet modification");
+            defer span.end();
             packet = try swap.apply(shared.translated.allocator(), kind, packet, protocolLimits()) orelse packet;
         };
         if (self.table) |table| if (Packets.packetId(packet)) |id| {
@@ -416,6 +419,8 @@ fn advertise(self: *Managed, arena: std.mem.Allocator, plugins: *const Plugins, 
 }
 
 fn relay(source: anytype, dest: anytype, sink: anytype, stats: *Stats, comptime counter: std.meta.FieldEnum(Stats), payload: []const u8) !bool {
+    const span = trace.zone(@src(), "opaque relay");
+    defer span.end();
     const frame = source.relayTo(dest, payload) catch |err| switch (err) {
         error.IncompatibleRelay => {
             stats.bump(.managed_relay_incompatible, 1);
@@ -440,7 +445,9 @@ pub fn fromPlayer(self: *Managed, ends: Ends, payload: []const u8) !void {
     };
     ends.stats.bump(.managed_decoded_batches, 1);
     ends.stats.bump(.managed_decoded_bytes, payload.len);
+    const span = trace.zone(@src(), "bedwire ingest");
     var packets = try self.player.ingest(payload);
+    span.end();
     defer packets.deinit();
     if (!self.inbound.take(Packets.now(ends.io) / std.time.ns_per_ms, packets.reader.bytes.len)) {
         ends.stats.bump(.player_floods, 1);
@@ -468,7 +475,9 @@ pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
     }
     ends.stats.bump(.managed_decoded_batches, 1);
     ends.stats.bump(.managed_decoded_bytes, payload.len);
+    const span = trace.zone(@src(), "bedwire ingest");
     var packets = try self.upstream.session.ingest(payload);
+    span.end();
     defer packets.deinit();
     if (self.upstream.phase == .ready) return self.relayFromBackend(ends, &packets);
 
@@ -654,6 +663,8 @@ pub fn send(session: anytype, sink: anytype, stats: *Stats, comptime counter: st
     var chunk = packets.len;
     while (rest.len != 0) {
         const count = @min(chunk, rest.len);
+        const span = trace.zone(@src(), "bedwire encode");
+        defer span.end();
         const frame = session.encode(rest[0..count]) catch |err| {
             if (err == error.NoSpaceLeft and count > 1) {
                 chunk = count / 2;
