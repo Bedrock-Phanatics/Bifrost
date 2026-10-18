@@ -5,7 +5,7 @@ Each plugin is one normal native shared library containing its code and embedded
 ```text
 plugins/
   Maintenance.so
-  Greeter.so
+  ChatGuard.so
   PacketFilter.so
 ```
 
@@ -17,9 +17,9 @@ Directory packages are rejected. There are no archives, extraction caches or run
 Keep this as a source file named `plugin.toml`:
 
 ```toml
-name = "Greeter"
+name = "ChatGuard"
 version = "1.0.0"
-description = "Logs a welcome for every player"
+description = "Blocks chat with banned words, warns the sender and removes repeat offenders"
 ```
 
 All three fields are required strings. Name and version must each be 1 to 64 bytes, and description 1 to
@@ -89,21 +89,21 @@ The SDK exports both functions and preserves the manifest name/version defaults.
 `bifrost.manifest(@embedFile("plugin.toml"))` as its manifest export.
 
 Run `zig build` with the repository's Zig 0.17.0 toolchain. It compiles the Zig and C++23 examples and
-installs only their libraries under `zig-out/plugins/`. Windows output is `Maintenance.dll`, `Greeter.dll`
+installs only their libraries under `zig-out/plugins/`. Windows output is `Maintenance.dll`, `ChatGuard.dll`
 and `PacketFilter.dll`. Third-party builds can import the dependency's `bifrost_plugin` module and use
 `addLibrary` with `.linkage = .dynamic`, as in [`build.zig`](../build.zig). No Zig runtime files are needed.
 
 ## C++23 and CMake
 
-[`examples/greeter`](../examples/greeter) contains a complete C++23 CMake project:
+[`examples/chatguard`](../examples/chatguard) contains a complete C++23 CMake project:
 
 ```sh
-cmake -S examples/greeter -B build/greeter -DCMAKE_BUILD_TYPE=Release
-cmake --build build/greeter --config Release
-cmake --install build/greeter --config Release --prefix ./stage
+cmake -S examples/chatguard -B build/chatguard -DCMAKE_BUILD_TYPE=Release
+cmake --build build/chatguard --config Release
+cmake --install build/chatguard --config Release --prefix ./stage
 ```
 
-Copy `stage/plugins/Greeter.so`, `.dll` or `.dylib` into `plugins/`. Use a compiler and standard library
+Copy `stage/plugins/ChatGuard.so`, `.dll` or `.dylib` into `plugins/`. Use a compiler and standard library
 with C++23 `std::format` support.
 
 For another project, include [`cmake/BifrostPlugin.cmake`](../cmake/BifrostPlugin.cmake), create a shared
@@ -114,7 +114,7 @@ The Zig build uses the same header template and also tracks manifest content cha
 
 MSVC, Clang and GCC can use this interface. Keep classes, containers, allocators and exceptions inside
 the binary. All exports and callbacks use the existing C ABI, with `extern "C"` and `noexcept` in C++.
-Catch exceptions inside callbacks where recovery is possible. The Greeter uses PascalCase classes
+Catch exceptions inside callbacks where recovery is possible. ChatGuard uses PascalCase classes
 and camelCase members.
 
 ## C
@@ -136,7 +136,7 @@ Use a CMake shared library target and the same `bifrost_embed_manifest` call. Th
 
 ## Dependencies and trust
 
-Link private dependencies statically where licensing and platform support permit. The CMake Greeter
+Link private dependencies statically where licensing and platform support permit. The CMake ChatGuard
 uses the static MSVC runtime and static GCC/C++ runtimes on MinGW. System libraries, platform runtimes
 and some private dependencies still require external installation.
 
@@ -175,11 +175,27 @@ replacement buffer. The `packet-dispatch` benchmark measures raw-text and chat p
 player-name lookup. This example limits client requests; backend view-distance policy remains the backend's
 responsibility.
 
+## A complete C++23 plugin
+
+[`examples/chatguard/ChatGuard.cpp`](../examples/chatguard/ChatGuard.cpp) uses most of the API in about 150 lines:
+
+- Name, version and description come from the embedded `plugin.toml`; `shutdown` logs totals.
+- `PLAYER_AUTHENTICATED` and `PLAYER_DISCONNECTED` events, with a copied `player_info` snapshot on join.
+- An in-game client Text subscription with `BIFROST_PACKET_FIELDS`, decoded through `decode_packet`.
+- Chat containing a banned word is canceled. The sender gets a raw Text warning built with `encode_packet`
+  and queued with `send_packet`, which copies the bytes before the callback cancels.
+- The third strike queues `disconnect` with a reason.
+
+Strike counts live in one map per worker, because a player's packets and events always arrive on that
+player's worker, so no lock is needed. Allocation failures are caught inside the callback. The integration
+test `the C++ chat guard example warns, cancels and finally removes a player` loads the built library
+through the managed proxy.
+
 ## Player information and actions
 
-The [Greeter](../examples/greeter/Greeter.cpp) feature-checks copied player information and posts a networking
-query to the player's worker. The C ABI also offers queued disconnect and backend-transfer actions from any
-thread. Zig uses `host.playerInfo`, `host.networkStats`, `host.disconnect` and `host.requestTransfer`.
+The C ABI offers copied player information from any thread, networking snapshots on the player's worker
+(post to get there) and queued disconnect and backend-transfer actions from any thread. Zig uses
+`host.playerInfo`, `host.networkStats`, `host.disconnect` and `host.requestTransfer`.
 Networking fields carry availability bits; unsupported measurements are never presented as zero measurements.
 See [the player API contract](plugin-abi.md#copied-player-information) for lifetimes, statuses, transfer semantics,
 disconnect-reason limitations and the phase-change event. Run `zig build bench -Doptimize=ReleaseFast -- players --quick`

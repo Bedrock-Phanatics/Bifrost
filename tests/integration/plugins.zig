@@ -950,6 +950,64 @@ test "the C++ packet example enforces Bedrock limits and player context across t
     try sendFilteredPackets(rig.player, &rig.b);
 }
 
+fn chatPacket(buffer: []u8, message: []const u8) ![]const u8 {
+    return managed.typedPacket(buffer, .{ .text = .{ .localize = false, .body = .{ .author_and_message = .{ .message_type = .chat, .player_name = "Steve", .message = message } }, .senders_xuid = "", .platform_id = "", .filtered_message = null } });
+}
+
+test "the C++ chat guard example warns, cancels and finally removes a player" {
+    var files: NativePlugins = try .init();
+    defer files.deinit();
+    const path = try files.add("ChatGuard", test_options.chat_guard);
+    defer gpa.free(path);
+    var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
+    defer plugins.deinit();
+    try files.load(&plugins, "ChatGuard");
+    try std.testing.expectEqualStrings("ChatGuard", plugins.metadata(0).name());
+    var rig: Rig = undefined;
+    try rig.start(.{ .plugins = &plugins });
+    defer rig.deinit();
+    var buffers: [2][128]u8 = undefined;
+    for ([_]u32{ 2, 1 }) |left| {
+        try rig.player.send(&.{ try chatPacket(&buffers[0], "Free Robux here"), try chatPacket(&buffers[1], "hello") });
+        var expected: [96]u8 = undefined;
+        const warning = try std.fmt.bufPrint(&expected, "That message was blocked. {d} more and you will be removed.", .{left});
+        var warned = false;
+        var echoed = false;
+        while (!warned or !echoed) {
+            var packets = try rig.player.receive();
+            defer packets.deinit();
+            while (packets.next()) |packet| switch ((try rig.player.session.decodePacket(packet)).value.typed.text.body) {
+                .message_only => |body| {
+                    try std.testing.expect(!warned);
+                    try std.testing.expectEqualStrings(warning, body.message);
+                    warned = true;
+                },
+                .author_and_message => |body| {
+                    try std.testing.expect(!echoed);
+                    try std.testing.expectEqualStrings("hello", body.message);
+                    echoed = true;
+                },
+                else => return error.UnexpectedPacket,
+            };
+        }
+    }
+    try rig.player.send(&.{try chatPacket(&buffers[0], "griefing time")});
+    var removed = false;
+    for (0..8) |_| {
+        var packets = try rig.player.receive();
+        defer packets.deinit();
+        while (packets.next()) |packet| {
+            if (packet.kind != .disconnect) return error.UnexpectedPacket;
+            const message = (try rig.player.session.decodePacket(packet)).value.typed.disconnect.messages.messages.message;
+            try std.testing.expectEqualStrings("Removed for repeated blocked messages", message);
+            removed = true;
+        }
+        if (removed) break;
+    }
+    try std.testing.expect(removed);
+    try std.testing.expectEqual(@as(u64, 0), plugins.totals(0).errors);
+}
+
 const Injector = struct {
     var completed: std.atomic.Value(u32) = .init(0);
     var failed: std.atomic.Value(u32) = .init(0);

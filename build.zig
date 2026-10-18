@@ -20,6 +20,7 @@ const Context = struct {
 
 const Plugin = struct {
     example: *std.Build.Step.Compile,
+    chat_guard: *std.Build.Step.Compile,
     c_fixture: *std.Build.Step.Compile,
     cpp_fixture: *std.Build.Step.Compile,
     no_entry: *std.Build.Step.Compile,
@@ -87,15 +88,15 @@ fn addPluginSdk(ctx: Context) Plugin {
         .{ .name = "bifrost_plugin", .module = sdk },
     }) });
     installPlugin(ctx, example, "Maintenance");
-    const greeter = b.addLibrary(.{ .name = "Greeter", .linkage = .dynamic, .root_module = b.createModule(.{
+    const chat_guard = b.addLibrary(.{ .name = "ChatGuard", .linkage = .dynamic, .root_module = b.createModule(.{
         .target = ctx.target,
         .optimize = ctx.optimize,
         .link_libcpp = true,
     }) });
-    greeter.root_module.addCSourceFile(.{ .file = b.path("examples/greeter/Greeter.cpp"), .flags = &.{ "-std=c++23", "-Wall", "-Wextra", "-Werror" } });
-    greeter.root_module.addIncludePath(b.path("include"));
-    embedManifest(b, greeter, "examples/greeter/plugin.toml");
-    installPlugin(ctx, greeter, "Greeter");
+    chat_guard.root_module.addCSourceFile(.{ .file = b.path("examples/chatguard/ChatGuard.cpp"), .flags = &.{ "-std=c++23", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror" } });
+    chat_guard.root_module.addIncludePath(b.path("include"));
+    embedManifest(b, chat_guard, "examples/chatguard/plugin.toml");
+    installPlugin(ctx, chat_guard, "ChatGuard");
     const packet_filter = b.addLibrary(.{ .name = "PacketFilter", .linkage = .dynamic, .root_module = b.createModule(.{ .target = ctx.target, .optimize = ctx.optimize, .link_libcpp = true }) });
     packet_filter.root_module.addCSourceFile(.{ .file = b.path("examples/packets/PacketFilter.cpp"), .flags = &.{ "-std=c++23", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror" } });
     packet_filter.root_module.addIncludePath(b.path("include"));
@@ -145,7 +146,7 @@ fn addPluginSdk(ctx: Context) Plugin {
     const rejected = b.addLibrary(.{ .name = "rejected", .linkage = .dynamic, .root_module = ctx.module("tests/plugin/rejected.zig", &.{
         .{ .name = "bifrost_plugin", .module = sdk },
     }) });
-    return .{ .no_manifest = no_manifest, .rejected = rejected, .example = example, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .no_entry = no_entry, .packet_filter = packet_filter, .filter_test = filter_test, .header = header.createModule() };
+    return .{ .no_manifest = no_manifest, .rejected = rejected, .example = example, .chat_guard = chat_guard, .c_fixture = c_fixture, .cpp_fixture = cpp_fixture, .no_entry = no_entry, .packet_filter = packet_filter, .filter_test = filter_test, .header = header.createModule() };
 }
 
 fn installPlugin(ctx: Context, library: *std.Build.Step.Compile, name: []const u8) void {
@@ -199,6 +200,7 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     options.addOptionPath("no_manifest_library", plugin.no_manifest.getEmittedBin());
     options.addOptionPath("rejected_plugin", plugin.rejected.getEmittedBin());
     options.addOptionPath("packet_filter", plugin.packet_filter.getEmittedBin());
+    options.addOptionPath("chat_guard", plugin.chat_guard.getEmittedBin());
     integration_tests.root_module.addImport("test_options", options.createModule());
 
     const step = b.step("test", "Run unit and integration tests");

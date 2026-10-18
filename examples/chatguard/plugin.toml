@@ -1,0 +1,3 @@
+name = "ChatGuard"
+version = "1.0.0"
+description = "Blocks chat with banned words, warns the sender and removes repeat offenders"
