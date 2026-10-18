@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const loader = @import("config/loader.zig");
 const Observer = @import("protocol/Observer.zig");
 
@@ -23,6 +24,16 @@ pub const Plugins = @import("plugin/Plugins.zig");
 pub const plugin_abi = @import("plugin/abi.zig");
 pub const loadProxyKey = @import("session/proxy_key.zig").load;
 pub const proxyKeyText = @import("session/proxy_key.zig").publicText;
+
+// glibc gives the heap top back after every burst of frees and faults it in again on the next one,
+// so keep a few MiB of slack
+pub fn tuneAllocator() void {
+    if (comptime builtin.os.tag != .linux or !builtin.abi.isGnu() or !builtin.link_libc) return;
+    const top_pad = -2;
+    _ = mallopt(top_pad, 4 * 1024 * 1024);
+}
+
+extern "c" fn mallopt(param: c_int, value: c_int) c_int;
 
 test {
     _ = Proxy;

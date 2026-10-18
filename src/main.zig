@@ -12,6 +12,7 @@ pub const std_options: std.Options = .{
 const config_path = "config/bifrost.toml";
 
 pub fn main(init: std.process.Init) !void {
+    bifrost.tuneAllocator();
     const config = loadConfig(init);
 
     var keys: ?bifrost.KeySet = if (config.keysFile()) |keys_path| bifrost.loadKeys(init.gpa, init.io, keys_path) catch |err|

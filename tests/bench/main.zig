@@ -49,6 +49,7 @@ const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", 
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
+    bifrost.tuneAllocator();
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len >= 2 and std.mem.eql(u8, args[1], "proxy")) return serveProxy(init, args[2..]);
