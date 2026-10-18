@@ -449,6 +449,7 @@ test "the C header matches the Zig ABI" {
         .{ abi.Entity, header.bifrost_entity },
     }) |pair| {
         try std.testing.expectEqual(@sizeOf(pair[0]), @sizeOf(pair[1]));
+        try std.testing.expectEqual(@alignOf(pair[0]), @alignOf(pair[1]));
         inline for (comptime std.meta.fieldNames(pair[0])) |field| {
             try std.testing.expectEqual(@offsetOf(pair[0], field), @offsetOf(pair[1], field));
         }
@@ -482,9 +483,17 @@ test "the C header matches the Zig ABI" {
     try std.testing.expectEqual(abi.version, header.BIFROST_ABI_VERSION);
     try std.testing.expectEqual(abi.no_backend, header.BIFROST_NO_BACKEND);
     try std.testing.expectEqual(abi.no_worker, header.BIFROST_NO_WORKER);
-    try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .packets = true })), header.BIFROST_CAPABILITY_PACKETS);
-    try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .gameplay = true })), header.BIFROST_CAPABILITY_GAMEPLAY);
-    try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities{ .entities = true })), header.BIFROST_CAPABILITY_ENTITIES);
+    inline for (comptime std.meta.fieldNames(abi.Capabilities)[0 .. std.meta.fieldNames(abi.Capabilities).len - 1]) |field| {
+        var capability: abi.Capabilities = .{};
+        @field(capability, field) = true;
+        const name = comptime upper: {
+            var buffer: [field.len]u8 = undefined;
+            break :upper "BIFROST_CAPABILITY_" ++ std.ascii.upperString(&buffer, field);
+        };
+        try std.testing.expectEqual(@as(u64, @bitCast(capability)), @field(header, name));
+    }
+    try std.testing.expectEqual(@as(u64, @bitCast(abi.Capabilities.supported)), header.BIFROST_CAPABILITY_EVENTS | header.BIFROST_CAPABILITY_COMMANDS |
+        header.BIFROST_CAPABILITY_PACKETS | header.BIFROST_CAPABILITY_TASKS | header.BIFROST_CAPABILITY_GAMEPLAY | header.BIFROST_CAPABILITY_ENTITIES);
 }
 
 fn expectFlags(comptime Flags: type, comptime prefix: []const u8) !void {
