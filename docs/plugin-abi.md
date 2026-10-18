@@ -399,6 +399,22 @@ notifications and avoid extra decoding or disabling the existing relay fast path
 invented from unsupported measurements. Command name validation, autocomplete-only permissions, plugin-attributed
 logs and rate-limited slow-callback diagnostics retain their existing behavior; no new permission or alert framework is added.
 
+## Known limitations
+
+- Plugins load once at startup and unload at shutdown. There is no hot reload, and a crashing or hanging plugin
+  takes the proxy with it.
+- Packet hooks, commands, messages and injection need managed mode. Passthrough only gets events, player
+  information, networking snapshots and the RakNet-level disconnect.
+- Typed fields cover Text and RequestChunkRadius, and injection accepts only those two. Other packets are raw bytes.
+- Every hook, command or tracking capability that needs in-game batches turns off the opaque relay for that
+  direction, and with more than one backend every batch is decoded anyway for transfers.
+- `run` callbacks share one pool of `[limits] plugin_task_threads` threads (128 tasks in total, 32 per plugin), so a blocking
+  task delays everyone's.
+- Player-side networking rates, jitter, duplicate, out-of-order and anomaly counts are not available.
+- Gameplay and entity data are what the proxy saw, never authoritative, and there are no world or collision queries.
+- The managed pipeline is tested against bedwire's client and backend in this repository. Behaviour with every
+  real Bedrock client and server build is not verified here.
+
 ## Versioning
 
 - `BIFROST_ABI_VERSION` changes only for a breaking change. Each side checks the other's `abi_version` and refuses
