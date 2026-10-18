@@ -50,7 +50,8 @@ test "threads sharing a budget stay within it and drain to zero" {
                     budget.release(held[slot]);
                     held[slot] = 0;
                 }
-                const amount = random.random().uintAtMost(usize, 300);
+                // One thread alone can pass the limit, so refusals happen even if the threads never overlap
+                const amount = random.random().uintAtMost(usize, 600);
                 if (budget.reserve(amount)) held[slot] = amount;
                 _ = peak.fetchMax(budget.used.load(.monotonic), .monotonic);
             }
