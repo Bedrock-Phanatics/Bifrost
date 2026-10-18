@@ -1164,3 +1164,28 @@ Linux injection queue, ns per packet: 32 B 118.7, 1 KiB 168.0, 16 KiB 9765.6, 64
 glibc giving the heap top back after each drained batch and faulting it in again; with
 `MALLOC_TRIM_THRESHOLD_=268435456 MALLOC_MMAP_THRESHOLD_=268435456` they drop to 645.4 and 3074.8. The proxy links
 glibc on Linux, so bursts of large injections pay this in production too. Text-sized injections are unaffected.
+
+## glibc top pad
+
+Recorded 2026-10-17 on the same WSL2 host, ReleaseFast. On glibc the proxy and bench now call
+`mallopt(M_TOP_PAD, 4 MiB)` at startup, so a burst of large frees no longer hands the heap top back only to fault
+it in again. musl, macOS and Windows are untouched.
+
+Injection queue, ns per packet: 16 KiB 9765.6 -> 639.9, 64 KiB 51886.7 -> 2502.7; 32 B and 1 KiB unchanged.
+
+Whole proxy, `-- connections managed`, alternating control / pad / control / pad with `MALLOC_TOP_PAD_` standing
+in for the call:
+
+| case | control 1 / 2 | 4 MiB pad 1 / 2 |
+|---|---|---|
+| joins/s, 2000 players wave 1 | 816 / 981 | 934 / 1077 |
+| managed 256 B 8x32, transfers possible | 11793 / 12879 | 12949 / 12590 |
+| managed 256 B 8x32, relayed | 26114 / 28891 | 28575 / 28426 |
+| managed 8 KiB 8x32, transfers possible | 1612 / 1942 | 1942 / 1925 |
+| managed 20 KiB 8x12, 1 decoded subscriber | 1017 / 1151 | 1045 / 1131 |
+| RSS per held player, 2000 players | 221.1 / 221.5 KiB | 221.3 / 221.3 KiB |
+| heap after each churn round | 4658873 B | 4658873 B |
+
+The first control run was slow across the board, so the throughput rows are noise; the second pair is level.
+Memory per player and after churn is the same. Setting the pad also turns off glibc's adaptive mmap threshold,
+which none of these cases showed a cost for.

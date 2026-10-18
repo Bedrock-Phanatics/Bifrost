@@ -410,9 +410,6 @@ logs and rate-limited slow-callback diagnostics retain their existing behavior; 
   direction, and with more than one backend every batch is decoded anyway for transfers.
 - `run` callbacks share one pool of `[limits] plugin_task_threads` threads (128 tasks in total, 32 per plugin), so a blocking
   task delays everyone's.
-- Each injection is one heap allocation. On Linux, glibc can hand freed memory back after a burst of large
-  injections and fault it in again on the next one, about 10 us for each 16 KiB packet instead of under 1 us; see
-  the final audit in [`baseline.md`](../tests/bench/baseline.md).
 - Player-side networking rates, jitter, duplicate, out-of-order and anomaly counts are not available.
 - Gameplay and entity data are what the proxy saw, never authoritative, and there are no world or collision queries.
 - The managed pipeline is tested against bedwire's client and backend in this repository. Behaviour with every
