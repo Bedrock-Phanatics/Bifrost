@@ -68,7 +68,7 @@ callbacks before shutdown hooks and library unloading, in reverse load order.
 
 ## Zig
 
-[`examples/maintenance.zig`](../examples/maintenance.zig) is a complete working example. A minimal plugin is:
+[`examples/maintenance/maintenance.zig`](../examples/maintenance/maintenance.zig) is a complete working example. A minimal plugin is:
 
 ```zig
 const bifrost = @import("bifrost_plugin");

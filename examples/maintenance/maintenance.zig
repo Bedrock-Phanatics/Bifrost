@@ -1,7 +1,7 @@
 const std = @import("std");
 const bifrost = @import("bifrost_plugin");
 
-pub const manifest = @embedFile("maintenance/plugin.toml");
+pub const manifest = @embedFile("plugin.toml");
 
 var host: bifrost.Host = undefined;
 

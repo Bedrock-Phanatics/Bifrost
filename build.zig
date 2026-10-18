@@ -84,7 +84,7 @@ fn addProxy(ctx: Context) void {
 fn addPluginSdk(ctx: Context) Plugin {
     const b = ctx.b;
     const sdk = b.addModule("bifrost_plugin", .{ .root_source_file = b.path("src/plugin/sdk.zig") });
-    const example = b.addLibrary(.{ .name = "maintenance", .linkage = .dynamic, .root_module = ctx.module("examples/maintenance.zig", &.{
+    const example = b.addLibrary(.{ .name = "maintenance", .linkage = .dynamic, .root_module = ctx.module("examples/maintenance/maintenance.zig", &.{
         .{ .name = "bifrost_plugin", .module = sdk },
     }) });
     installPlugin(ctx, example, "Maintenance");
