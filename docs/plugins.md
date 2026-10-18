@@ -68,7 +68,7 @@ callbacks before shutdown hooks and library unloading, in reverse load order.
 
 ## Zig
 
-[`examples/maintenance/maintenance.zig`](../examples/maintenance/maintenance.zig) is a complete working example. A minimal plugin is:
+[`examples/maintenance/src/maintenance.zig`](../examples/maintenance/src/maintenance.zig) is a complete working example. A minimal plugin is:
 
 ```zig
 const bifrost = @import("bifrost_plugin");
@@ -82,6 +82,13 @@ comptime {
 pub fn init(host: bifrost.Host) !void {
     host.log(.info, "plugin started", .{});
 }
+```
+
+Every example keeps `plugin.toml` at the top of its directory and the code under `src/`. Zig can't embed a
+file above the module's own directory, so the build hands the manifest in as an import:
+
+```zig
+plugin.root_module.addAnonymousImport("plugin.toml", .{ .root_source_file = b.path("plugin.toml") });
 ```
 
 The SDK exports both functions and preserves the manifest name/version defaults. Optional `name` and
@@ -156,7 +163,7 @@ Legacy `[[plugin]] path` configuration is also rejected.
 
 ## Packet filtering
 
-[`examples/packets/PacketFilter.cpp`](../examples/packets/PacketFilter.cpp) is a C++23 native plugin that drops
+[`examples/packets/src/PacketFilter.cpp`](../examples/packets/src/PacketFilter.cpp) is a C++23 native plugin that drops
 client chat over 512 bytes, replaces chat authors with the player name Bifrost reports, and caps requested and
 maximum chunk radius at 12. Negative radius requests are canceled. Change the two constants to suit the server;
 these are example policies, not Bedrock protocol limits.
@@ -177,7 +184,7 @@ responsibility.
 
 ## A complete C++23 plugin
 
-[`examples/chatguard/ChatGuard.cpp`](../examples/chatguard/ChatGuard.cpp) uses most of the API in about 150 lines:
+[`examples/chatguard/src/ChatGuard.cpp`](../examples/chatguard/src/ChatGuard.cpp) uses most of the API in about 150 lines:
 
 - Name, version and description come from the embedded `plugin.toml`; `shutdown` logs totals.
 - `PLAYER_AUTHENTICATED` and `PLAYER_DISCONNECTED` events, with a copied `player_info` snapshot on join.

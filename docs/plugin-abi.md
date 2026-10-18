@@ -179,7 +179,7 @@ phase. Native code must provide valid memory for every pointer and declared leng
 
 The Zig SDK exposes `host.decodePacket(packet, sdk.Text)` and `host.encodePacket(packet, text)`, also accepting
 `sdk.ChunkRadius`. Older hosts return `error.Unsupported` without reading missing function pointers.
-[`PacketFilter.cpp`](../examples/packets/PacketFilter.cpp) demonstrates subscriptions, lazy decoding, cancellation,
+[`PacketFilter.cpp`](../examples/packets/src/PacketFilter.cpp) demonstrates subscriptions, lazy decoding, cancellation,
 typed text replacement and packet injection in C++23.
 
 ### Packet injection

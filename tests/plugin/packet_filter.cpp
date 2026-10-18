@@ -2,7 +2,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
-#include "../../examples/packets/PacketFilter.cpp"
+#include "../../examples/packets/src/PacketFilter.cpp"
 
 #define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "packet filter check failed at line %d\n", __LINE__); std::abort(); } } while (false)
 

@@ -84,21 +84,22 @@ fn addProxy(ctx: Context) void {
 fn addPluginSdk(ctx: Context) Plugin {
     const b = ctx.b;
     const sdk = b.addModule("bifrost_plugin", .{ .root_source_file = b.path("src/plugin/sdk.zig") });
-    const example = b.addLibrary(.{ .name = "maintenance", .linkage = .dynamic, .root_module = ctx.module("examples/maintenance/maintenance.zig", &.{
+    const example = b.addLibrary(.{ .name = "maintenance", .linkage = .dynamic, .root_module = ctx.module("examples/maintenance/src/maintenance.zig", &.{
         .{ .name = "bifrost_plugin", .module = sdk },
     }) });
+    example.root_module.addAnonymousImport("plugin.toml", .{ .root_source_file = b.path("examples/maintenance/plugin.toml") });
     installPlugin(ctx, example, "Maintenance");
     const chat_guard = b.addLibrary(.{ .name = "ChatGuard", .linkage = .dynamic, .root_module = b.createModule(.{
         .target = ctx.target,
         .optimize = ctx.optimize,
         .link_libcpp = true,
     }) });
-    chat_guard.root_module.addCSourceFile(.{ .file = b.path("examples/chatguard/ChatGuard.cpp"), .flags = &.{ "-std=c++23", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror" } });
+    chat_guard.root_module.addCSourceFile(.{ .file = b.path("examples/chatguard/src/ChatGuard.cpp"), .flags = &.{ "-std=c++23", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror" } });
     chat_guard.root_module.addIncludePath(b.path("include"));
     embedManifest(b, chat_guard, "examples/chatguard/plugin.toml");
     installPlugin(ctx, chat_guard, "ChatGuard");
     const packet_filter = b.addLibrary(.{ .name = "PacketFilter", .linkage = .dynamic, .root_module = b.createModule(.{ .target = ctx.target, .optimize = ctx.optimize, .link_libcpp = true }) });
-    packet_filter.root_module.addCSourceFile(.{ .file = b.path("examples/packets/PacketFilter.cpp"), .flags = &.{ "-std=c++23", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror" } });
+    packet_filter.root_module.addCSourceFile(.{ .file = b.path("examples/packets/src/PacketFilter.cpp"), .flags = &.{ "-std=c++23", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror" } });
     packet_filter.root_module.addIncludePath(b.path("include"));
     embedManifest(b, packet_filter, "examples/packets/plugin.toml");
     installPlugin(ctx, packet_filter, "PacketFilter");
