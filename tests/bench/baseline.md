@@ -1189,3 +1189,22 @@ in for the call:
 The first control run was slow across the board, so the throughput rows are noise; the second pair is level.
 Memory per player and after churn is the same. Setting the pad also turns off glibc's adaptive mmap threshold,
 which none of these cases showed a cost for.
+
+## Worker reply queues
+
+Recorded 2026-10-18 on Windows x86_64, 12 CPUs, ReleaseFast, `-- queues`, while other desktop apps held the host
+near 45% load. Plugin replies, messages, injections and actions reach a worker from any thread, so a per-worker SPSC
+queue or a ring-decomposed MPSC would need every producer registered up front; only multi-producer designs fit.
+freref/spsc-queue's build script doesn't run on Zig 0.17 and ringmpsc is Linux only, so the comparison
+uses local copies of the three shapes. One million items, one consumer draining in batches, queue of 1024:
+
+| producers | spin (current) items/s | mutex items/s | lock-free ring items/s | p99 spin / mutex / ring us |
+|---|---|---|---|---|
+| 1 | 7.5 M | 9.4 M | 26.4 M | 42.6 / 141.2 / 4.8 |
+| 4 | 6.8 M | 23.5 M | 13.0 M | 89.5 / 133.9 / 122.9 |
+| 24 | 4.5 M | 5.5 M | 9.8 M | 147.2 / 485.1 / 264.8 |
+
+The worst case still moves 4.5 M items/s, about 220 ns each, while per-plugin quotas keep real reply traffic in the
+thousands per second, and the spin lock holds up when oversubscribed with the best p99 at 24 producers. The task pool
+and reply queues stay as they are: bounded, drained once per turn, futex sleep when idle, and closed before
+shutdown drains them.

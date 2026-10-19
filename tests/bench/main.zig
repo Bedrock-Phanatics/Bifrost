@@ -15,6 +15,7 @@ const bench_injection = @import("injection.zig");
 const bench_links = @import("links.zig");
 const bench_players = @import("players.zig");
 const bench_gameplay = @import("gameplay.zig");
+const bench_queues = @import("queues.zig");
 
 const Backend = harness.Backend;
 const Frames = harness.Frames;
@@ -37,15 +38,16 @@ comptime {
         _ = bench_players;
         _ = bench_gameplay;
         _ = bench_injection;
+        _ = bench_queues;
     }
 }
 
 const usage =
-    \\usage: bench [relay|fairness|managed|deflate|plugins|players|gameplay|packet-dispatch|callback-latency|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
+    \\usage: bench [relay|fairness|managed|deflate|plugins|players|gameplay|packet-dispatch|callback-latency|injection|injection-transport|injection-workers|decode|ids|tasks|handles|links|queues|handshake|connections|workers|backends ...] [--quick] [--driver-threads N] [--proxy-exe PATH]
     \\
 ;
 
-const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "players", "gameplay", "decode", "injection", "ids", "tasks", "handles", "links", "handshake", "connections", "workers", "backends" };
+const all_scenarios = [_][]const u8{ "relay", "fairness", "managed", "deflate", "plugins", "players", "gameplay", "decode", "injection", "ids", "tasks", "handles", "links", "queues", "handshake", "connections", "workers", "backends" };
 const login_token_bytes = 16 * 1024;
 
 pub fn main(init: std.process.Init) !void {
@@ -159,6 +161,13 @@ pub fn main(init: std.process.Init) !void {
             const results = try bench_links.run(env.gpa, env.io, env.quick);
             try env.out.writeAll("\n## Worker link lookup\n\nUniform live IDs, median of seven samples through Proxy.packet. Links have no managed session, so this measures lookup and the unsupported check; no queue or transport work. Link allocations are excluded from index heap. No allocations are permitted during lookup.\n\n| players | ns per lookup | lookups/s | index heap B |\n|---|---|---|---|\n");
             for (results) |result| try env.out.print("| {d} | {d:.1} | {d:.0} | {d} |\n", .{ result.players, result.ns_per_lookup, std.time.ns_per_s / result.ns_per_lookup, result.index_heap });
+        }
+        if (std.mem.eql(u8, name, "queues")) {
+            const producers = [_]usize{ 1, 4, 2 * env.cpus };
+            const results = try bench_queues.run(env.gpa, env.quick, &producers);
+            defer env.gpa.free(results);
+            try env.out.print("\n## Worker reply queues\n\nProducers on their own threads post to one bounded queue of 1024; one consumer drains it in batches. Spin is the current Work.Queue lock, mutex is std.Io.Mutex, ring is a lock-free bounded MPMC ring. Latency is post to drain for every 64th item. {d} producers oversubscribes {d} CPUs.\n\n| producers | queue | items/s | p99 us |\n|---|---|---|---|\n", .{ 2 * env.cpus, env.cpus });
+            for (results) |result| try env.out.print("| {d} | {t} | {d:.0} | {d:.1} |\n", .{ result.producers, result.kind, result.items_per_s, result.p99_ns / 1000 });
         }
         if (std.mem.eql(u8, name, "handshake")) try handshakeScenario(&env);
         if (std.mem.eql(u8, name, "connections")) try connectionsScenario(&env);

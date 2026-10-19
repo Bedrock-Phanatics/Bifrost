@@ -245,7 +245,7 @@ fn addBench(ctx: Context, packet_filter: *std.Build.Step.Compile) void {
     };
     // The driver keeps the default scheduler so only the proxy under test changes
     const driver = benchExe(ctx, "bifrost-bench", imports, ctx.zio);
-    const bench_tests = b.addTest(.{ .root_module = driver.root_module, .filters = &.{ "benchmark process usage", "handle benchmark", "relay benchmark" } });
+    const bench_tests = b.addTest(.{ .root_module = driver.root_module, .filters = &.{ "benchmark process usage", "handle benchmark", "relay benchmark", "queue designs" } });
     b.step("bench-test", "Check benchmark counters and resource cleanup").dependOn(&b.addRunArtifact(bench_tests).step);
     const proxy = benchExe(ctx, "bifrost-bench-proxy", imports, b.dependency("zio", .{
         .target = ctx.target,
