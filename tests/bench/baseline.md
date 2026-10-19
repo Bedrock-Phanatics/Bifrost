@@ -1208,3 +1208,40 @@ The worst case still moves 4.5 M items/s, about 220 ns each, while per-plugin qu
 thousands per second, and the spin lock holds up when oversubscribed with the best p99 at 24 producers. The task pool
 and reply queues stay as they are: bounded, drained once per turn, futex sleep when idle, and closed before
 shutdown drains them.
+
+## Allocation audit, allocators and maps
+
+Recorded 2026-10-18 on Windows x86_64, ReleaseFast, `-- relay managed connections --quick`, with the host partly
+loaded by other apps; throughput differences under 5% are noise here. The relay and managed tables now report proxy
+allocations per round trip.
+
+Forwarding below the MTU never reaches the allocator: 64 B and 512 B single-player relays are 0.00 per round trip
+in passthrough and every managed setup, and the loaded rows only pay RakNet's outbound queue when a player falls
+behind (about 0.5 at 512 B 8x32). Above the MTU passthrough pays about one allocation per fragment, 12.0 at 8 KiB and
+30.1 at 20 KiB, the same as managed. Tracing the bench proxy put them all in raknet-zig's reassembler: fragment
+buffers bigger than its largest 1200 B class are freed after every message, and every reassembled message gets a
+fresh output buffer. A raknet-zig change that adds a 1536 B class, keeps up to 16 KiB of fragment storage and a
+16 KiB output buffer per session took 8 KiB round trips to 0.00 and 20 KiB to 6.0 in a `--fork` run, with 8 KiB 1x1
+going from 978 / 1028 to 1064 round trips/s and p50 from 922 / 905 to 811 us. It is not committed or pinned here
+yet; it costs up to 32 KiB more per session that receives large splits.
+
+`std.heap.smp_allocator` against the default libc allocator, alternating c / smp / c / smp in the bench proxy:
+
+| case | c allocator | smp allocator |
+|---|---|---|
+| relay 8 KiB 1x1, round trips/s | 1122 / 1158 | 1138 / 1116 |
+| relay 20 KiB 8x12, round trips/s | 888 / 968 | 1000 / 988 |
+| RSS per held player, 500 players | 282.0 / 282.0 KiB | 303.5 / 303.8 KiB |
+| RSS above fresh after 1000 players left | 14212 / 12256 KiB | 64864 / 65316 KiB |
+| RSS after the first churn round | 9168 / 8928 KiB | 12364 / 13448 KiB |
+
+Throughput is level and smp keeps more memory, so the libc allocator stays. mimalloc has no Zig 0.17 package and
+wasn't built; with forwarding allocation free below the MTU there is little for it to win.
+
+verztable builds from source on Zig 0.17 but not as a package. Against the link index Bifrost uses, ns per lookup:
+64 links 2.07 vs 1.77, 1000 links 2.44 vs 2.01, 10000 links 3.12 vs 2.25. Packets find their link through the RakNet
+session, so that index is only consulted by plugin calls that already cost tens of ns; no change.
+
+Tracy: zig-gamedev/ztracy's build script doesn't run on Zig 0.17, so `-Dtracy=true` compiles Tracy v0.13.1's client
+directly behind `src/trace.zig`. Default builds don't fetch or link it. Metrics add two clock reads per worker turn
+and plain stores for the new counters; the RakNet totals are sampled once a second with the deadline sweep.
