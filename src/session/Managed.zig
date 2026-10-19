@@ -434,6 +434,7 @@ fn relay(source: anytype, dest: anytype, sink: anytype, stats: *Stats, comptime 
         return err;
     };
     stats.bump(counter, frame.bytes.len);
+    stats.bump(messages(counter), 1);
     stats.bump(.managed_relayed_batches, 1);
     stats.bump(.managed_relayed_bytes, payload.len);
     return true;
@@ -678,8 +679,13 @@ pub fn send(session: anytype, sink: anytype, stats: *Stats, comptime counter: st
             return err;
         };
         stats.bump(counter, frame.bytes.len);
+        stats.bump(messages(counter), 1);
         rest = rest[count..];
     }
+}
+
+fn messages(comptime bytes: std.meta.FieldEnum(Stats)) std.meta.FieldEnum(Stats) {
+    return if (bytes == .bytes_to_backend) .messages_to_backend else .messages_to_player;
 }
 
 pub fn encodeTyped(buffer: []u8, packet: protocol.typed.Packet) ![]const u8 {

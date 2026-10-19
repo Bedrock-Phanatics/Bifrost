@@ -114,7 +114,7 @@ const Loaded = struct {
     quota: Work.Quota = .{},
     ready: std.atomic.Value(bool) = .init(false),
 
-    fn label(self: *const Loaded) []const u8 {
+    pub fn label(self: *const Loaded) []const u8 {
         return self.metadata.name();
     }
 };

@@ -19,6 +19,7 @@ pub const min_connect_timeout_ms = 500;
 pub const default_motd = "MCPE;Bifrost;2193;1.26.51;0;100;0;Bifrost;Survival;1;19132;19133;";
 
 bind: IpAddress = .{ .ip4 = .unspecified(19132) },
+metrics_bind: ?IpAddress = null,
 workers: u8 = 1,
 max_players: u32 = 4096,
 max_players_per_ip: u32 = 0,

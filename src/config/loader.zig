@@ -152,6 +152,8 @@ fn readServer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
         const value = entry.value_ptr.*;
         if (eql(key.name.?, "bind")) {
             config.bind = try address(diag, key, value, true);
+        } else if (eql(key.name.?, "metrics")) {
+            config.metrics_bind = try address(diag, key, value, false);
         } else if (eql(key.name.?, "motd")) {
             config.setMotd(try string(diag, key, value)) catch
                 return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_motd_len});
@@ -393,6 +395,14 @@ test "full config reads every key" {
     try std.testing.expectEqualStrings("[::1]:3000", config.backends()[1].name());
 }
 
+test "metrics are off unless an address is given" {
+    var diag: Diagnostic = .{};
+    const backend = "[[backend]]\naddress = \"127.0.0.1:1\"\n";
+    try std.testing.expectEqual(@as(?IpAddress, null), (try parse(std.testing.allocator, backend, &diag)).metrics_bind);
+    const config = try parse(std.testing.allocator, "[server]\nmetrics = \"127.0.0.1:9100\"\n" ++ backend, &diag);
+    try std.testing.expectEqual(@as(u16, 9100), config.metrics_bind.?.getPort());
+}
+
 test "syntax errors report a position" {
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, "[server]\nbind = \n", &diag));
@@ -407,6 +417,7 @@ test "invalid values name the offending key" {
     try expectInvalid("[server]\nport = 1\n" ++ backend, "server.port: unknown key");
     try expectInvalid("[server]\nbind = \"localhost:1\"\n" ++ backend, "server.bind: expected \"ip:port\", got \"localhost:1\"");
     try expectInvalid("[server]\nbind = 19132\n" ++ backend, "server.bind: expected a string");
+    try expectInvalid("[server]\nmetrics = \"127.0.0.1:0\"\n" ++ backend, "server.metrics: needs a non-zero port, got \"127.0.0.1:0\"");
     try expectInvalid("[server]\nworkers = 0\n" ++ backend, "server.workers: must be between 1 and 64");
     try expectInvalid("[limits]\nplugin_task_threads = 65\n" ++ backend, "limits.plugin_task_threads: must be between 1 and 64");
     try expectInvalid("[limits]\nhandshake_rate_per_ip = 0\n" ++ backend, "limits.handshake_rate_per_ip: must be between 1 and 1000000");

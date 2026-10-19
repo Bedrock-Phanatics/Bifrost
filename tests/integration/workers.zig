@@ -175,3 +175,51 @@ test "max_players_per_ip turns away extra players from one address" {
     try std.testing.expectEqual(@as(u64, 2), running.stats().sessions_accepted);
     try std.testing.expectEqual(@as(u64, 1), running.stats().sessions_rejected);
 }
+
+fn scrape(address: std.Io.net.IpAddress, request: []const u8, buffer: []u8) ![]const u8 {
+    const stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll(request);
+    try writer.interface.flush();
+    var read_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    const len = try reader.interface.readSliceShort(buffer);
+    return buffer[0..len];
+}
+
+test "the metrics endpoint serves Prometheus text and refuses other paths" {
+    var backend: Backend = undefined;
+    try backend.start(io, .{});
+    defer backend.deinit();
+    var metrics_config = try workersConfig(backend.address(), 1);
+    metrics_config.metrics_bind = fixtures.loopback;
+    var running: RunningWorkers = undefined;
+    try running.start(io, metrics_config);
+    defer running.deinit();
+
+    var player: Player = try .connect(io, running.address());
+    defer player.deinit();
+    try player.roundTrip("\xfehello");
+
+    const address = running.workers.metricsAddress().?;
+    var buffer: [64 * 1024]u8 = undefined;
+    const page = try scrape(address, "GET /metrics HTTP/1.1\r\nHost: test\r\n\r\n", &buffer);
+    try std.testing.expect(std.mem.startsWith(u8, page, "HTTP/1.1 200 OK\r\n"));
+    for ([_][]const u8{
+        "bifrost_players_online 1\n",
+        "bifrost_messages_total{direction=\"to_backend\"} 1\n",
+        "bifrost_messages_total{direction=\"to_player\"} 1\n",
+        "bifrost_backend_dial_seconds_count 1\n",
+        "bifrost_turn_seconds_bucket{le=\"+Inf\"}",
+        "bifrost_backend_up{backend=\"",
+    }) |line| if (std.mem.indexOf(u8, page, line) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ line, page });
+        return error.MissingMetric;
+    };
+
+    const missing = try scrape(address, "GET / HTTP/1.1\r\n\r\n", &buffer);
+    try std.testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 404 Not Found\r\n"));
+    try running.stop();
+}

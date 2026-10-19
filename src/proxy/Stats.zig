@@ -10,6 +10,8 @@ links_closed: u64 = 0,
 listener_errors: u64 = 0,
 bytes_to_backend: u64 = 0,
 bytes_to_player: u64 = 0,
+messages_to_backend: u64 = 0,
+messages_to_player: u64 = 0,
 handshakes_observed: u64 = 0,
 observer_gave_up: u64 = 0,
 logins_verified: u64 = 0,
@@ -42,11 +44,20 @@ logins_throttled: u64 = 0,
 player_floods: u64 = 0,
 backlog_pauses: u64 = 0,
 slow_players: u64 = 0,
+raknet_retransmits: u64 = 0,
+raknet_lost_datagrams: u64 = 0,
+// Gauges the worker refreshes once a second
+links_active: u64 = 0,
+player_queued_packets: u64 = 0,
 
 // Only the worker writes these, so a plain atomic store is enough
 pub fn bump(self: *Stats, comptime field: std.meta.FieldEnum(Stats), amount: u64) void {
     const counter = &@field(self, @tagName(field));
     @atomicStore(u64, counter, counter.* +% amount, .monotonic);
+}
+
+pub fn set(self: *Stats, comptime field: std.meta.FieldEnum(Stats), amount: u64) void {
+    @atomicStore(u64, &@field(self, @tagName(field)), amount, .monotonic);
 }
 
 pub fn snapshot(self: *const Stats) Stats {

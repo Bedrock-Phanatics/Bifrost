@@ -22,6 +22,7 @@ const Handles = Plugins.Handles;
 const abi = @import("../plugin/abi.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
+const Metrics = @import("Metrics.zig");
 const trace = @import("../trace.zig");
 
 const Proxy = @This();
@@ -59,6 +60,7 @@ listener_failures: u8 = 0,
 stop_requested: std.atomic.Value(bool) = .init(false),
 health_changed: std.atomic.Value(bool) = .init(false),
 stats: Stats = .{},
+timings: Metrics.Timings = .{},
 next_player: u64 = 0,
 next_epoch: Transfer.State.Epoch = 0,
 mailbox_mutex: std.Io.Mutex = .init,
@@ -177,6 +179,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .max_transfers = config.max_transfers,
         .next_epoch = &self.next_epoch,
         .events = .{ .plugins = options.plugins, .worker = options.worker },
+        .timings = &self.timings,
     };
     return self;
 }
@@ -314,6 +317,8 @@ fn turn(self: *Proxy) void {
     };
     // Reset before checking, or we could miss a wake
     self.scheduler.wake.reset();
+    const busy_since = Metrics.nowNs(self.io);
+    defer self.timings.turn.record(Metrics.sinceUs(self.io, busy_since));
 
     if (self.health_changed.swap(false, .acquire)) self.refreshAdvertisement();
     self.drainMailbox();
@@ -328,7 +333,15 @@ fn turn(self: *Proxy) void {
     const now_ms = nowMs(self.io);
     if (now_ms >= self.next_sweep_ms) {
         self.next_sweep_ms = now_ms + sweep_interval_ms;
-        for (self.links.values()) |link| link.checkDeadlines(now_ms);
+        var transport: Link.Transport = .{};
+        for (self.links.values()) |link| {
+            link.checkDeadlines(now_ms);
+            link.sampleTransport(&transport);
+        }
+        self.stats.bump(.raknet_retransmits, transport.retransmits);
+        self.stats.bump(.raknet_lost_datagrams, transport.lost);
+        self.stats.set(.player_queued_packets, transport.queued);
+        self.stats.set(.links_active, self.links.count());
     }
     self.serviceReady() catch return self.stop();
     if (self.listener_busy or self.scheduler.hasReady()) self.scheduler.wake.set(self.io);

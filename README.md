@@ -37,7 +37,8 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 Configure the proxy through [`config/bifrost.toml`](config/bifrost.toml). [Resource limits](docs/limits.md)
-explains the timeouts, budgets and rate limits.
+explains the timeouts, budgets and rate limits. Set `metrics = "127.0.0.1:9100"` under `[server]` to serve
+Prometheus metrics at `/metrics`.
 
 ## Session Modes
 

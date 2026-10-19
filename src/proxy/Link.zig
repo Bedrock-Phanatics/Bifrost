@@ -19,6 +19,7 @@ const PacketQueue = @import("PacketQueue.zig");
 const Rate = @import("Rate.zig");
 const Scheduler = @import("Scheduler.zig");
 const Stats = @import("Stats.zig");
+const Metrics = @import("Metrics.zig");
 const trace = @import("../trace.zig");
 
 const Link = @This();
@@ -61,6 +62,20 @@ pub const Env = struct {
     max_transfers: u32 = std.math.maxInt(u32),
     next_epoch: ?*Transfer.State.Epoch = null,
     events: Events = .{},
+    timings: ?*Metrics.Timings = null,
+};
+
+pub const Transport = struct { retransmits: u64 = 0, lost: u64 = 0, queued: u64 = 0 };
+
+const Seen = struct {
+    retransmits: u64 = 0,
+    lost: u64 = 0,
+
+    fn delta(self: *Seen, stats: raknet.SessionStatistics, total: *Transport) void {
+        total.retransmits += stats.retransmitted_datagrams -| self.retransmits;
+        total.lost += stats.lost_datagrams -| self.lost;
+        self.* = .{ .retransmits = stats.retransmitted_datagrams, .lost = stats.lost_datagrams };
+    }
 };
 
 env: *const Env,
@@ -93,6 +108,11 @@ stage_since_ms: u64,
 backlogged_since_ms: ?u64 = null,
 parked: bool = false,
 park_node: std.DoublyLinkedList.Node = .{},
+dial_started_ns: u64 = 0,
+transfer_started_ns: u64 = 0,
+seen_player: Seen = .{},
+seen_backend: Seen = .{},
+seen_client: ?*raknet.Client = null,
 
 pub fn create(env: *const Env, session: *raknet.Session) !*Link {
     const self = try env.gpa.create(Link);
@@ -133,6 +153,7 @@ pub fn connect(self: *Link) (error{NoBackendAvailable} || std.Io.ConcurrentError
     self.backend_id = id;
     self.env.events.backendSelected(self.player, id.index());
     self.dial = .{};
+    self.dial_started_ns = Metrics.nowNs(self.env.io);
     const options: raknet.ClientOptions = .{ .handshake_timeout_ms = self.env.connect_timeout_ms };
     const address = self.env.router.get(id).address;
     self.dial_task = try self.env.io.concurrent(Dial.run, .{ &self.dial, self.env.gpa, self.env.io, address, options, Scheduler.linkNotify(self) });
@@ -163,6 +184,7 @@ pub fn forwardToBackend(self: *Link, payload: []const u8) !void {
     if (self.backend) |client| {
         try client.send(payload, .reliable_ordered, 0);
         self.env.stats.bump(.bytes_to_backend, payload.len);
+        self.env.stats.bump(.messages_to_backend, 1);
         self.env.scheduler.schedule(self);
     } else if (self.dial_task != null) {
         try self.pending.push(self.env.gpa, payload);
@@ -375,6 +397,21 @@ fn backlogged(stats: raknet.SessionStatistics, draining: bool) bool {
     return stats.queued_packets >= backlog_packets >> shift or stats.queued_payload_bytes >= backlog_bytes >> shift;
 }
 
+// Worker only, once a second, so counters survive sessions closing
+pub fn sampleTransport(self: *Link, total: *Transport) void {
+    if (self.session) |session| if (session.state == .connected) {
+        const stats = session.statistics();
+        self.seen_player.delta(stats, total);
+        total.queued += stats.queued_packets;
+    };
+    const client = self.backend orelse return;
+    if (self.seen_client != client) {
+        self.seen_client = client;
+        self.seen_backend = .{};
+    }
+    self.seen_backend.delta(client.statistics(), total);
+}
+
 pub fn checkDeadlines(self: *Link, now_ms: u64) void {
     const session = self.session orelse return;
     if (session.state != .connected) return;
@@ -467,6 +504,7 @@ fn adopt(self: *Link, result: Dial.ConnectError!*raknet.Client) void {
     self.backend = client;
     self.network_rates = .{};
     self.env.stats.bump(.backends_connected, 1);
+    if (self.env.timings) |timings| timings.dial.record(Metrics.sinceUs(self.env.io, self.dial_started_ns));
     const session = self.session orelse return self.dropBackend();
     if (self.managed) |managed| return managed.backendConnected(self.ends(session)) catch |err| self.fail(err);
     self.flushPending(client) catch |err| self.fail(err);
@@ -501,6 +539,7 @@ fn startTransfer(self: *Link, requested: Backend.Id) !void {
     epoch.* +%= 1;
     self.transfer = try Transfer.create(self.transferHost(session), target, self.env.router.get(target).address, epoch.*, self.env.transfer);
     if (self.env.transfers) |count| count.* += 1;
+    self.transfer_started_ns = Metrics.nowNs(self.env.io);
     self.env.scheduler.schedule(self);
 }
 
@@ -525,6 +564,7 @@ fn endTransfer(self: *Link, event: ?Transfer.State.Event) void {
     self.transfer = null;
     if (self.env.transfers) |count| count.* -= 1;
     if (event) |cause| transfer.end(self.env.io, self.env.stats, cause);
+    if (transfer.outcome == .committed) if (self.env.timings) |timings| timings.transfer.record(Metrics.sinceUs(self.env.io, self.transfer_started_ns));
     if (transfer.state.phase.committed()) {
         self.backend_id = transfer.target;
         self.network_rates = .{};
@@ -569,6 +609,7 @@ fn onBackendMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{
         return;
     };
     self.env.stats.bump(.bytes_to_player, payload.bytes.len);
+    self.env.stats.bump(.messages_to_player, 1);
 }
 
 fn flushPending(self: *Link, client: *raknet.Client) !void {
@@ -576,6 +617,7 @@ fn flushPending(self: *Link, client: *raknet.Client) !void {
     for (self.pending.items()) |packet| {
         try client.send(packet, .reliable_ordered, 0);
         self.env.stats.bump(.bytes_to_backend, packet.len);
+        self.env.stats.bump(.messages_to_backend, 1);
     }
 }
 

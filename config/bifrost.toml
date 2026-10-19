@@ -1,5 +1,7 @@
 [server]
 bind = "0.0.0.0:19132"
+# Prometheus metrics at http://<address>/metrics, off unless set
+# metrics = "127.0.0.1:9100"
 # Linux only above 1
 workers = 1
 motd = "MCPE;Bifrost;2193;1.26.51;0;100;0;Bifrost;Survival;1;19132;19133;"

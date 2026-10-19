@@ -70,4 +70,5 @@ test {
     _ = @import("plugin/Work.zig");
     _ = @import("plugin/sdk.zig");
     _ = @import("trace.zig");
+    _ = @import("proxy/Metrics.zig");
 }
