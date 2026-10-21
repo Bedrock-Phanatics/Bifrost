@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .nethernet = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/nethernet-zig#d236a714d02499bc5e83ea97c18b17695f4d3638",
-            .hash = "nethernet-1.4.0-dprTqO-0CgBKZmoT9EqdC4tWyFKtYMqY8Jj6tOwUkte8",
+            .url = "git+https://github.com/Bedrock-Phanatics/nethernet-zig#748bcb6b1e7e219748b0d4e1ca4b015b05da04cd",
+            .hash = "nethernet-1.4.0-dprTqLjICgA0vv17_NuwY-4hPvPUNojBB30AWgqqykSW",
         },
         .bedwire = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#6301cb70ee8c218e13d83568b5fc262dac73161c",
-            .hash = "bedwire-0.4.0-6vrYrfnDEgBvxk5curJtUYWLwTcJG1z0dbY68jTrEraW",
+            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#a6678d0c8cd8c56b28063129532c69fb12552c1c",
+            .hash = "bedwire-0.4.0-6vrYrd6OGgDATrxbQ4NQAJaDmAhelr4twU5WUmxYmdie",
         },
         .zio = .{
             .url = "git+https://github.com/EuroZig/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",

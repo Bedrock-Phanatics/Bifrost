@@ -71,13 +71,14 @@ pub fn closeSoon(self: *Peer, now_ms: u64) void {
     if (self.closing_since_ms == null) self.closing_since_ms = now_ms;
 }
 
-/// True once the peer can be destroyed. Deleting with data still in SCTP would abort and drop it,
-/// so this waits for libdatachannel's queue, then for its own shutdown to get the rest out.
+/// True once the peer can be destroyed. Closing with data still in SCTP would abort and drop it,
+/// so this waits for libdatachannel's queue and the far end's acknowledgements, then for the close.
+/// Acknowledgements raise no event, so the sweep checks again.
 pub fn drained(self: *Peer, now_ms: u64) bool {
     const since = self.closing_since_ms orelse return false;
     if (now_ms -| since < drain_timeout_ms) {
         if (!self.shutting_down) {
-            if (self.buffered() != 0) return false;
+            if (self.buffered() != 0 or self.connection.unackedAmount() != 0) return false;
             self.connection.shutdown();
             self.shutting_down = true;
         }
