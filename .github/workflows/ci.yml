@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest]
+        os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -30,6 +30,12 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+          # Restored Windows caches can reference missing Zig runtime libraries
+          use-cache: ${{ runner.os != 'Windows' }}
+      - if: runner.os == 'Linux'
+        run: sh tools/setup-native.sh
+      - if: runner.os == 'Windows'
+        run: powershell -ExecutionPolicy Bypass -File tools/setup-native.ps1
       - run: zig build test bench-test
       - run: zig build test bench-test -Doptimize=ReleaseSafe
       - run: zig build test bench-test -Doptimize=ReleaseFast
@@ -41,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest]
+        os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -49,11 +55,17 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+          # Restored Windows caches can reference missing Zig runtime libraries
+          use-cache: ${{ runner.os != 'Windows' }}
+      - if: runner.os == 'Linux'
+        run: sh tools/setup-native.sh
+      - if: runner.os == 'Windows'
+        run: powershell -ExecutionPolicy Bypass -File tools/setup-native.ps1
       - run: zig build stress -Doptimize=ReleaseSafe -Dtransfer-report=true
       - run: zig build stress -Doptimize=ReleaseSafe
       - run: zig build stress -Doptimize=ReleaseSafe
 
-  cross:
+  bench-cli:
     needs: format
     runs-on: ubuntu-24.04
     steps:
@@ -61,6 +73,5 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
-      - run: zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe
-      - run: zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
+      - run: sh tools/setup-native.sh
       - run: zig build bench -- --help
