@@ -36,5 +36,5 @@ What's open as of 2.0.0-rc.2. Details live in the linked docs.
   | joins | 127/s | 1,149/s |
 
   Each player also costs about 675 KiB of resident memory. See `tests/bench/baseline.md`.
-- **Large plugin packet injections on Linux** pay glibc trim and refault costs, about 10 µs per 16 KiB. See
-  [Plugin ABI](plugin-abi.md).
+- **Large plugin packet injections on Linux** pay glibc trim and refault costs, about 10 µs per 16 KiB. That was
+  measured on 1.2.1, before the NetherNet switch.

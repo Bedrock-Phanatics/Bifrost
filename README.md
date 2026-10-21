@@ -84,6 +84,8 @@ can't be carried across a proxy hop, so a backend has to trust Bifrost for it:
 Bifrost logs the key to trust at startup. Quark v6 trusts it through `network.trusted-proxy-keys`. Start with
 the [setup guide](docs/setup.md); [Backend support](docs/backends.md) has the details.
 
+What's still open or unverified is listed in [Known issues](docs/known-issues.md).
+
 ## Plugin Development
 
 Bifrost supports compiled native plugins through a stable C ABI.
