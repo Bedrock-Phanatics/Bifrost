@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .nethernet = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/nethernet-zig#eab6d0e788ea14f4a87a8512aac785593d118f18",
-            .hash = "nethernet-1.3.0-dprTqCiSCgAd8A6Lbs-nCYLicVplrQUArbpN9oQ3uPTE",
+            .url = "git+https://github.com/Bedrock-Phanatics/nethernet-zig#d236a714d02499bc5e83ea97c18b17695f4d3638",
+            .hash = "nethernet-1.4.0-dprTqO-0CgBKZmoT9EqdC4tWyFKtYMqY8Jj6tOwUkte8",
         },
         .bedwire = .{
             .url = "git+https://github.com/Bedrock-Phanatics/bedwire#c10622fbc07ee9667990142b073ea66bbc421a4c",
