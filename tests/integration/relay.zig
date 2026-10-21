@@ -82,6 +82,8 @@ test "players keep their own link while others come and go" {
     defer backend.deinit();
     var proxy_config = try fixtures.config(&.{backend.address()});
     proxy_config.max_players = 64;
+    // 24 dials at once each sign and verify P-384, which Debug builds do about 150 times slower
+    proxy_config.connect_timeout_ms = 30_000;
     var running: Running = undefined;
     try running.start(io, proxy_config, .{});
     defer running.deinit();

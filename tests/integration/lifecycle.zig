@@ -150,7 +150,9 @@ test "a leaving player's last packets all reach the proxy and go on to the backe
     try backend.start(io, .{});
     defer backend.deinit();
     var running: Running = undefined;
-    try running.start(io, try fixtures.config(&.{backend.address()}), .{});
+    var proxy_config = try fixtures.config(&.{backend.address()});
+    proxy_config.connect_timeout_ms = 60_000;
+    try running.start(io, proxy_config, .{});
     defer running.deinit();
 
     var player: Player = try .connect(io, running.address());
@@ -165,5 +167,5 @@ test "a leaving player's last packets all reach the proxy and go on to the backe
 
     try running.waitForStat(.messages_to_backend, burst + 1);
     try fixtures.waitFor(io, &backend.disconnects, 1);
-    try std.testing.expect(backend.received.load(.acquire) >= 2);
+    try std.testing.expectEqual(@as(u32, burst + 1), backend.received.load(.acquire));
 }
