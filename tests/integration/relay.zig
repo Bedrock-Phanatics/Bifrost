@@ -43,6 +43,22 @@ fn relayBothWays(io: std.Io) !void {
     try std.testing.expectEqual(@as(u64, 20_006), stats.bytes_to_player);
 }
 
+test "without auth backends see a throwaway key rather than the proxy identity" {
+    const io = std.testing.io;
+    var backend: Backend = undefined;
+    try backend.start(io, .{});
+    defer backend.deinit();
+    var running: Running = undefined;
+    try running.start(io, try fixtures.config(&.{backend.address()}), .{});
+    defer running.deinit();
+
+    var player: Player = try .connect(io, running.address());
+    defer player.deinit();
+    try player.roundTrip("\xfehello");
+    const dialer = backend.server.lastDialer().?.toUncompressedSec1();
+    try std.testing.expect(!std.mem.eql(u8, &running.transport.identity.public_key.toUncompressedSec1(), &dialer));
+}
+
 test "backend traffic reaches an idle player" {
     const io = std.testing.io;
     var backend: Backend = undefined;

@@ -58,6 +58,8 @@ test "a managed player logs in to a backend as the proxy and relays game packets
     try std.testing.expectEqualStrings("Steve", setup.backend.name());
     try std.testing.expectEqual(@as(usize, 0), setup.backend.identity_xuid_len);
     try std.testing.expect(!setup.backend.identity_online);
+    // Backends like Quark match the dialing key against the Login signer
+    try std.testing.expectEqualSlices(u8, &setup.proxy_key.public_key.toUncompressedSec1(), &setup.backend.server.lastDialer().?.toUncompressedSec1());
     setup.running.stop();
     const stats = setup.running.stats();
     try std.testing.expectEqual(@as(u64, 1), stats.logins_verified);

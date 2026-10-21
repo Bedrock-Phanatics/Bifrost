@@ -107,6 +107,8 @@ upstream: Upstream,
 player_phase: PlayerPhase = .settings,
 identity: ?bedwire.Identity = null,
 client_data: ?[]u8 = null,
+// Signed into backend Logins, since backends only see the proxy's address
+player_address: ?std.Io.net.IpAddress = null,
 initial_packs: packs.Fingerprint = .{},
 initial_registries: registries.Fingerprint = .{},
 transferred: bool = false,
@@ -128,7 +130,7 @@ commands_sent: bool = false,
 early: PacketQueue,
 inbound: Rate = .unlimited,
 
-pub fn create(gpa: std.mem.Allocator, shared: *Shared, early_packets: u32, early_bytes: u32) !*Managed {
+pub fn create(gpa: std.mem.Allocator, shared: *Shared, player_address: std.Io.net.IpAddress, early_packets: u32, early_bytes: u32) !*Managed {
     const self = try gpa.create(Managed);
     errdefer gpa.destroy(self);
     var player: PlayerSession = try .init(.server, .{ .pool = &shared.pool, .policy = session_policy });
@@ -138,6 +140,7 @@ pub fn create(gpa: std.mem.Allocator, shared: *Shared, early_packets: u32, early
         .shared = shared,
         .player = player,
         .upstream = try .init(shared),
+        .player_address = if (player_address.getPort() == 0) null else player_address,
         .early = .init(early_packets, early_bytes, shared.budget),
         .inbound = .bytes(shared.player_bytes_per_second),
     };
@@ -164,7 +167,7 @@ pub fn upstreamContext(self: *Managed, ends: Ends, backend: *Peer) Upstream.Cont
 }
 
 pub fn loginUpstream(self: *Managed, upstream: *Upstream, ctx: Upstream.Context) !void {
-    try upstream.login(ctx, &self.identity.?, self.client_data.?);
+    try upstream.login(ctx, &self.identity.?, self.client_data.?, self.player_address);
 }
 
 pub fn swapUpstream(self: *Managed, next: Upstream) Upstream {

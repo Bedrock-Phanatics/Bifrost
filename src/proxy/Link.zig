@@ -100,7 +100,7 @@ transfer_started_ns: u64 = 0,
 pub fn create(env: *const Env, connection: *NetherNet.Connection, address: std.Io.net.IpAddress) !*Link {
     const self = try env.gpa.create(Link);
     errdefer env.gpa.destroy(self);
-    const managed = if (env.managed) |shared| try Managed.create(env.gpa, shared, env.pending_packets, env.pending_bytes) else null;
+    const managed = if (env.managed) |shared| try Managed.create(env.gpa, shared, address, env.pending_packets, env.pending_bytes) else null;
     errdefer if (managed) |m| m.destroy();
     self.* = .{
         .env = env,

@@ -31,12 +31,15 @@ pub fn main(init: std.process.Init) !void {
         .managed => bifrost.loadProxyKey(init.io, config.proxyKeyFile().?) catch |err|
             fatal("{s}: {t}", .{ config.proxyKeyFile().?, err }),
     };
-    if (proxy_key) |key| log.info("managed sessions; backends must trust proxy key {s}", .{&bifrost.proxyKeyText(key)});
     if (config.auth == .off) log.warn("auth is off: logins aren't checked, and without Minecraft encryption over NetherNet anyone can replay one", .{});
 
     // Players confirm this key once, so it has to survive restarts
     const identity = bifrost.loadIdentity(init.io, init.gpa, config.identityFile()) catch |err|
         fatal("{s}: {t}", .{ config.identityFile(), err });
+    if (config.auth == .verify)
+        log.info("{s} sessions; backends must trust proxy key {s}", .{ @tagName(config.session_mode), &bifrost.proxyKeyText(proxy_key orelse identity) })
+    else
+        log.info("auth is off, so backends see a throwaway key and can't be told to trust Bifrost", .{});
     if (config.native_threads != 0) bifrost.setNativeThreads(config.native_threads) catch |err|
         fatal("nethernet threads: {t}", .{err});
 

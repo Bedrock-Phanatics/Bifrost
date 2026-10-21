@@ -15,6 +15,8 @@ pub const backlog_bytes = 1024 * 1024;
 
 pub const Settings = struct {
     identity: KeyPair,
+    // Managed mode dials with the key that signs its Logins, so backends trust one key for both
+    dial_identity: ?KeyPair = null,
     // Microsoft's JWKS, so clients must prove the key their Login uses
     issuer_keys: ?[]const u8 = null,
     connect_timeout_ms: u32 = 5_000,
@@ -30,6 +32,7 @@ pub const max_ice_servers = 4;
 gpa: std.mem.Allocator,
 io: std.Io,
 identity: KeyPair,
+dial_identity: KeyPair,
 issuer: ?nethernet.identity_issuer.Keys,
 native: @FieldType(nethernet.ConnectionOptions, "native"),
 connect_timeout_ms: u32,
@@ -49,6 +52,7 @@ pub fn init(self: *NetherNet, gpa: std.mem.Allocator, io: std.Io, settings: Sett
         .gpa = gpa,
         .io = io,
         .identity = settings.identity,
+        .dial_identity = settings.dial_identity orelse settings.identity,
         .issuer = issuer,
         .native = .{
             .maximum_message_size = max_message_bytes,
@@ -104,7 +108,7 @@ fn verify(context: ?*anyopaque, token: []const u8) anyerror!?nethernet.sdp_ident
 pub fn dial(self: *const NetherNet, address: std.Io.net.IpAddress) !*Connection {
     var origin_buffer: [64]u8 = undefined;
     const origin = try std.fmt.bufPrint(&origin_buffer, "http://{f}", .{address});
-    const token = try nethernet.identity.serverToken(self.gpa, self.identity, std.Io.Clock.real.now(self.io).toSeconds());
+    const token = try nethernet.identity.serverToken(self.gpa, self.dial_identity, std.Io.Clock.real.now(self.io).toSeconds());
     defer self.gpa.free(token);
     var id: [8]u8 = undefined;
     self.io.random(&id);
@@ -114,7 +118,7 @@ pub fn dial(self: *const NetherNet, address: std.Io.net.IpAddress) !*Connection 
         .negotiation_timeout_ms = self.connect_timeout_ms,
         .connection_timeout_ms = self.connect_timeout_ms,
         .allow_anonymous = true,
-        .identity = .{ .key = self.identity, .token = token, .domain = "bifrost" },
+        .identity = .{ .key = self.dial_identity, .token = token, .domain = "bifrost" },
     });
 }
 

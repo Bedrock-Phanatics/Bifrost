@@ -75,6 +75,9 @@ pub const Server = struct {
     arrived: std.ArrayList(*Connection) = .empty,
     wakeup: nethernet.Wakeup = .{},
     clients: std.ArrayList(*Client) = .empty,
+    dialer: ?PublicKey = null,
+
+    pub const PublicKey = nethernet.identity.Scheme.PublicKey;
 
     pub const Client = struct {
         connection: *Connection,
@@ -94,7 +97,12 @@ pub const Server = struct {
             .gpa = gpa,
             .io = io,
             .listener = try nethernet.EndpointListener.listen(gpa, io, address_, .{
-                .connection = .{ .allow_anonymous = true, .maximum_message_size = max_message_bytes, .native = .{ .maximum_message_size = max_message_bytes } },
+                .connection = .{
+                    .allow_anonymous = true,
+                    .verify_client = .{ .context = self, .verify = recordDialer },
+                    .maximum_message_size = max_message_bytes,
+                    .native = .{ .maximum_message_size = max_message_bytes },
+                },
                 .maximum_negotiations = 256,
                 .maximum_http_workers = 256,
                 .maximum_pending_accepts = 1024,
@@ -119,6 +127,22 @@ pub const Server = struct {
 
     pub fn address(self: *const Server) IpAddress {
         return self.listener.server.socket.address;
+    }
+
+    /// The key the most recent identified dialer proved.
+    pub fn lastDialer(self: *Server) ?PublicKey {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.dialer;
+    }
+
+    fn recordDialer(context: ?*anyopaque, token: []const u8) anyerror!?PublicKey {
+        const self: *Server = @ptrCast(@alignCast(context.?));
+        const key = try nethernet.identity.claimPublicKey(self.gpa, token, std.Io.Clock.real.now(self.io).toSeconds(), .server);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.dialer = key;
+        return key;
     }
 
     fn acceptAll(self: *Server) void {

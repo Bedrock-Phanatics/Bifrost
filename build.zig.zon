@@ -9,8 +9,8 @@
             .hash = "nethernet-1.4.0-dprTqO-0CgBKZmoT9EqdC4tWyFKtYMqY8Jj6tOwUkte8",
         },
         .bedwire = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#c10622fbc07ee9667990142b073ea66bbc421a4c",
-            .hash = "bedwire-0.4.0-6vrYrda9EgDrAo5TB4goP82IJzdHu-6fk7pjhy5ef9Y6",
+            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#6301cb70ee8c218e13d83568b5fc262dac73161c",
+            .hash = "bedwire-0.4.0-6vrYrfnDEgBvxk5curJtUYWLwTcJG1z0dbY68jTrEraW",
         },
         .zio = .{
             .url = "git+https://github.com/EuroZig/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",

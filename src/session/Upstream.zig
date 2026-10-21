@@ -37,10 +37,10 @@ pub fn connected(self: *Upstream, ctx: Context) !void {
     self.phase = .settings;
 }
 
-pub fn login(self: *Upstream, ctx: Context, identity: *const bedwire.Identity, client_data: []const u8) !void {
+pub fn login(self: *Upstream, ctx: Context, identity: *const bedwire.Identity, client_data: []const u8, player_address: ?std.Io.net.IpAddress) !void {
     std.debug.assert(self.phase == .waiting_for_login);
     const expires = std.Io.Clock.real.now(ctx.io).toSeconds() + Managed.login_lifetime_s;
-    const request = try bedwire.auth.login.buildProxyConnectionRequest(Managed.BackendProfile, ctx.gpa, ctx.shared.key, identity, client_data, expires, .envelope, Managed.limits);
+    const request = try bedwire.auth.login.buildProxyConnectionRequest(Managed.BackendProfile, ctx.gpa, ctx.shared.key, identity, client_data, player_address, expires, .envelope, Managed.limits);
     defer ctx.gpa.free(request);
     const storage = try ctx.gpa.alloc(u8, request.len + 32);
     defer ctx.gpa.free(storage);

@@ -42,6 +42,13 @@ pub const Options = struct {
     issuer_keys: ?[]const u8 = null,
 };
 
+/// The key backends see Bifrost dial with, null for the listener's own identity.
+pub fn dialIdentity(io: std.Io, auth: Observer.Auth, proxy_key_pair: ?proxy_key.Ecdsa.KeyPair) ?NetherNet.KeyPair {
+    if (proxy_key_pair) |key| return key;
+    // Without auth nothing ties a Login to its player, so a backend must have no key to trust
+    return if (auth == .off) .generate(io) else null;
+}
+
 pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Workers {
     try config.validate();
     const self = try gpa.create(Workers);
@@ -62,6 +69,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
     for (ice_servers[0..config.ice_server_count], 0..) |*url, i| url.* = config.iceServer(i);
     try self.transport.init(gpa, io, .{
         .identity = options.identity,
+        .dial_identity = dialIdentity(io, options.auth, options.proxy_key),
         .issuer_keys = options.issuer_keys,
         .connect_timeout_ms = config.connect_timeout_ms,
         .port_min = config.port_min,
