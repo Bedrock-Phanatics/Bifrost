@@ -174,7 +174,7 @@ listeners and is sent after the current callback finishes; a full queue simply d
 The plugin subscribes to client Text in-game and RequestChunkRadius in any permitted phase. It decodes fields
 through the host API and re-encodes changed packets and chat warnings. Forwarded message bodies and other text fields are
 preserved. Failed decoding, player-name lookup or encoding cancels the packet. Bifrost validates packet headers,
-direction, phase and size limits, and applies its normal compression/encryption and transfer handling.
+direction, phase and size limits, and applies its normal compression and transfer handling.
 
 The plugin has no owned state, heap allocation or shutdown work. Each callback uses stack storage and borrowed
 packet fields; the callback's host pointer remains valid for the plugin's lifetime. Changed packets and warnings use the

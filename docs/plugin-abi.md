@@ -198,10 +198,10 @@ radius injection also updates the radius Bifrost replays during transfers. Use p
 fields into a callback's replacement buffer in C++ before submitting it. Input bytes are copied before return.
 
 `OK` means accepted into the owning worker's FIFO queue, not delivered to the peer. A supplied `done` runs once
-with a `bifrost_task_result`: `OK` means the normal reliable-ordered channel-0 send accepted the packet;
+with a `bifrost_task_result`: `OK` means the reliable data channel accepted the packet;
 `STALE_HANDLE` means the player disconnected; `CANCELED` means a backend selection or transfer changed the route,
 the queue closed, or shutdown started; `BUSY` means a transfer is active or the peer is too far behind to take more
-(the same RakNet backlog that pauses relaying, see [limits](limits.md)); `TOO_LATE` means the session is not in
+(the same send backlog that pauses relaying, see [limits](limits.md)); `TOO_LATE` means the session is not in
 game; `FAILED` means encoding or transport failed. Shutdown completions run before plugin shutdown with
 `worker == BIFROST_NO_WORKER`. Keep callback state alive until completion. Rejected submissions never call `done`.
 
@@ -216,7 +216,7 @@ The worker drains a snapshot of the queue after transfer requests and before its
 accepted in queue order send in that order, after the current callback/batch has finished. Concurrent submitters
 have no ordering guarantee before queue insertion. A transfer cancels queued packets even if it is rejected or
 rolls back, so an old submission cannot reach a different backend. Delivery checks the live handle and route again.
-Injections use the session's normal batching, compression, encryption and reliable ordered transport and bypass
+Injections use the session's normal batching, compression and reliable ordered data channel and bypass
 packet listeners in both directions. There is no synchronous listener recursion. A completion may submit another
 packet; it waits for a later drain and remains subject to the same bounds. Responses from the backend traverse
 packet listeners normally.
@@ -254,7 +254,7 @@ milliseconds since handle creation, rather than wall time. A snapshot is coheren
 immediately become stale. During `PLAYER_DISCONNECTED` it reports disconnected; after that callback the handle is retired.
 
 Managed phases follow the player-facing Bedrock session: settings, login, handshake, resource packs, joining and
-in-game. Passthrough phases are `UNKNOWN` because encrypted progress cannot be observed reliably. Both modes
+in-game. Passthrough phases are `UNKNOWN` because the proxy stops following the session after the Login. Both modes
 report closing and disconnected. Changes publish at session/batch boundaries, with no lock or copy for unchanged
 state. `TRANSFER_REQUESTED` reports requested, then snapshots expose the transfer state machine's current phase.
 
@@ -271,26 +271,20 @@ Only fields whose `available` bit is set are meaningful. An unset bit means unav
 
 | availability bit | meaning |
 |---|---|
-| `RTT` | RakNet's smoothed RTT in milliseconds, absent until an eligible ACK sample exists |
-| `RELIABILITY` | MTU, retransmission timeout, cumulative acknowledged, timed-out and retransmitted datagrams, ACK/NACK record counts |
-| `QUEUES` | outbound packet/payload bytes and high-water packet count, recovery and ordered-buffer occupancy, in-flight bytes and congestion window |
-| `LOSS_ESTIMATE` | `lost / (acknowledged + lost)`, scaled to parts per million, absent with no observations |
-| `RATES` | backend UDP datagrams and bytes per second over `rate_interval_ms`, sampled on demand |
+| `QUEUES` | `mtu` (1200), `queued_bytes` waiting in the data channels to that peer, and the receive queue's high-water message count in `queued_packets_high_water` |
+| `RATES` | messages and bytes per second each way over `rate_interval_ms`, sampled on demand, backend target only |
 
-The loss estimate counts RakNet retransmission timeouts, which can repeat for one datagram and can result from
-delay or ACK loss. It is a timeout ratio, not an end-to-end loss measurement. NACK counts and ordered-buffer
-occupancy are measurements, not anomaly or out-of-order traffic counts. Retransmission counts also include
-NACK-triggered retries. Byte occupancies are payload accounting, not total allocated memory.
+NetherNet runs over SCTP inside libdatachannel, whose API exposes no round trip, retransmission or loss counters,
+so `RTT`, `RELIABILITY` and `LOSS_ESTIMATE` stay unset on both legs, as do jitter, duplicate, out-of-order and
+anomaly counts. Their fields are left zero and their bits unset; Bifrost does not synthesize them from unrelated
+counters. The bit values and the struct layout are unchanged, so older plugins keep working and simply see fewer bits.
 
-Backend rates reuse the dedicated RakNet socket's existing counters, including control datagrams. The first
-query establishes a baseline; a subsequent query at least 250 ms later yields rates for that interval. Queries
-closer together report rates unavailable and leave the baseline alone. Samples are shared by plugins on that
-player and reset when the active backend changes. `sampled_at_ms` uses the awake clock and has no wall-clock epoch.
-Integer rates truncate fractions. There is no timer, per-packet counter, allocation, transport lock or background scan.
-
-Player-side rates are unavailable because its listener socket serves multiple players. Jitter, duplicate traffic,
-out-of-order counts and reliability anomalies are unavailable on both legs in the pinned RakNet API. Their bits
-remain unset. Bifrost does not synthesize them from unrelated counters.
+Backend rates use that connection's own message and byte counters. The first query establishes a baseline; a
+subsequent query at least 250 ms later yields rates for that interval. Queries closer together report rates
+unavailable and leave the baseline alone. Samples are shared by plugins on that player and reset when the active
+backend changes. `sampled_at_ms` uses the awake clock and has no wall-clock epoch. Integer rates truncate
+fractions. There is no timer, per-packet counter, allocation or background scan; `queued_bytes` asks
+libdatachannel, which takes its lock briefly.
 
 ### Gameplay and entity information
 
@@ -373,10 +367,10 @@ own submitting threads before shutdown returns, as with existing posts and packe
 
 A disconnect completion reports the close being initiated, not a remote acknowledgment. Repeated attempts
 return `TOO_LATE` once closing, or `STALE_HANDLE` after detachment. Managed reasons use a Bedrock Disconnect
-packet through normal encryption/compression, bypassing packet listeners, before closing the reliable transport.
-Delivery is best effort and depends on the peer and connection phase. `FAILED` can mean the reason failed to encode
-or send; the transport still closes. In passthrough, the encrypted session is opaque, so the reason is ignored and
-only the RakNet disconnect is sent. It is never sent as unencrypted chat. Disconnect also invalidates queued injections.
+packet through normal compression, bypassing packet listeners, then close the connection once what is queued has
+gone out, for up to 2 s. Delivery is best effort and depends on the peer and connection phase. `FAILED` can mean the
+reason failed to encode or send; the transport still closes. In passthrough the proxy doesn't own the session, so the
+reason is ignored and only the connection is closed. It is never sent as chat. Disconnect also invalidates queued injections.
 
 A transfer completion reports that the state machine started. Its eventual outcome still arrives through the
 existing transfer events. Worker delivery returns `UNSUPPORTED` in passthrough, `BUSY` during another transfer or
@@ -404,7 +398,7 @@ logs and rate-limited slow-callback diagnostics retain their existing behavior; 
 - Plugins load once at startup and unload at shutdown. There is no hot reload, and a crashing or hanging plugin
   takes the proxy with it.
 - Packet hooks, commands, messages and injection need managed mode. Passthrough only gets events, player
-  information, networking snapshots and the RakNet-level disconnect.
+  information, networking snapshots and the transport-level disconnect.
 - Typed fields cover Text and RequestChunkRadius, and injection accepts only those two. Other packets are raw bytes.
 - Every hook, command or tracking capability that needs in-game batches turns off the opaque relay for that
   direction, and with more than one backend every batch is decoded anyway for transfers.
