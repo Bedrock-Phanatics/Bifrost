@@ -95,7 +95,8 @@ test "global max_players holds across workers" {
     var connected: usize = 0;
     defer for (players[0..connected]) |*player| player.deinit();
     for (0..players.len) |_| {
-        players[connected] = try Player.connect(io, running.address());
+        // A turned-away player can lose the race and see its dial fail instead of its first echo
+        players[connected] = Player.connect(io, running.address()) catch continue;
         connected += 1;
     }
     var admitted: usize = 0;
