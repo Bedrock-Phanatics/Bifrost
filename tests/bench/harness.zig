@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const raknet = @import("raknet");
 const bedwire = @import("bedwire");
+const net = @import("net");
 const bifrost = @import("bifrost");
 const managed = @import("managed.zig");
 
@@ -38,14 +38,13 @@ pub const Snapshot = struct {
     handshakes: u64 = 0,
     gave_up: u64 = 0,
     heap_bytes: u64 = 0,
-    session_bytes: u64 = 0,
     relayed: u64 = 0,
     decoded: u64 = 0,
     allocations: u64 = 0,
     per_worker: [max_workers]u64 = @splat(0),
     workers: usize = 0,
 
-    const scalar_fields = 15;
+    const scalar_fields = 14;
 
     pub fn write(self: Snapshot, w: *std.Io.Writer) !void {
         inline for (@typeInfo(Snapshot).@"struct".field_names[0..scalar_fields]) |name| try w.print("{d} ", .{@field(self, name)});
@@ -300,7 +299,7 @@ pub const Frames = struct {
     request: []u8,
     settings: []u8,
     login: []u8,
-    handshake: []u8,
+    status: []u8,
 
     const limits: bedwire.Limits = .{};
 
@@ -335,15 +334,15 @@ pub const Frames = struct {
             .packet = .{ .login = .{ .client_network_version = version, .connection_request = token } },
         }));
         errdefer gpa.free(login);
-        const handshake = try compressed(gpa, try encode(buffer, .{
-            .header = .{ .packet_id = Current.packetId(.server_to_client_handshake).? },
-            .packet = .{ .server_to_client_handshake = .{ .handshake_web_token = "header.payload.signature" } },
+        const status = try compressed(gpa, try encode(buffer, .{
+            .header = .{ .packet_id = Current.packetId(.play_status).? },
+            .packet = .{ .play_status = .{ .status = .loginsuccess } },
         }));
-        return .{ .gpa = gpa, .request = request, .settings = settings, .login = login, .handshake = handshake };
+        return .{ .gpa = gpa, .request = request, .settings = settings, .login = login, .status = status };
     }
 
     pub fn deinit(self: *Frames) void {
-        for ([_][]u8{ self.request, self.settings, self.login, self.handshake }) |frame| self.gpa.free(frame);
+        for ([_][]u8{ self.request, self.settings, self.login, self.status }) |frame| self.gpa.free(frame);
     }
 
     fn encode(buffer: []u8, envelope: bedwire.protocol.typed.Envelope) ![]const u8 {
@@ -352,13 +351,13 @@ pub const Frames = struct {
         return writer.written();
     }
 
+    // NetherNet batches have no 0xfe header
     fn plain(gpa: std.mem.Allocator, packet: []const u8) ![]u8 {
         const frame = try gpa.alloc(u8, packet.len + 16);
         errdefer gpa.free(frame);
-        frame[0] = bedwire.framing.batch.header;
-        var writer = bedwire.framing.batch.Writer.init(frame[1..], limits);
+        var writer = bedwire.framing.batch.Writer.init(frame, limits);
         try writer.append(packet);
-        return gpa.realloc(frame, 1 + writer.written().len);
+        return gpa.realloc(frame, writer.written().len);
     }
 
     fn compressed(gpa: std.mem.Allocator, packet: []const u8) ![]u8 {
@@ -372,84 +371,81 @@ pub const Frames = struct {
         defer gpa.destroy(scratch);
         const frame = try gpa.alloc(u8, packet.len * 2 + 64);
         errdefer gpa.free(frame);
-        const framed = try codec.encode(writer.written(), frame[2..], scratch);
-        frame[0] = bedwire.framing.batch.header;
-        frame[1] = @backingInt(framed.algorithm);
-        return gpa.realloc(frame, 2 + framed.bytes.len);
+        const framed = try codec.encode(writer.written(), frame[1..], scratch);
+        frame[0] = @backingInt(framed.algorithm);
+        return gpa.realloc(frame, 1 + framed.bytes.len);
     }
 };
 
 /// Answers the fake handshake, then echoes everything
 pub const Backend = struct {
+    gpa: std.mem.Allocator,
     io: std.Io,
-    listener: *raknet.Server,
+    server: net.Server = undefined,
+    serving: bool = false,
+    // Holds the port while paused, accepting TCP but never answering, like a hung server
+    parked: ?std.Io.net.Server = null,
+    bound: IpAddress = loopback(0),
     frames: *const Frames,
     task: ?std.Io.Future(void) = null,
     stopping: std.atomic.Value(bool) = .init(false),
     connects: std.atomic.Value(u32) = .init(0),
 
     pub fn start(self: *Backend, gpa: std.mem.Allocator, io: std.Io, frames: *const Frames) !void {
-        var config: raknet.Config = .{};
-        config.listener.maximum_connections = 16_384;
-        config.listener.maximum_pending_handshakes = 16_384;
-        self.* = .{
-            .io = io,
-            .listener = try raknet.Server.listen(gpa, io, loopback(0), .{ .advertisement = "MCPE;bench", .config = config, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000 }),
-            .frames = frames,
-        };
-        errdefer self.listener.destroy();
+        self.* = .{ .gpa = gpa, .io = io, .frames = frames };
         try self.serve();
     }
 
     pub fn deinit(self: *Backend) void {
         self.pause();
-        self.listener.destroy();
+        if (self.parked) |*parked| parked.deinit(self.io);
     }
 
     pub fn port(self: *const Backend) u16 {
-        return self.listener.localAddress().getPort();
+        return self.bound.getPort();
     }
 
     pub fn serve(self: *Backend) !void {
-        if (self.task != null) return;
+        if (self.serving) return;
+        if (self.parked) |*parked| parked.deinit(self.io);
+        self.parked = null;
+        try self.server.start(self.gpa, self.io, self.bound, null);
+        self.bound = self.server.address();
+        self.serving = true;
         self.stopping.store(false, .release);
         self.task = try self.io.concurrent(run, .{self});
     }
 
-    /// Stops answering, so dials and pings time out like a hung server
     pub fn pause(self: *Backend) void {
-        var task = self.task orelse return;
+        if (!self.serving) return;
         self.stopping.store(true, .release);
-        task.await(self.io);
+        self.server.wakeup.signal(self.io);
+        if (self.task) |*task| task.await(self.io);
         self.task = null;
+        self.server.deinit();
+        self.serving = false;
+        self.parked = self.bound.listen(self.io, .{ .reuse_address = true }) catch null;
     }
 
     fn run(self: *Backend) void {
-        while (!self.stopping.load(.acquire)) {
-            _ = self.listener.poll(millis(5), .{
-                .context = self,
-                .connected = onConnected,
-                .message = onMessage,
-            }) catch {};
-        }
+        while (!self.stopping.load(.acquire)) self.server.poll(5, self);
     }
 
-    fn onConnected(context: *anyopaque, _: *raknet.Session) error{ApplicationFailure}!void {
-        const self: *Backend = @ptrCast(@alignCast(context));
+    pub fn connected(self: *Backend, _: *net.Server.Client) !void {
         _ = self.connects.fetchAdd(1, .monotonic);
     }
 
-    fn onMessage(context: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-        const self: *Backend = @ptrCast(@alignCast(context));
-        const bytes = payload.bytes;
+    pub fn message(self: *Backend, client: *net.Server.Client, bytes: []const u8) !void {
         const reply = if (std.mem.eql(u8, bytes, self.frames.request))
             self.frames.settings
         else if (std.mem.eql(u8, bytes, self.frames.login))
-            self.frames.handshake
+            self.frames.status
         else
             bytes;
-        session.send(reply, .reliable_ordered, 0) catch return error.ApplicationFailure;
+        client.send(reply) catch |err| if (err != error.Backpressure) return err;
     }
+
+    pub fn disconnected(_: *Backend, _: *net.Server.Client) void {}
 };
 
 pub const Recorder = struct {
@@ -468,7 +464,7 @@ pub fn stamp(payload: []u8, io: std.Io) void {
 
 pub const Player = struct {
     io: std.Io,
-    client: *raknet.Client,
+    connection: *net.Connection,
     received: u64 = 0,
     matched: bool = false,
     expect: ?[]const u8 = null,
@@ -477,19 +473,23 @@ pub const Player = struct {
     bedrock: ?*managed.Bedrock = null,
 
     pub fn connect(self: *Player, gpa: std.mem.Allocator, io: std.Io, address: IpAddress) !void {
-        self.* = .{ .io = io, .client = try raknet.Client.connect(gpa, io, address, .{}) };
+        self.* = .{ .io = io, .connection = try net.dial(gpa, io, address, null) };
+    }
+
+    pub fn connectAs(self: *Player, gpa: std.mem.Allocator, io: std.Io, address: IpAddress, identity: net.Identity) !void {
+        self.* = .{ .io = io, .connection = try net.dial(gpa, io, address, identity) };
     }
 
     pub fn deinit(self: *Player) void {
-        self.client.destroy();
+        self.connection.destroy();
         if (self.bedrock) |bedrock| bedrock.destroy();
     }
 
     pub fn send(self: *Player, payload: []const u8) !void {
-        const bedrock = self.bedrock orelse return self.client.send(payload, .reliable_ordered, 0);
+        const bedrock = self.bedrock orelse return self.connection.send(payload, .reliable);
         const frame = try bedrock.wrap(payload);
         defer frame.release();
-        try self.client.send(frame.bytes, .reliable_ordered, 0);
+        try self.connection.send(frame.bytes, .reliable);
     }
 
     /// Sends and waits for exactly this reply
@@ -504,7 +504,7 @@ pub const Player = struct {
 
     pub fn handshake(self: *Player, frames: *const Frames) !void {
         try self.exchange(frames.request, frames.settings, 5_000);
-        try self.exchange(frames.login, frames.handshake, 5_000);
+        try self.exchange(frames.login, frames.status, 5_000);
     }
 
     pub fn waitFor(self: *Player, target: u64, timeout_ms: u64) !void {
@@ -515,23 +515,23 @@ pub const Player = struct {
         }
     }
 
-    /// Keeps the session alive while idle
     pub fn idle(self: *Player, ms: i64) !void {
         try self.pollOnce(ms);
-        if (self.client.isClosed()) return error.ConnectionClosed;
+        if (net.closed(self.connection)) return error.ConnectionClosed;
     }
 
+    /// Waits up to `ms` for a message, then takes whatever else is already there
     pub fn pollOnce(self: *Player, ms: i64) !void {
-        _ = self.client.poll(millis(ms), self, onMessage) catch |err| switch (err) {
-            error.Timeout => {},
-            else => return err,
-        };
+        var wait = ms;
+        while (try net.receive(self.connection, wait)) |message| {
+            try self.onMessage(message.data);
+            wait = 0;
+        }
     }
 
-    fn onMessage(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-        const self: *Player = @ptrCast(@alignCast(context));
-        const bedrock = self.bedrock orelse return self.record(payload.bytes);
-        var packets = bedrock.session.ingest(payload.bytes) catch return error.ApplicationFailure;
+    fn onMessage(self: *Player, payload: []const u8) error{ApplicationFailure}!void {
+        const bedrock = self.bedrock orelse return self.record(payload);
+        var packets = bedrock.session.ingest(payload) catch return error.ApplicationFailure;
         defer packets.deinit();
         while (packets.next()) |packet| try self.record(packet.bytes[managed.header_len..]);
     }

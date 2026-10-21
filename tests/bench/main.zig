@@ -4,6 +4,7 @@ const zio = @import("zio");
 const bifrost = @import("bifrost");
 const bench_options = @import("bench_options");
 const sample = @import("sample");
+const net = @import("net");
 const harness = @import("harness.zig");
 const managed = @import("managed.zig");
 const bench_plugins = @import("plugins.zig");
@@ -149,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "players")) {
             const results = try bench_players.run(env.gpa, env.io, env.quick);
             try env.out.print("\nPlayer info {d} B, network output {d} B, rate sampler {d} B per link.\n", .{ @sizeOf(bifrost.plugin_abi.PlayerInfo), @sizeOf(bifrost.plugin_abi.NetworkStats), @sizeOf(bifrost.Plugins.Network.Rates) });
-            try env.out.writeAll("\n## Player APIs\n\nMedian of seven samples, 50,000 calls per quick sample or 500,000 otherwise. Snapshots allocate nothing. Scheduling includes one allocation, queue insertion, drain, callback or action, and free, with no transport I/O. Transport statistics is the underlying RakNet collection baseline. Event cases have 0, 1 or 10 subscribers.\n\n| case | ns per call | allocations per call |\n|---|---|---|\n");
+            try env.out.writeAll("\n## Player APIs\n\nMedian of seven samples, 50,000 calls per quick sample or 500,000 otherwise. Snapshots allocate nothing. Scheduling includes one allocation, queue insertion, drain, callback or action, and free, with no transport I/O. Event cases have 0, 1 or 10 subscribers.\n\n| case | ns per call | allocations per call |\n|---|---|---|\n");
             for (results) |result| try env.out.print("| {t} | {d:.1} | {d:.1} |\n", .{ result.case, result.ns_per_call, result.allocations_per_call });
         }
         if (std.mem.eql(u8, name, "gameplay")) {
@@ -211,7 +212,7 @@ const Env = struct {
 const Memory = struct {
     base_kb: u64 = 0,
     pool_bytes: u64 = 0,
-    per_player: ?struct { players: u64, rss_kb: f64, heap_kb: f64, session_kb: f64 } = null,
+    per_player: ?struct { players: u64, rss_kb: f64, heap_kb: f64 } = null,
     peak: ?struct { kb: u64, what: []const u8 } = null,
     retained: ?struct { players: u64, rss_kb: i64, heap_bytes: i64 } = null,
     churn_kb: [3]u64 = @splat(0),
@@ -221,7 +222,8 @@ const Memory = struct {
 /// args: workers connect_timeout_ms health_interval_ms passthrough|managed+<plugin setup> backend_port...
 fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len < 5) return error.InvalidArguments;
-    var config: bifrost.Config = .{ .bind = harness.loopback(0), .max_players = 16_384 };
+    // Every bench player dials from 127.0.0.1, so the per-IP cap would turn most of them away
+    var config: bifrost.Config = .{ .bind = harness.loopback(0), .max_players = 16_384, .max_negotiations = 256, .max_negotiations_per_ip = 256 };
     config.workers = try std.fmt.parseInt(u8, args[0], 10);
     config.connect_timeout_ms = try std.fmt.parseInt(u32, args[1], 10);
     config.health_interval_ms = try std.fmt.parseInt(u32, args[2], 10);
@@ -229,12 +231,12 @@ fn serveProxy(init: std.process.Init, args: []const [:0]const u8) !void {
     for (args[4..]) |port| try config.addBackend(null, harness.loopback(try std.fmt.parseInt(u16, port, 10)));
     var keys = try sample.keySet(init.gpa);
     defer keys.deinit();
-    var options: bifrost.Workers.Options = .{};
+    var options: bifrost.Workers.Options = .{ .identity = bifrost.NetherNet.KeyPair.generate(init.io) };
     var plugins: bifrost.Plugins = try .init(init.gpa, config.backends(), .{ .workers = config.workers });
     defer plugins.deinit();
     if (std.mem.startsWith(u8, args[3], "managed+")) {
         config.session_mode = .managed;
-        options = .{ .auth = .{ .verify = &keys }, .proxy_key = managed.proxyKey(), .plugins = &plugins };
+        options = .{ .auth = .{ .verify = &keys }, .proxy_key = managed.proxyKey(), .plugins = &plugins, .identity = options.identity, .issuer_keys = sample.jwks_json };
         const setup = args[3]["managed+".len..];
         if (std.mem.eql(u8, setup, "inject-player")) {
             try bench_injection.loadTransport(&plugins, .player);
@@ -288,10 +290,9 @@ fn snapshot(io: std.Io, workers: *bifrost.Workers, heap: *const harness.Counting
         .closed = totals.links_closed,
         .backend_failures = totals.backend_failures,
         .backends_connected = totals.backends_connected,
-        .handshakes = totals.handshakes_observed,
+        .handshakes = totals.logins_observed,
         .gave_up = totals.observer_gave_up,
         .heap_bytes = heap.live.load(.monotonic),
-        .session_bytes = totals.session_memory_bytes,
         .relayed = totals.managed_relayed_batches,
         .decoded = totals.managed_decoded_batches,
         .allocations = heap.allocations.load(.monotonic),
@@ -708,23 +709,23 @@ const InjectionJob = struct {
                     if (len != self.packet.len) return error.InvalidBenchmarkPacket;
                     const frame = try session.encodeOne(self.packet);
                     defer frame.release();
-                    try self.player.client.send(frame.bytes, .reliable_ordered, 0);
+                    try self.player.connection.send(frame.bytes, .reliable);
                 }
             } else if (self.received == self.sent) {
                 return;
             } else if (now > self.until_ns + 3 * std.time.ns_per_s) {
                 return error.ReplyTimedOut;
             }
-            _ = self.player.client.poll(harness.millis(10), self, onMessage) catch |err| switch (err) {
-                error.Timeout => {},
-                else => return err,
-            };
+            var wait: i64 = 10;
+            while (try net.receive(self.player.connection, wait)) |message| {
+                try self.onMessage(message.data);
+                wait = 0;
+            }
         }
     }
 
-    fn onMessage(context: *anyopaque, payload: @import("raknet").BorrowedPayload) error{ApplicationFailure}!void {
-        const self: *InjectionJob = @ptrCast(@alignCast(context));
-        var packets = self.player.bedrock.?.session.ingest(payload.bytes) catch return error.ApplicationFailure;
+    fn onMessage(self: *InjectionJob, payload: []const u8) error{ApplicationFailure}!void {
+        var packets = self.player.bedrock.?.session.ingest(payload) catch return error.ApplicationFailure;
         defer packets.deinit();
         while (packets.next()) |packet| self.record(packet.bytes) catch return error.ApplicationFailure;
     }
@@ -836,10 +837,6 @@ fn injectionDistribution(snapshot_value: Snapshot, workers: u8, players: usize) 
 }
 
 fn injectionScenario(env: *Env, mode: enum { transport, workers }) !void {
-    if (mode == .workers and !bifrost.Config.multi_worker_supported) {
-        try env.out.writeAll("\n## Packet injection workers\n\nSkipped: multiple reuse-port workers require Linux.\n");
-        return;
-    }
     const sample_ms = if (mode == .workers) @max(2000, env.iterationMs()) else env.iterationMs();
     try env.out.print("\n## Packet injection transport\n\nEncrypted managed sessions, deflate above 256 B, pseudorandom printable Text messages. Each request is canceled by a plugin and injected to the player or backend; the backend echoes Text to the player. Throughput counts verified replies received within each timed interval, latency includes drained replies. Sequence, content and exact delivery counts are checked, and every player must make progress. CPU and resident memory cover only the proxy process; peak memory is its lifetime peak. Allocations are measured separately by the injection queue benchmark. Sampling {d} intervals of {d} ms after {d} ms warmup.\n\n| workers | target | packet bytes | load | replies/s median [min-max] | p50 us | p95 us | p99 us | proxy CPU % | resident KiB | peak resident KiB | connected players per worker |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n", .{ env.iterations(), sample_ms, env.warmupMs() });
     const worker_counts = [_]u8{ 1, 2, 4 };
@@ -856,9 +853,8 @@ fn injectionScenario(env: *Env, mode: enum { transport, workers }) !void {
         var joined: usize = 0;
         defer for (players[0..joined]) |*player| player.deinit();
         for (players, 0..) |*player, i| {
-            try player.connect(env.gpa, env.io, proxy.address());
+            try managed.join(env.gpa, env.io, player, proxy.address(), @intCast(i + 2));
             joined += 1;
-            try managed.join(env.gpa, env.io, player, @intCast(i + 2));
         }
         const distribution = try proxy.stats();
         try injectionDistribution(distribution, workers, players.len);
@@ -996,9 +992,14 @@ fn managedScenario(env: *Env) !void {
         }
         const started = nowNs(env.io);
         for (players, 0..) |*player, i| {
-            try player.connect(env.gpa, env.io, proxy.address());
-            joined += 1;
-            if (setup.managed) try managed.join(env.gpa, env.io, player, @intCast(i + 2)) else try player.handshake(env.frames);
+            if (setup.managed) {
+                try managed.join(env.gpa, env.io, player, proxy.address(), @intCast(i + 2));
+                joined += 1;
+            } else {
+                try player.connect(env.gpa, env.io, proxy.address());
+                joined += 1;
+                try player.handshake(env.frames);
+            }
         }
         join.* = elapsedS(env.io, started) * 1000 / @as(f64, @floatFromInt(players.len));
         for (managed_sizes, setup_rows) |size, *pair| for (pair, 0..) |*row, loaded| {
@@ -1213,9 +1214,8 @@ fn pluginsScenario(env: *Env) !void {
             env.gpa.free(players);
         }
         for (players, 0..) |*player, i| {
-            try player.connect(env.gpa, env.io, proxy.address());
+            try managed.join(env.gpa, env.io, player, proxy.address(), @intCast(i + 2));
             joined += 1;
-            try managed.join(env.gpa, env.io, player, @intCast(i + 2));
         }
         heap[1] = ((try proxy.stats()).heap_bytes - heap[0]) / players.len;
         result[0] = try relay(env, &proxy, players[0..1], 512, 1);
@@ -1334,8 +1334,8 @@ fn handshakeScenario(env: *Env) !void {
         \\
         \\## Handshake observer
         \\
-        \\Per player: RequestNetworkSettings -> NetworkSettings, then compressed Login ({d} B, fragmented) -> ServerToClientHandshake,
-        \\which ends the Tap. "Raw" is the same two exchanges with identical sizes after the Tap is off.
+        \\Per player: RequestNetworkSettings -> NetworkSettings, then compressed Login ({d} B, fragmented) -> PlayStatus,
+        \\which ends the Tap. The first exchange also waits for the backend dial. "Raw" is the same two exchanges with identical sizes after the Tap is off.
         \\{d} players, 8 at a time, after {d} warmup players. Times are for both exchanges, in us.
         \\
         \\| path | p50 | p95 | p99 |
@@ -1488,10 +1488,10 @@ fn connectionsScenario(env: *Env) !void {
         \\
         \\## Connections
         \\
-        \\Each player connects, completes the observed handshake and one echo, with at most 64 joins in flight.
-        \\Everyone then leaves at once; leave time runs until the proxy has freed every link.
-        \\Each size runs two waves on one fresh proxy. "Drops" is the host's UDP RcvbufErrors delta: leave notifications
-        \\the kernel dropped are only cleaned up by RakNet's 10 s idle timeout, which then dominates leaves/s.
+        \\Each player connects over NetherNet (HTTP signaling, ICE, DTLS, SCTP), completes the observed login and one
+        \\echo, with at most 64 joins in flight; the proxy dials its backend the same way. Everyone then leaves at once;
+        \\leave time runs until the proxy has freed every link. Each size runs two waves on one fresh proxy. "Drops" is the
+        \\host's UDP RcvbufErrors delta, Linux only.
         \\
         \\| players | wave | joined | joins/s | join p50 ms | join p99 ms | leaves/s | drops |
         \\|---|---|---|---|---|---|---|---|
@@ -1506,14 +1506,13 @@ fn connectionsScenario(env: *Env) !void {
 
     try env.out.print(
         \\
-        \\Memory per held player, first wave vs the fresh proxy. Heap is live bytes through Bifrost's allocator; RakNet session
-        \\is the listener's session quota, published after each worker turn; the rest of the heap is the backend RakNet client,
-        \\Link, Tap and pending queue. Heap and session samples can represent different instants.
+        \\Memory per held player, first wave vs the fresh proxy. Heap is live bytes through Bifrost's allocator, which
+        \\nethernet-zig's two connections per player also use; libdatachannel's own C++ allocations only show in RSS.
         \\RSS stays near its peak after players leave because the allocator keeps freed pages; heap after leave shows what is
         \\really still allocated.
         \\
-        \\| players | RSS/player | heap/player | RakNet session | rest of heap | RSS held, wave 1 / 2 | RSS after leave | heap after leave |
-        \\|---|---|---|---|---|---|---|---|
+        \\| players | RSS/player | heap/player | RSS held, wave 1 / 2 | RSS after leave | heap after leave |
+        \\|---|---|---|---|---|---|
         \\
     , .{});
     for (counts, 0..) |count, i| {
@@ -1522,13 +1521,13 @@ fn connectionsScenario(env: *Env) !void {
         const second = waves[i][1];
         const rss = perPlayerKib(first.held.rss_kb, base.rss_kb, first.joined, 1);
         const heap = perPlayerKib(first.held.heap_bytes, base.heap_bytes, first.joined, 1024);
-        const session = perPlayerKib(first.held.session_bytes, base.session_bytes, first.joined, 1024);
         const heap_left = @as(i64, @intCast(second.after.heap_bytes)) - @as(i64, @intCast(base.heap_bytes));
-        try env.out.print("| {d} | {d:.1} KiB | {d:.1} KiB | {d:.1} KiB | {d:.1} KiB | {d} / {d} KiB | {d} KiB | {d} B |\n", .{
-            count,             rss,                heap,                session,   heap - session,
-            first.held.rss_kb, second.held.rss_kb, second.after.rss_kb, heap_left,
+        try env.out.print("| {d} | {d:.1} KiB | {d:.1} KiB | {d} / {d} KiB | {d} KiB | {d} B |\n", .{
+            count,             rss,                heap,
+            first.held.rss_kb, second.held.rss_kb, second.after.rss_kb,
+            heap_left,
         });
-        env.memory.per_player = .{ .players = first.joined, .rss_kb = rss, .heap_kb = heap, .session_kb = session };
+        env.memory.per_player = .{ .players = first.joined, .rss_kb = rss, .heap_kb = heap };
         env.memory.retained = .{ .players = first.joined, .rss_kb = @as(i64, @intCast(second.after.rss_kb)) - @as(i64, @intCast(base.rss_kb)), .heap_bytes = heap_left };
     }
     try env.out.flush();
@@ -1627,17 +1626,13 @@ fn workersScenario(env: *Env) !void {
         \\## Workers
         \\
         \\{d} players, {d} B echoes, {d} in flight each, 4 backends. CPU is proxy CPU time over wall time while measuring (100% = one core).
-        \\Players spread across workers by the kernel's SO_REUSEPORT hash.
+        \\One listener hands players to workers round robin.
         \\
         \\| workers | round trips/s | MiB/s | p50 us | p99 us | proxy CPU | RSS | players per worker |
         \\|---|---|---|---|---|---|---|---|
         \\
     , .{ player_count, size, window });
     for ([_]u8{ 1, 2, 4, 8 }) |workers| {
-        if (workers > 1 and !bifrost.Config.multi_worker_supported) {
-            try env.out.print("| {d} | Linux only |\n", .{workers});
-            continue;
-        }
         if (workers > env.cpus) continue;
         var proxy: Proxy = undefined;
         try env.startProxy(&proxy, .{ .workers = workers, .backends = backends.ports });
@@ -1837,7 +1832,7 @@ fn memorySummary(env: *Env) !void {
     if (memory.pool_bytes != 0) try env.out.print("| Bedwire observer pool per worker (reserved, touched only by Login) | {Bi} |\n", .{memory.pool_bytes});
     if (memory.per_player) |per| {
         try env.out.print("| per held player at {d} players, RSS | {d:.1} KiB |\n", .{ per.players, per.rss_kb });
-        try env.out.print("| per held player, heap: RakNet session + rest (backend client, Link, Tap) | {d:.1} + {d:.1} KiB |\n", .{ per.session_kb, per.heap_kb - per.session_kb });
+        try env.out.print("| per held player, heap (Link, two NetherNet connections, Tap) | {d:.1} KiB |\n", .{per.heap_kb});
     }
     if (memory.peak) |peak| try env.out.print("| peak RSS, {s} | {d} KiB |\n", .{ peak.what, peak.kb });
     if (memory.retained) |retained| try env.out.print("| after two waves of {d} players left: RSS above fresh / heap above fresh | {d} KiB / {d} B |\n", .{ retained.players, retained.rss_kb, retained.heap_bytes });

@@ -1245,3 +1245,41 @@ session, so that index is only consulted by plugin calls that already cost tens 
 Tracy: zig-gamedev/ztracy's build script doesn't run on Zig 0.17, so `-Dtracy=true` compiles Tracy v0.13.1's client
 directly behind `src/trace.zig`. Default builds don't fetch or link it. Metrics add two clock reads per worker turn
 and plain stores for the new counters; the RakNet totals are sampled once a second with the deadline sweep.
+
+## NetherNet, 2.0.0-rc.1
+
+Recorded 2026-10-20 on Windows 11, 12 logical CPUs, Zig 0.17.0, ReleaseFast, `-- --quick`. RakNet is gone, so the
+comparison is against the last Windows RakNet numbers above (`## Windows`) on the same machine. Every hop is now
+HTTP signaling, ICE, DTLS and SCTP through libdatachannel's thread pool (4 threads per process), and the bench
+driver hosts its players and backends in one more such process.
+
+| case | RakNet (Windows) | NetherNet |
+|---|---|---|
+| relay 512 B 1x1, round trips/s | 5076 (p50 155 us, p99 303 us) | 2470 (p50 391 us, p99 536 us) |
+| relay 64 B 1x1 | | 2348 (p50 405 us), 73% proxy CPU |
+| relay 512 B 8x32 | | 10016, 4.9 MiB/s, 217% proxy CPU |
+| relay 8 KiB 8x32 | | 1718, 13.4 MiB/s, 286% proxy CPU |
+| allocations per relayed round trip | | 0.00 in every relay and managed case |
+| joins/s, 500 players, 64 in flight | 1149 (1 healthy backend) | 127 / 117 (p50 418 / 466 ms) |
+| churn cycles/s, 32 tasks | 307 to 836 | 121 to 137, 0 failed |
+| RSS per held player, 500 players | Linux only before | 675 KiB |
+| fresh proxy RSS | | 8212 KiB |
+
+A round trip crosses four DTLS/SCTP legs, each a thread handoff into libdatachannel and back, so latency per hop
+roughly doubles against RakNet. Joins are bound by two WebRTC handshakes per player (player and backend dial),
+each with an ECDSA P-384 identity signature, which is why the join rate is about a tenth of RakNet's. The
+observed-handshake row in the scenario includes the backend dial, about 25 ms, that the raw row doesn't.
+
+Memory: each player holds two connections. The receive ring was 1 MiB per connection and gets touched page by
+page as it wraps, so it is now 512 KiB; heap per player went from 3086 to 2062 KiB, most of it reserved and never
+touched (scratch and send buffers sized for a full 256 KiB SCTP message). Most of the 675 KiB RSS per player is
+libdatachannel's own per-connection state, which only shows in RSS. Churn rounds return to the same heap.
+
+Workers, 32 players at 512 B 8x32: 1 / 2 / 4 / 8 workers at 10572 / 11588 / 12898 / 10984 round trips/s. Bifrost
+workers aren't the bottleneck any more; the shared native pool is (`[nethernet] threads`).
+
+Managed, 256 B 8x32 from the same run: passthrough 11506, managed relayed 9752, managed with transfers possible
+(every batch decoded) 6190 round trips/s. Join time per player 24.7 ms passthrough, 35.5 ms managed.
+
+The first quick run let only 8 of 100 and 117 of 500 bench players in: every bench player dials from 127.0.0.1
+and `max_negotiations_per_ip` defaults to 4. The bench proxy now raises both negotiation limits.

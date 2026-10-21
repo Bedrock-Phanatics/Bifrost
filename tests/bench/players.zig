@@ -1,11 +1,10 @@
 const std = @import("std");
 const bifrost = @import("bifrost");
-const raknet = @import("raknet");
 const harness = @import("harness.zig");
 const abi = bifrost.plugin_abi;
 const Network = bifrost.Plugins.Network;
 
-pub const Case = enum { player_info, transport_statistics, network_snapshot, rate_sample, worker_post, disconnect_action, event_0, event_1, event_10 };
+pub const Case = enum { player_info, network_snapshot, rate_sample, worker_post, disconnect_action, event_0, event_1, event_10 };
 pub const Result = struct { case: Case, ns_per_call: f64, allocations_per_call: f64 };
 
 var host: *const abi.Host = undefined;
@@ -30,7 +29,6 @@ fn noTransfer(_: *anyopaque, _: u64, _: u32) abi.Status {
 }
 
 const Runner = struct {
-    core: raknet.advanced.session.Core,
     api: *const abi.Host,
     io: std.Io,
     case: Case = .network_snapshot,
@@ -40,7 +38,7 @@ const Runner = struct {
 
     fn network(context: *anyopaque, _: u64, _: abi.PacketTarget, out: *abi.NetworkStats) abi.Status {
         const self: *Runner = @ptrCast(@alignCast(context));
-        out.* = Network.snapshot(self.core.statistics(), harness.nowNs(self.io) / std.time.ns_per_ms);
+        out.* = .{ .mtu = 1200, .available = abi.NetworkMetric.queues, .sampled_at_ms = harness.nowNs(self.io) / std.time.ns_per_ms, .queued_bytes = 4096 };
         return .ok;
     }
 
@@ -63,14 +61,13 @@ const Runner = struct {
                 if (self.api.player_info(self.api.context, player, &info, @sizeOf(abi.PlayerInfo)) != .ok) self.failed = true;
                 std.mem.doNotOptimizeAway(info);
             },
-            .transport_statistics => std.mem.doNotOptimizeAway(self.core.statistics()),
             .network_snapshot => {
                 if (self.api.network_stats(self.api.context, player, .player, &snapshot, @sizeOf(abi.NetworkStats)) != .ok) self.failed = true;
                 std.mem.doNotOptimizeAway(snapshot);
             },
             .rate_sample => {
                 snapshot.sampled_at_ms = i * 250;
-                rates.sample(.{ .bytes_received = i * 1024, .datagrams_received = i }, &snapshot);
+                rates.sample(.{ .bytes_received = i * 1024, .messages_received = i }, &snapshot);
                 std.mem.doNotOptimizeAway(snapshot);
             },
             else => unreachable,
@@ -95,20 +92,16 @@ const Sink = struct {
     }
 };
 
-pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![9]Result {
+pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![8]Result {
     var heap: harness.CountingAllocator = .{ .backing = gpa };
-    var results: [9]Result = undefined;
+    var results: [8]Result = undefined;
     const loops: usize = if (quick) 50_000 else 500_000;
     for (std.meta.tags(Case), &results) |case, *result| {
         var plugins: bifrost.Plugins = try .init(heap.allocator(), &.{}, .{ .slow_callback_ns = std.math.maxInt(u64) });
         defer plugins.deinit();
         events = if (case == .event_10) 10 else if (case == .event_1) 1 else 0;
         for (0..@max(events, 1)) |_| try plugins.add(init, null);
-        var runner: Runner = .{ .core = try .init(gpa, 1400, .{}), .api = host, .io = io, .loops = loops, .case = case };
-        defer runner.core.deinit();
-        runner.core.rtt_state.observe(125);
-        runner.core.acknowledged_datagrams = 1000;
-        runner.core.lost_datagrams = 10;
+        var runner: Runner = .{ .api = host, .io = io, .loops = loops, .case = case };
         const player = try plugins.handles.acquire(heap.allocator(), .{ .context = &runner, .link = 1, .transfer = noTransfer, .network = Runner.network, .io = io });
         plugins.handles.setIdentity(player, "Steve", "2535400000000001", "00000000-0000-0000-0000-000000000001", true);
         var sink: Sink = .{};
@@ -140,7 +133,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, quick: bool) ![9]Result {
                 },
             }
             const count = heap.allocations.load(.monotonic) - before;
-            allocations += count - @intFromBool(case == .player_info or case == .transport_statistics or case == .network_snapshot or case == .rate_sample);
+            allocations += count - @intFromBool(case == .player_info or case == .network_snapshot or case == .rate_sample);
             if (heap.live.load(.monotonic) != baseline or runner.failed) return error.InvalidBenchmark;
         }
         std.mem.sort(u64, &times, {}, std.sort.asc(u64));
