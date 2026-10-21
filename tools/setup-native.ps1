@@ -17,5 +17,7 @@ git -C .deps/nethernet-zig checkout --quiet $commit
 if ($LASTEXITCODE -ne 0) { throw "can't check out nethernet-zig $commit" }
 
 & .deps/nethernet-zig/tools/setup-native.ps1 @args
+# That script moves into its own checkout
+Set-Location -LiteralPath $root
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue .deps/native
 Copy-Item -Recurse .deps/nethernet-zig/.deps/native .deps/native
