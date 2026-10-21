@@ -76,12 +76,13 @@ stops a captured Login being replayed.
 Backends must accept NetherNet over HTTP signaling, as vanilla servers and Quark v6 do. The player's identity
 can't be carried across a proxy hop, so a backend has to trust Bifrost for it:
 
-- **managed** logs in to the backend with a Login re-signed by the proxy key. The backend must trust that key.
+- **managed** dials and logs in to the backend with the proxy key, re-signing the Login. The backend must trust
+  that key.
 - **passthrough** forwards the player's own Login, which no longer matches the key Bifrost proves to the backend.
   The backend must skip that check for Bifrost's connection.
 
-Quark v6 has neither yet: with `xbox-auth = true` it rejects both, and with `xbox-auth = false` managed mode
-works but players have no XUID. See [Backend support](docs/backends.md).
+Bifrost logs the key to trust at startup. Quark v6 trusts it through `network.trusted-proxy-keys`. Start with
+the [setup guide](docs/setup.md); [Backend support](docs/backends.md) has the details.
 
 ## Plugin Development
 

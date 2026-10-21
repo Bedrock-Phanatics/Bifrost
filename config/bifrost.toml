@@ -59,7 +59,8 @@ mode = "off"
 # keys_file = "minecraft-keys.json"
 
 [session]
-# "managed" needs auth mode = "verify", and backends must trust the proxy key it logs
+# "managed" needs auth mode = "verify", and backends must trust the proxy key it logs. It is the setup to use
+# in production, see docs/setup.md
 mode = "passthrough"
 # proxy_key_file = "bifrost-proxy.key"
 

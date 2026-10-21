@@ -13,8 +13,8 @@ Bifrost reaches every backend over NetherNet, the same way a player does. A back
 3. **A way to trust the proxy.** Bifrost proves its own key when it dials (`[nethernet] identity_file`, a
    self-signed ES384 identity in the SDP). It can't prove the player's key, because that needs the player's private
    key. So:
-   - in **managed** mode the backend gets a Login re-signed by the proxy key (`[session] proxy_key_file`, logged at
-     startup) and must accept that key as an issuer;
+   - in **managed** mode Bifrost dials with the proxy key (`[session] proxy_key_file`, logged at startup) and
+     re-signs the Login with it, and the backend must accept that key as an issuer;
    - in **passthrough** mode the backend gets the player's own Login and must skip comparing its key with the
      NetherNet identity for connections from Bifrost's key. Bifrost has already made that comparison itself.
 
@@ -25,28 +25,38 @@ replayed Login, and Bifrost doesn't try to work around it.
 ## Quark v6
 
 Quark v6 serves NetherNet from `src/network/mcpe/nethernet` using the PHP `webrtc` extension, with HTTP signaling
-on `server-port`. Framing, the missing encryption handshake and the status endpoint all match. What it lacks:
+on `server-port`. Framing, the missing encryption handshake and the status endpoint all match.
 
-| needed | Quark v6 today |
-| --- | --- |
-| trust a proxy's Login signer | none; a Login not signed by Microsoft is treated as self-signed and only allowed with `xbox-auth = false`, and then the player gets no XUID |
-| skip the Login-to-transport key check for a trusted proxy | none; with an authenticated Login the check always runs, and the player is kicked before any plugin event |
-| verify the dialing identity's issuer | none; any well-formed, unexpired ES384 token is accepted, so pinning Bifrost's key would need new code |
+Since Quark `acad4380b` (branch `v6.0.0`) it can trust Bifrost. Copy the key Bifrost logs at startup
+("backends must trust proxy key ...") into `server.toml`:
 
-So today, with Quark v6:
+```toml
+[network]
+trusted-proxy-keys = ["MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE..."]
+```
 
-- **managed** works only with `xbox-auth = false`. Players get in, but without a XUID, and `player.verify-xuid`
-  then kicks anyone whose saved data has one.
-- **passthrough** doesn't work. With Xbox auth on, the forwarded Login fails the key check against Bifrost's
-  identity. With it off, Quark still validates the Login and runs the same check.
+- **managed** dials with the proxy key and signs the Login with it, so one key covers both. Quark takes the
+  name, UUID and XUID from the Login and counts the player as Xbox authenticated when a XUID is present. With
+  `[auth] mode = "off"` there is no XUID, so the player only gets in with `xbox-auth = false`.
+- **passthrough** dials with `[nethernet] identity_file`, and that is the key logged. Quark verifies the forwarded
+  Xbox Login as usual and only skips comparing it with the NetherNet identity.
 
-Closing the gap needs a trusted-proxy option in Quark: a list of proxy keys whose NetherNet connections may
-present a Login signed by that key (managed) or skip the transport key check (passthrough), keeping the XUID from
-the Login. Until then, run Bifrost in front of Quark only for offline or testing setups.
+Managed Logins also carry a signed `PlayerAddress` claim, which Quark `a2cf1f81e` and newer use as the session
+IP. Passthrough has nowhere signed to put it, so Quark sees Bifrost's address there. With `[auth] mode = "off"`
+Bifrost dials with a throwaway key, so no backend can be set up to trust Logins nobody verified. See the
+[setup guide](setup.md) for the recommended configuration.
+
+Quark honours a proxy-signed Login only on a NetherNet connection whose identity is a trusted key, and the
+identity assertion proves the dialer holds that key. A trusted proxy can log in as anyone, so list only proxies
+you run. Older Quark builds have none of this: there, managed works only with `xbox-auth = false` and without
+XUIDs, and passthrough doesn't work at all.
+
+This was checked by verifying a bedwire-built proxy Login with Quark's own parsing and signature code. A full
+Bifrost-to-Quark session with a real client hasn't been run.
 
 ## Other backends
 
-gophertunnel-based servers (`minecraft.NetherNet`) behave like Quark here: they check the Login key against the
+gophertunnel-based servers (`minecraft.NetherNet`) behave like older Quark builds: they check the Login key against the
 NetherNet identity whenever the Login is authenticated, and have no proxy trust either. How vanilla BDS treats a
 proxied connection wasn't checked. Bifrost was tested against its own in-process backends built on bedwire and
 nethernet-zig, not against any of these servers.
