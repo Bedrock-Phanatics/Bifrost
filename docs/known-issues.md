@@ -7,20 +7,17 @@ What's open as of 2.0.0-rc.2. Details live in the linked docs.
 - **No real client has joined through Bifrost.** Every test uses in-process players and backends built on bedwire
   and nethernet-zig. Neither a vanilla Bedrock client joining Bifrost nor a full Bifrost-to-Quark session has
   been run. The Quark login path was checked by verifying a bedwire-built login with Quark's own code.
-- **Linux hasn't been run since the NetherNet switch.** It needs libdatachannel built with
-  `tools/setup-native.sh`. Sanitizer and Release-mode runs are also pending.
+- **No sanitizer runs yet.** The full suite passes on Windows and Linux in Debug and ReleaseSafe, but nothing has
+  been run under ThreadSanitizer or AddressSanitizer since the NetherNet switch.
 - **`udp_mux` hasn't been tried with vanilla clients** (`config/bifrost.toml`).
 - **Other backends:** gophertunnel servers and vanilla BDS have no way to trust a proxy, and neither was tested.
   See [Backend support](backends.md).
 
 ## Bugs
 
-- **Messages can be lost on close.** When the proxy closes a backend that's still sending, the backend can miss
-  the last few messages. Separately, a close that lands while SCTP reading is paused drops what SCTP still held.
-  Players who stay connected aren't affected. See [Resource limits](limits.md#backpressure).
-- **One lifecycle test is flaky** ("a leaving player's last packets all reach the proxy and go on to the
-  backend"). It fails about once in several full runs and passes on its own, which fits the close-path loss
-  above.
+- **A close while SCTP reading is paused drops what SCTP still held.** Reading pauses when a receive queue has
+  less than 256 KiB free. Players who stay connected aren't affected. See
+  [Resource limits](limits.md#backpressure).
 
 ## Limits of the design
 

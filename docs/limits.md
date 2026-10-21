@@ -80,12 +80,10 @@ The other way works the same: a backend that falls 1 MiB behind stops Bifrost re
 never fail for lack of room, because reading always stops before the native send buffer could fill. A link
 waiting on one side is woken by the transport the moment that side drains, nothing polls for it.
 
-Closing a connection lets what is already queued go out first, for up to 2 s, so a Disconnect reason or a
-player's last packets still arrive at the proxy. Two gaps remain in the transport. A receive queue with less than
-256 KiB free stops SCTP reading, and if the far end closes while reading is stopped, what SCTP still held is dropped
-with the connection. And when the proxy closes a backend that is still sending to it, the backend can miss the last
-few messages even after SCTP acknowledged them; in tests up to a fifth of a 20-message tail went missing about half
-the time. Neither affects players that stay connected.
+Closing a connection waits, for up to 2 s, until the far end has acknowledged everything already sent, so a
+Disconnect reason or a player's last packets still arrive at the proxy and go on to the backend. One gap remains in the transport. A
+receive queue with less than 256 KiB free stops SCTP reading, and if the far end closes while reading is stopped,
+what SCTP still held is dropped with the connection. It doesn't affect players that stay connected.
 
 ## Diagnostics
 
