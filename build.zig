@@ -5,9 +5,10 @@ const Context = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     bifrost: *std.Build.Module,
-    raknet: *std.Build.Module,
+    nethernet: *std.Build.Module,
     bedwire: *std.Build.Module,
     zio: *std.Build.Module,
+    native_prefix: []const u8,
 
     fn module(self: Context, path: []const u8, imports: []const std.Build.Module.Import) *std.Build.Module {
         return self.b.createModule(.{ .root_source_file = self.b.path(path), .target = self.target, .optimize = self.optimize, .imports = imports });
@@ -15,6 +16,16 @@ const Context = struct {
 
     fn dependency(self: Context, name: []const u8, module_name: []const u8) *std.Build.Module {
         return self.b.dependency(name, .{ .target = self.target, .optimize = self.optimize }).module(module_name);
+    }
+
+    // libdatachannel is a shared library, so anything that runs needs to find it
+    fn native(self: Context, run: *std.Build.Step.Run) void {
+        const b = self.b;
+        switch (self.target.result.os.tag) {
+            .windows => run.setEnvironmentVariable("PATH", b.fmt("{s};{s}", .{ b.pathJoin(&.{ self.native_prefix, "bin" }), b.graph.environ_map.get("PATH") orelse "" })),
+            .linux => run.setEnvironmentVariable("LD_LIBRARY_PATH", b.pathJoin(&.{ self.native_prefix, "lib" })),
+            else => {},
+        }
     }
 };
 
@@ -42,11 +53,13 @@ pub fn build(b: *std.Build) void {
         .target = b.standardTargetOptions(.{}),
         .optimize = b.standardOptimizeOption(.{}),
         .bifrost = undefined,
-        .raknet = undefined,
+        .nethernet = undefined,
         .bedwire = undefined,
         .zio = undefined,
+        .native_prefix = b.option([]const u8, "native-prefix", "Where tools/setup-native installed libdatachannel") orelse
+            (b.root.joinString(b.allocator, ".deps/native") catch @panic("out of memory")),
     };
-    ctx.raknet = ctx.dependency("zig_raknet", "raknet");
+    ctx.nethernet = b.dependency("nethernet", .{ .target = ctx.target, .optimize = ctx.optimize, .@"native-prefix" = ctx.native_prefix }).module("nethernet");
     ctx.bedwire = ctx.dependency("bedwire", "bedwire");
     ctx.zio = ctx.dependency("zio", "zio");
     ctx.bifrost = b.addModule("bifrost", .{
@@ -54,7 +67,7 @@ pub fn build(b: *std.Build) void {
         .target = ctx.target,
         .optimize = ctx.optimize,
         .imports = &.{
-            .{ .name = "raknet", .module = ctx.raknet },
+            .{ .name = "nethernet", .module = ctx.nethernet },
             .{ .name = "toml", .module = ctx.dependency("toml", "toml") },
             .{ .name = "bedwire", .module = ctx.bedwire },
         },
@@ -72,6 +85,7 @@ fn addTracy(ctx: Context) void {
     const enabled = b.option(bool, "tracy", "Build with Tracy profiler zones") orelse false;
     const options = b.addOptions();
     options.addOption(bool, "tracy", enabled);
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
     ctx.bifrost.addImport("build_options", options.createModule());
     if (!enabled) return;
     const tracy = b.lazyDependency("tracy", .{}) orelse return;
@@ -90,8 +104,10 @@ fn addProxy(ctx: Context) void {
     }) });
     exe.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
     b.installArtifact(exe);
+    if (ctx.target.result.os.tag == .windows) b.getInstallStep().dependOn(&b.addInstallFileWithDir(.{ .cwd_relative = b.pathJoin(&.{ ctx.native_prefix, "bin", "libdatachannel.dll" }) }, .bin, "libdatachannel.dll").step);
 
     const run_cmd = b.addRunArtifact(exe);
+    ctx.native(run_cmd);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
     b.step("run", "Run Bifrost").dependOn(&run_cmd.step);
@@ -196,10 +212,12 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run tests whose names contain this text")) |filter| &.{filter} else &.{};
     const unit_tests = b.addTest(.{ .root_module = ctx.bifrost, .filters = filters });
     const fuzz_tests = b.addTest(.{ .root_module = ctx.bifrost, .filters = &.{"native packet codec and injection fuzz"}, .use_llvm = true });
-    b.step("fuzz-test", "Fuzz native packet decoding and injection validation").dependOn(&b.addRunArtifact(fuzz_tests).step);
+    const run_fuzz = b.addRunArtifact(fuzz_tests);
+    ctx.native(run_fuzz);
+    b.step("fuzz-test", "Fuzz native packet decoding and injection validation").dependOn(&run_fuzz.step);
     const integration_tests = b.addTest(.{ .root_module = ctx.module("tests/root.zig", &.{
         .{ .name = "bifrost", .module = ctx.bifrost },
-        .{ .name = "raknet", .module = ctx.raknet },
+        .{ .name = "nethernet", .module = ctx.nethernet },
         .{ .name = "bedwire", .module = ctx.bedwire },
         .{ .name = "zio", .module = ctx.zio },
         .{ .name = "bifrost_plugin_h", .module = plugin.header },
@@ -221,11 +239,17 @@ fn addTests(ctx: Context, plugin: Plugin) void {
     integration_tests.root_module.addImport("test_options", options.createModule());
 
     const step = b.step("test", "Run unit and integration tests");
-    step.dependOn(&b.addRunArtifact(unit_tests).step);
-    step.dependOn(&b.addRunArtifact(integration_tests).step);
+    const run_unit = b.addRunArtifact(unit_tests);
+    ctx.native(run_unit);
+    step.dependOn(&run_unit.step);
+    b.step("unit-test", "Run only the unit tests").dependOn(&run_unit.step);
+    const run_integration = b.addRunArtifact(integration_tests);
+    ctx.native(run_integration);
+    step.dependOn(&run_integration.step);
     step.dependOn(&b.addRunArtifact(plugin.filter_test).step);
 
     const stress = b.addRunArtifact(integration_tests);
+    ctx.native(stress);
     stress.has_side_effects = true;
     b.step("stress", "Run the integration tests again, never from cache").dependOn(&stress.step);
 }
@@ -238,15 +262,18 @@ fn addBench(ctx: Context, packet_filter: *std.Build.Step.Compile) void {
     options.addOptionPath("packet_filter", packet_filter.getEmittedBin());
     const imports: []const std.Build.Module.Import = &.{
         .{ .name = "bifrost", .module = ctx.bifrost },
-        .{ .name = "raknet", .module = ctx.raknet },
+        .{ .name = "nethernet", .module = ctx.nethernet },
         .{ .name = "bedwire", .module = ctx.bedwire },
         .{ .name = "bench_options", .module = options.createModule() },
         .{ .name = "sample", .module = ctx.module("tests/support/sample.zig", &.{.{ .name = "bedwire", .module = ctx.bedwire }}) },
+        .{ .name = "net", .module = ctx.module("tests/support/net.zig", &.{.{ .name = "nethernet", .module = ctx.nethernet }}) },
     };
     // The driver keeps the default scheduler so only the proxy under test changes
     const driver = benchExe(ctx, "bifrost-bench", imports, ctx.zio);
     const bench_tests = b.addTest(.{ .root_module = driver.root_module, .filters = &.{ "benchmark process usage", "handle benchmark", "relay benchmark", "queue designs" } });
-    b.step("bench-test", "Check benchmark counters and resource cleanup").dependOn(&b.addRunArtifact(bench_tests).step);
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    ctx.native(run_bench_tests);
+    b.step("bench-test", "Check benchmark counters and resource cleanup").dependOn(&run_bench_tests.step);
     const proxy = benchExe(ctx, "bifrost-bench-proxy", imports, b.dependency("zio", .{
         .target = ctx.target,
         .optimize = ctx.optimize,
@@ -256,6 +283,7 @@ fn addBench(ctx: Context, packet_filter: *std.Build.Step.Compile) void {
     compile.dependOn(&driver.step);
     compile.dependOn(&proxy.step);
     const run = b.addRunArtifact(driver);
+    ctx.native(run);
     run.addArg("--proxy-exe");
     run.addArtifactArg(proxy);
     run.addPassthruArgs();

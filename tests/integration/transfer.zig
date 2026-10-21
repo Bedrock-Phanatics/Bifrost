@@ -119,7 +119,7 @@ test "leaving or stopping the proxy mid-transfer frees the target in every phase
         switch (phase) {
             .dialing => try rig.waitFor(.transfers_started, 1),
             .logging_in => try fixtures.waitFor(io, &rig.b.logins, 1),
-            .joining => try fixtures.waitFor(io, &rig.b.handshakes, 1),
+            .joining => try fixtures.waitFor(io, &rig.b.admitted, 1),
         }
         if (stop_proxy) {
             rig.running.stop();
@@ -179,7 +179,7 @@ test "an allocation failure anywhere in a transfer fails cleanly" {
     var b: managed.Backend = undefined;
     try b.start(io, proxy_key.public_key);
     defer b.deinit();
-    const options: bifrost.Proxy.Options = .{ .auth = .{ .verify = &keys }, .proxy_key = proxy_key };
+    const options: fixtures.Running.Options = .{ .auth = .{ .verify = &keys }, .proxy_key = proxy_key };
     const proxy_config = try managed.config(&.{ a.address(), b.address() });
 
     var counting: FailOnce = .{ .child = gpa, .fail_at = std.math.maxInt(usize), .armed = .init(false) };
@@ -190,7 +190,7 @@ test "an allocation failure anywhere in a transfer fails cleanly" {
     }
 }
 
-fn transferWith(allocator: *FailOnce, proxy_config: bifrost.Config, options: bifrost.Proxy.Options) !bool {
+fn transferWith(allocator: *FailOnce, proxy_config: bifrost.Config, options: fixtures.Running.Options) !bool {
     var running: Running = undefined;
     try running.startWith(io, allocator.allocator(), proxy_config, options);
     defer running.deinit();

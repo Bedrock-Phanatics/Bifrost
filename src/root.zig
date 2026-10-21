@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const loader = @import("config/loader.zig");
 const Observer = @import("protocol/Observer.zig");
 
+pub const version = @import("build_options").version;
 pub const Config = @import("config/Config.zig");
 pub const Diagnostic = loader.Diagnostic;
 pub const loadConfig = loader.loadFile;
@@ -14,11 +15,17 @@ pub const Budget = @import("proxy/Budget.zig");
 pub const Stats = @import("proxy/Stats.zig");
 pub const Backend = @import("backend/Backend.zig");
 pub const Health = @import("backend/Health.zig");
+pub const NetherNet = @import("net/NetherNet.zig");
+pub const Listener = @import("net/Listener.zig");
+pub const Peer = @import("net/Peer.zig");
 
 pub const Auth = Observer.Auth;
 pub const KeySet = @import("bedwire").auth.KeySet;
 pub const loadKeys = Observer.loadKeys;
-pub const advertisedPlayers = @import("protocol/advertisement.zig").players;
+pub const readKeys = Observer.readKeys;
+pub const parseKeys = Observer.parseKeys;
+pub const loadIdentity = @import("nethernet").identity_file.loadOrCreate;
+pub const setNativeThreads = @import("nethernet").Peer.setNativeThreadPoolSize;
 pub const Managed = @import("session/Managed.zig");
 pub const Plugins = @import("plugin/Plugins.zig");
 pub const plugin_abi = @import("plugin/abi.zig");
@@ -43,7 +50,9 @@ test {
     _ = Backend;
     _ = Health;
     _ = @import("backend/Router.zig");
-    _ = @import("protocol/advertisement.zig");
+    _ = NetherNet;
+    _ = Listener;
+    _ = Peer;
     _ = @import("proxy/PacketQueue.zig");
     _ = Budget;
     _ = @import("proxy/Rate.zig");

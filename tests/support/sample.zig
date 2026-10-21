@@ -4,7 +4,9 @@ const oidc_key = @import("oidc_key.zig");
 
 const protocol = bedwire.protocol;
 const Current = protocol.Current;
-const Ecdsa = bedwire.crypto.spki.Ecdsa;
+pub const Ecdsa = bedwire.crypto.spki.Ecdsa;
+
+pub const jwks_json = oidc_key.jwks_json;
 
 pub fn keySet(allocator: std.mem.Allocator) !bedwire.auth.KeySet {
     return bedwire.auth.KeySet.parse(allocator, oidc_key.jwks_json, .{});
@@ -53,6 +55,17 @@ fn signRsa(allocator: std.mem.Allocator, header: []const u8, payload: []const u8
     bytes[signed_len] = '.';
     _ = encoder.encode(bytes[signed_len + 1 ..], &signature_bytes);
     return bytes;
+}
+
+// The token Minecraft's auth service gives a client for the NetherNet handshake
+pub fn transportToken(allocator: std.mem.Allocator, key: Ecdsa.KeyPair, now: i64) ![]u8 {
+    const claims = try std.fmt.allocPrint(
+        allocator,
+        "{{\"iss\":\"https://authorization.franchise.minecraft-services.net/\",\"aud\":\"api://auth-minecraft-services/multiplayer\",\"iat\":{d},\"exp\":{d},\"cpk\":\"{s}\"}}",
+        .{ now, now + 3600, bedwire.auth.login.encodedPublicKey(key.public_key) },
+    );
+    defer allocator.free(claims);
+    return signRsa(allocator, "{\"alg\":\"RS256\",\"kid\":\"" ++ oidc_key.kid ++ "\"}", claims);
 }
 
 pub fn request(allocator: std.mem.Allocator, key: Ecdsa.KeyPair, client_data_signer: Ecdsa.KeyPair, name: []const u8, xuid: []const u8, now: i64) ![]u8 {

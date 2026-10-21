@@ -1,6 +1,6 @@
 const std = @import("std");
-const raknet = @import("raknet");
 const bedwire = @import("bedwire");
+const Peer = @import("../net/Peer.zig");
 const Budget = @import("../proxy/Budget.zig");
 const PacketQueue = @import("../proxy/PacketQueue.zig");
 const Rate = @import("../proxy/Rate.zig");
@@ -43,6 +43,8 @@ comptime {
 }
 
 pub const PlayerSession = bedwire.Session;
+// NetherNet frames have no 0xfe header, and DTLS stands in for Minecraft's own encryption
+pub const session_policy: bedwire.SessionPolicy = .{ .encryption = .disabled, .batch_header = false };
 pub const BackendSession = bedwire.SessionWithProfile(BackendProfile);
 
 pub const limits: bedwire.Limits = .{
@@ -92,11 +94,11 @@ pub const Hooks = struct {
 pub const Ends = struct {
     io: std.Io,
     stats: *Stats,
-    player: *raknet.Session,
-    backend: ?*raknet.Client,
+    player: *Peer,
+    backend: ?*Peer,
 };
 
-pub const PlayerPhase = enum { settings, login, handshake, ready };
+pub const PlayerPhase = enum { settings, login, ready };
 
 gpa: std.mem.Allocator,
 shared: *Shared,
@@ -129,7 +131,7 @@ inbound: Rate = .unlimited,
 pub fn create(gpa: std.mem.Allocator, shared: *Shared, early_packets: u32, early_bytes: u32) !*Managed {
     const self = try gpa.create(Managed);
     errdefer gpa.destroy(self);
-    var player: PlayerSession = try .init(.server, .{ .pool = &shared.pool });
+    var player: PlayerSession = try .init(.server, .{ .pool = &shared.pool, .policy = session_policy });
     errdefer player.deinit();
     self.* = .{
         .gpa = gpa,
@@ -157,8 +159,8 @@ pub fn inGame(self: *const Managed) bool {
     return self.upstream.phase == .ready and self.player.state == .in_game;
 }
 
-pub fn upstreamContext(self: *Managed, ends: Ends, client: *raknet.Client) Upstream.Context {
-    return .{ .gpa = self.gpa, .io = ends.io, .stats = ends.stats, .shared = self.shared, .client = client };
+pub fn upstreamContext(self: *Managed, ends: Ends, backend: *Peer) Upstream.Context {
+    return .{ .gpa = self.gpa, .io = ends.io, .stats = ends.stats, .shared = self.shared, .backend = backend };
 }
 
 pub fn loginUpstream(self: *Managed, upstream: *Upstream, ctx: Upstream.Context) !void {
@@ -429,7 +431,7 @@ fn relay(source: anytype, dest: anytype, sink: anytype, stats: *Stats, comptime 
         else => return err,
     };
     defer frame.release();
-    sink.send(frame.bytes, .reliable_ordered, 0) catch |err| {
+    sink.send(frame.bytes) catch |err| {
         dest.close();
         return err;
     };
@@ -456,15 +458,15 @@ pub fn fromPlayer(self: *Managed, ends: Ends, payload: []const u8) !void {
     }
     if (self.player_phase == .ready) return self.relayFromPlayer(ends, &packets);
 
-    // Bedwire allows one packet per batch until encryption is up
+    // Bedwire allows one packet per batch until the login is through
     const packet = packets.next() orelse return error.MalformedBatch;
     switch (self.player_phase) {
         .settings => try self.answerSettings(ends, packet),
-        .login => try self.authenticate(ends, packet),
-        .handshake => {
+        .login => {
+            try self.authenticate(ends, packet);
             try self.player.advance(.resource_packs);
             self.player_phase = .ready;
-            if (self.upstream.phase == .waiting_for_login) try self.loginUpstream(&self.upstream, self.upstreamContext(ends, ends.backend.?));
+            if (self.upstream.phase == .waiting_for_login) try self.loginUpstream(&self.upstream, self.upstreamContext(ends, ends.backend orelse return error.BackendClosed));
         },
         .ready => unreachable,
     }
@@ -484,7 +486,7 @@ pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
 
     const packet = packets.next() orelse return error.MalformedBatch;
     const ctx = self.upstreamContext(ends, ends.backend orelse return error.BackendClosed);
-    const progress = self.upstream.receive(ctx, packet) catch |err| {
+    const progress = self.upstream.receive(packet) catch |err| {
         if (err == error.BackendRefused and self.player_phase == .ready) self.sendToPlayer(ends, &.{packet.bytes}) catch {};
         return err;
     };
@@ -502,6 +504,9 @@ pub fn fromBackend(self: *Managed, ends: Ends, payload: []const u8) !void {
             }
             try batch.flush();
             if (next_state) |state| try self.advance(state);
+            // The player waits for this PlayStatus too, and packs may share its batch
+            packets.reset();
+            try self.relayFromBackend(ends, &packets);
         },
     }
 }
@@ -536,21 +541,18 @@ fn authenticate(self: *Managed, ends: Ends, packet: PlayerSession.Packet) !void 
     errdefer identity.deinit();
     const client_data = try clientData(self.gpa, try typed(try self.player.decodePacket(packet), .login));
     errdefer self.gpa.free(client_data);
-
-    var salt: [16]u8 = undefined;
-    ends.io.random(&salt);
-    const token = try bedwire.auth.login.serverHandshake(self.gpa, self.shared.key, salt, limits);
-    defer self.gpa.free(token);
-    const storage = try self.gpa.alloc(u8, token.len + 16);
-    defer self.gpa.free(storage);
-    try self.sendToPlayer(ends, &.{try encodeTyped(storage, .{ .server_to_client_handshake = .{ .handshake_web_token = token } })});
-    try self.player.installServerCrypto(self.shared.key.secret_key, salt);
+    // Without Minecraft encryption a captured Login could be replayed, unless it has to match the key the connection proved
+    const proven = ends.player.identityKey() orelse return error.Unauthenticated;
+    if (!std.mem.eql(u8, &proven.toUncompressedSec1(), &identity.public_key.toUncompressedSec1())) {
+        ends.stats.bump(.logins_rejected, 1);
+        log.info("login rejected: {s} signed in with a key the connection never proved", .{identity.display_name});
+        return error.Unauthenticated;
+    }
 
     ends.stats.bump(.logins_verified, 1);
     log.info("verified {s} (xuid {s})", .{ identity.display_name, identity.xuid });
     self.identity = identity;
     self.client_data = client_data;
-    self.player_phase = .handshake;
 }
 
 fn relayFromPlayer(self: *Managed, ends: Ends, packets: *PlayerSession.Packets) !void {
@@ -674,7 +676,7 @@ pub fn send(session: anytype, sink: anytype, stats: *Stats, comptime counter: st
             return err;
         };
         defer frame.release();
-        sink.send(frame.bytes, .reliable_ordered, 0) catch |err| {
+        sink.send(frame.bytes) catch |err| {
             session.close();
             return err;
         };
@@ -755,7 +757,7 @@ test "failed managed batches release replacement storage before the next player"
     try writer.writeVarU32(Current.packetId(.change_dimension).?);
     packets[8] = writer.written();
     var stats: Stats = .{};
-    var session: raknet.Session = undefined;
+    var session: Peer = undefined;
     const ends: Ends = .{ .io = std.testing.io, .stats = &stats, .player = &session, .backend = null };
     Replace.calls = 0;
     for (0..3) |_| {

@@ -25,7 +25,7 @@ const Setup = struct {
         try self.running.start(io, try managed.config(&.{self.backend.address()}), self.options());
     }
 
-    fn options(self: *Setup) bifrost.Proxy.Options {
+    fn options(self: *Setup) Running.Options {
         return .{ .auth = .{ .verify = &self.keys }, .proxy_key = self.proxy_key };
     }
 
@@ -48,7 +48,8 @@ test "a managed player logs in to a backend as the proxy and relays game packets
     const player = try managed.Player.connect(io, setup.running.address(), 2);
     defer player.destroy();
     try player.login("Steve", "2535400000000001");
-    try std.testing.expect(player.session.encrypted());
+    // DTLS carries the encryption, Minecraft's own is never turned on
+    try std.testing.expect(!player.session.encrypted());
     try player.spawn();
     try player.echo("hello");
     try player.echo(&@as([3000]u8, @splat('x')));
@@ -61,7 +62,7 @@ test "a managed player logs in to a backend as the proxy and relays game packets
     const stats = setup.running.stats();
     try std.testing.expectEqual(@as(u64, 1), stats.logins_verified);
     try std.testing.expectEqual(@as(u64, 1), stats.proxy_logins);
-    try std.testing.expectEqual(@as(u64, 0), stats.handshakes_observed);
+    try std.testing.expectEqual(@as(u64, 0), stats.logins_observed);
     // Snappy on the backend, deflate to the player
     try std.testing.expectEqual(@as(u64, 0), stats.managed_relayed_batches);
     try std.testing.expect(stats.managed_relay_incompatible != 0);
@@ -148,7 +149,6 @@ test "a backend that doesn't trust the proxy key refuses the player" {
     defer player.destroy();
     try player.settings(current_version);
     try player.sendLogin("Steve", "2535400000000001", player.key);
-    try player.finishHandshake();
     try player.awaitClosed();
 
     setup.running.stop();
@@ -201,17 +201,16 @@ test "leaving at every login stage frees the managed link" {
     try setup.start(try trusted());
     defer setup.deinit();
 
-    for (0..5) |stage| {
+    for (0..4) |stage| {
         const player = try managed.Player.connect(io, setup.running.address(), 2);
         if (stage >= 1) try player.settings(current_version);
         if (stage >= 2) try player.sendLogin("Steve", "2535400000000001", player.key);
-        if (stage >= 3) try player.finishHandshake();
-        if (stage >= 4) try player.awaitLoginStatus();
+        if (stage >= 3) try player.awaitLoginStatus();
         player.destroy();
         try setup.running.waitForStat(.links_closed, stage + 1);
     }
     setup.running.stop();
-    try std.testing.expectEqual(@as(u64, 5), setup.running.stats().sessions_accepted);
+    try std.testing.expectEqual(@as(u64, 4), setup.running.stats().sessions_accepted);
 }
 
 test "leaving while the backend dial is pending cancels it" {
@@ -225,11 +224,10 @@ test "leaving while the backend dial is pending cancels it" {
     try running.start(io, proxy_config, .{ .auth = .{ .verify = &keys }, .proxy_key = try managed.proxyKey(1) });
     defer running.deinit();
 
-    // The player's handshake doesn't wait for the backend
+    // The player's login doesn't wait for the backend
     const player = try managed.Player.connect(io, running.address(), 2);
     try player.settings(current_version);
     try player.sendLogin("Steve", "2535400000000001", player.key);
-    try player.finishHandshake();
     player.destroy();
     try running.waitForStat(.links_closed, 1);
 
@@ -278,8 +276,9 @@ test "managed mode needs a proxy key and verified logins" {
     var keys = try managed.keySet();
     defer keys.deinit();
     const proxy_config = try managed.config(&.{fixtures.nowhere});
-    try std.testing.expectError(error.MissingProxyKey, bifrost.Proxy.create(gpa, io, proxy_config, .{ .auth = .{ .verify = &keys } }));
-    try std.testing.expectError(error.ManagedNeedsVerifiedLogins, bifrost.Proxy.create(gpa, io, proxy_config, .{ .proxy_key = try managed.proxyKey(1) }));
+    var transport: bifrost.NetherNet = undefined;
+    try std.testing.expectError(error.MissingProxyKey, bifrost.Proxy.create(gpa, io, proxy_config, .{ .transport = &transport, .auth = .{ .verify = &keys } }));
+    try std.testing.expectError(error.ManagedNeedsVerifiedLogins, bifrost.Proxy.create(gpa, io, proxy_config, .{ .transport = &transport, .proxy_key = try managed.proxyKey(1) }));
 }
 
 test "session modes allocate only their own protocol state and clean up failures" {
@@ -289,16 +288,18 @@ test "session modes allocate only their own protocol state and clean up failures
         fn run(allocator: std.mem.Allocator, key_set: *const bifrost.KeySet, use_managed: bool) !void {
             var proxy_config = try fixtures.config(&.{fixtures.nowhere});
             if (use_managed) proxy_config.session_mode = .managed;
+            var transport: bifrost.NetherNet = undefined;
             const proxy = try bifrost.Proxy.create(allocator, io, proxy_config, .{
+                .transport = &transport,
                 .auth = .{ .verify = key_set },
                 .proxy_key = try managed.proxyKey(1),
             });
             defer proxy.destroy();
             try std.testing.expectEqual(use_managed, proxy.observer_pool == null);
             try std.testing.expectEqual(use_managed, proxy.env.observer_pool == null);
-            var session: @import("raknet").Session = undefined;
-            const link = try bifrost.Proxy.Link.create(&proxy.env, &session);
-            defer link.destroy();
+            const connection: *bifrost.NetherNet.Connection = undefined;
+            const link = try bifrost.Proxy.Link.create(&proxy.env, connection, fixtures.loopback);
+            defer link.release();
             try std.testing.expectEqual(use_managed, link.observer == null);
             try std.testing.expectEqual(use_managed, link.managed != null);
             if (link.observer) |*observer| try std.testing.expect(observer.tap.pool == &proxy.observer_pool.?);
@@ -313,7 +314,7 @@ test "an allocation failure anywhere in a managed login fails cleanly" {
     var backend: managed.Backend = undefined;
     try backend.start(io, proxy_key.public_key);
     defer backend.deinit();
-    const options: bifrost.Proxy.Options = .{ .auth = .{ .verify = &keys }, .proxy_key = proxy_key };
+    const options: Running.Options = .{ .auth = .{ .verify = &keys }, .proxy_key = proxy_key };
     const proxy_config = try managed.config(&.{backend.address()});
 
     var counting: FailOnce = .{ .child = gpa, .fail_at = std.math.maxInt(usize) };
@@ -324,7 +325,7 @@ test "an allocation failure anywhere in a managed login fails cleanly" {
     }
 }
 
-fn playThrough(allocator: *FailOnce, proxy_config: bifrost.Config, options: bifrost.Proxy.Options) !bool {
+fn playThrough(allocator: *FailOnce, proxy_config: bifrost.Config, options: Running.Options) !bool {
     var running: Running = undefined;
     running.startWith(io, allocator.allocator(), proxy_config, options) catch return false;
     defer running.deinit();

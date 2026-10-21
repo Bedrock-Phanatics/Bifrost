@@ -245,8 +245,9 @@ fn millis(ns: u64) f64 {
 }
 
 test "eight players moving at once keep transfer time and memory flat" {
-    const rounds = 50 * test_options.soak;
-    const warm_up = 5;
+    // Every transfer is a full WebRTC dial, so keep the default run short; -Dsoak scales it up
+    const rounds = 12 * test_options.soak;
+    const warm_up = 4;
     var counting: FailOnce = .{ .child = std.testing.allocator, .fail_at = std.math.maxInt(usize), .armed = .init(false) };
     var rig: Rig = undefined;
     try rig.start(.{ .allocator = counting.allocator() });
@@ -260,8 +261,8 @@ test "eight players moving at once keep transfer time and memory flat" {
         joined += 1;
         try player.*.login("Alex", "2535400000000002");
         try player.*.spawn();
-        // RakNet here never pings, so idle players would hit its 10 s timeout during slow Debug joins
-        for (players[0..joined]) |active| try active.echo("keepalive");
+        // The echo only comes back once the proxy has the player in game
+        try player.*.echo("joined");
     }
     for (players) |player| player.timeout_ms = 2;
 

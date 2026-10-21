@@ -39,17 +39,6 @@ pub fn unpark(self: *Scheduler, link: *Link) void {
     self.backlogged.remove(&link.park_node);
 }
 
-pub fn resumeDrained(self: *Scheduler) void {
-    var node = self.backlogged.first;
-    while (node) |current| {
-        node = current.next;
-        const link: *Link = @fieldParentPtr("park_node", current);
-        if (link.playerBacklogged()) continue;
-        self.unpark(link);
-        self.schedule(link);
-    }
-}
-
 pub fn wakeNotify(self: *Scheduler) Notify {
     return .{ .context = self, .call = wakeOnly };
 }

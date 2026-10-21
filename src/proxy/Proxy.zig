@@ -1,16 +1,12 @@
 const std = @import("std");
-const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const Config = @import("../config/Config.zig");
 const Health = @import("../backend/Health.zig");
 const Router = @import("../backend/Router.zig");
-const Notify = @import("../net/Notify.zig");
-const Watch = @import("../net/watch.zig").Watch;
-const no_wait = @import("../net/watch.zig").no_wait;
+const NetherNet = @import("../net/NetherNet.zig");
 const Observer = @import("../protocol/Observer.zig");
 const Managed = @import("../session/Managed.zig");
 const proxy_key = @import("../session/proxy_key.zig");
-const advertisement = @import("../protocol/advertisement.zig");
 const Admission = @import("Admission.zig");
 const Budget = @import("Budget.zig");
 const Rate = @import("Rate.zig");
@@ -25,13 +21,16 @@ const Stats = @import("Stats.zig");
 const Metrics = @import("Metrics.zig");
 const trace = @import("../trace.zig");
 
+/// One worker. Owns its links and runs them on one task, so nothing in here needs a lock.
 const Proxy = @This();
 const log = std.log.scoped(.proxy);
 
-const max_listener_failures = 32;
 const mailbox_capacity = 64;
+const inbox_capacity = 64;
 const sweep_interval_ms = 1_000;
 const rejection_log_interval_ms = 10_000;
+// When ICE won't say where the player is, they all share one per-IP bucket
+const unknown_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
 
 pub const TransferRequest = struct { player: u64, target: Backend.Id };
 
@@ -39,7 +38,6 @@ gpa: std.mem.Allocator,
 io: std.Io,
 config: Config,
 router: Router,
-listener: *raknet.Server,
 scheduler: Scheduler,
 admission: *Admission,
 own_admission: Admission,
@@ -54,11 +52,7 @@ observer_pool: ?bedwire.BufferPool,
 managed: ?Managed.Shared,
 env: Link.Env,
 links: std.AutoArrayHashMapUnmanaged(u64, *Link) = .empty,
-listener_watch: Watch(raknet.Server) = .{},
-listener_busy: bool = false,
-listener_failures: u8 = 0,
 stop_requested: std.atomic.Value(bool) = .init(false),
-health_changed: std.atomic.Value(bool) = .init(false),
 stats: Stats = .{},
 timings: Metrics.Timings = .{},
 next_player: u64 = 0,
@@ -66,8 +60,11 @@ next_epoch: Transfer.State.Epoch = 0,
 mailbox_mutex: std.Io.Mutex = .init,
 mailbox: [mailbox_capacity]TransferRequest = undefined,
 mailbox_len: usize = 0,
+inbox: [inbox_capacity]*NetherNet.Connection = undefined,
+inbox_len: usize = 0,
 
 pub const Options = struct {
+    transport: *const NetherNet,
     auth: Observer.Auth = .off,
     admission: ?*Admission = null,
     budget: ?*Budget = null,
@@ -82,19 +79,6 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
     const self = try gpa.create(Proxy);
     errdefer gpa.destroy(self);
 
-    var raknet_config: raknet.Config = .{};
-    raknet_config.listener.maximum_connections = config.max_players;
-    // Room above Link.backlog_packets, since one backend poll can add a few hundred more before the next check
-    raknet_config.session.maximum_queued_outbound_packets = 1024;
-    var ad_buffer: [advertisement_capacity]u8 = undefined;
-    const listener = try raknet.Server.listen(gpa, io, config.bind, .{
-        .advertisement = renderAdvertisement(&config, &ad_buffer, 0),
-        .config = raknet_config,
-        .reuse_port = config.workers > 1,
-        .offline_rate_per_second = config.handshake_rate_per_ip,
-        .offline_burst = 2 * config.handshake_rate_per_ip,
-    });
-    errdefer listener.destroy();
     var observer_pool: ?bedwire.BufferPool = if (config.session_mode == .passthrough) try Observer.initPool(gpa) else null;
     errdefer if (observer_pool) |*pool| pool.deinit();
     const own_per_ip = if (options.admission == null) config.max_players_per_ip else 0;
@@ -119,7 +103,6 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .io = io,
         .config = config,
         .router = undefined,
-        .listener = listener,
         .scheduler = .{ .io = io },
         .admission = undefined,
         .own_admission = own_admission,
@@ -147,11 +130,11 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .io = io,
         .stats = &self.stats,
         .scheduler = &self.scheduler,
+        .transport = options.transport,
         .observer_pool = if (self.observer_pool) |*pool| pool else null,
         .auth = options.auth,
         .health = options.health,
         .router = &self.router,
-        .connect_timeout_ms = config.connect_timeout_ms,
         .pending_packets = config.pending_packets,
         .pending_bytes = config.pending_bytes,
         .budget = self.budget,
@@ -190,21 +173,19 @@ pub fn destroy(self: *Proxy) void {
     if (self.managed) |*shared| shared.deinit(self.gpa);
     self.own_admission.deinit();
     if (self.observer_pool) |*pool| pool.deinit();
-    self.listener.destroy();
     self.gpa.destroy(self);
 }
 
-pub fn localAddress(self: *const Proxy) std.Io.net.IpAddress {
-    return self.listener.localAddress();
-}
-
-pub fn healthNotify(self: *Proxy) Notify {
-    return .{ .context = self, .call = onHealthChanged };
-}
-
-fn onHealthChanged(context: *anyopaque) void {
-    const self: *Proxy = @ptrCast(@alignCast(context));
-    self.health_changed.store(true, .release);
+/// Any thread. Takes the connection, or leaves it with the caller when this worker is full or stopping.
+pub fn adopt(self: *Proxy, connection: *NetherNet.Connection) error{ Busy, Canceled }!void {
+    {
+        self.mailbox_mutex.lockUncancelable(self.io);
+        defer self.mailbox_mutex.unlock(self.io);
+        if (self.stop_requested.load(.acquire)) return error.Canceled;
+        if (self.inbox_len == inbox_capacity) return error.Busy;
+        self.inbox[self.inbox_len] = connection;
+        self.inbox_len += 1;
+    }
     self.scheduler.wake.set(self.io);
 }
 
@@ -223,14 +204,19 @@ pub fn requestTransfer(self: *Proxy, player: u64, target: Backend.Id) error{ Mai
 
 fn drainMailbox(self: *Proxy) void {
     var requests: [mailbox_capacity]TransferRequest = undefined;
-    const count = count: {
+    var arrivals: [inbox_capacity]*NetherNet.Connection = undefined;
+    const count, const arrived = counts: {
         self.mailbox_mutex.lockUncancelable(self.io);
         defer self.mailbox_mutex.unlock(self.io);
         const count = self.mailbox_len;
         @memcpy(requests[0..count], self.mailbox[0..count]);
         self.mailbox_len = 0;
-        break :count count;
+        const arrived = self.inbox_len;
+        @memcpy(arrivals[0..arrived], self.inbox[0..arrived]);
+        self.inbox_len = 0;
+        break :counts .{ count, arrived };
     };
+    for (arrivals[0..arrived]) |connection| self.welcome(connection);
     for (requests[0..count]) |request| self.startTransfer(request);
 }
 
@@ -306,11 +292,6 @@ pub fn run(self: *Proxy) void {
 }
 
 fn turn(self: *Proxy) void {
-    defer @atomicStore(u64, &self.stats.session_memory_bytes, self.listener.session_quota.used_bytes, .monotonic);
-    self.listener_watch.arm(self.io, self.listener, self.scheduler.wakeNotify()) catch |err| {
-        log.err("listener watch failed: {t}", .{err});
-        return self.stop();
-    };
     self.scheduler.wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(sweep_interval_ms), .clock = .awake } }) catch |err| switch (err) {
         error.Timeout => {},
         error.Canceled => return self.stop(),
@@ -320,70 +301,29 @@ fn turn(self: *Proxy) void {
     const busy_since = Metrics.nowNs(self.io);
     defer self.timings.turn.record(Metrics.sinceUs(self.io, busy_since));
 
-    if (self.health_changed.swap(false, .acquire)) self.refreshAdvertisement();
     self.drainMailbox();
     {
         const span = trace.zone(@src(), "plugin queue");
         defer span.end();
         self.env.events.drain(self.io, self);
     }
-    const listener_ready = self.listener_watch.take(self.io);
-    if (listener_ready or self.listener_busy) self.pollListener();
-    self.scheduler.resumeDrained();
     const now_ms = nowMs(self.io);
     if (now_ms >= self.next_sweep_ms) {
         self.next_sweep_ms = now_ms + sweep_interval_ms;
-        var transport: Link.Transport = .{};
+        var buffered: u64 = 0;
         for (self.links.values()) |link| {
             link.checkDeadlines(now_ms);
-            link.sampleTransport(&transport);
+            buffered += link.sampleTransport();
         }
-        self.stats.bump(.raknet_retransmits, transport.retransmits);
-        self.stats.bump(.raknet_lost_datagrams, transport.lost);
-        self.stats.set(.player_queued_packets, transport.queued);
+        self.stats.set(.player_buffered_bytes, buffered);
         self.stats.set(.links_active, self.links.count());
     }
     self.serviceReady() catch return self.stop();
-    if (self.listener_busy or self.scheduler.hasReady()) self.scheduler.wake.set(self.io);
+    if (self.scheduler.hasReady()) self.scheduler.wake.set(self.io);
 }
 
 fn nowMs(io: std.Io) u64 {
     return @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
-}
-
-const advertisement_capacity = Config.max_motd_len + 32;
-
-fn renderAdvertisement(config: *const Config, buffer: *[advertisement_capacity]u8, online: u32) []const u8 {
-    return advertisement.render(buffer, config.motd(), online, config.max_players) catch config.motd();
-}
-
-fn refreshAdvertisement(self: *Proxy) void {
-    const health = self.env.health orelse return;
-    var buffer: [advertisement_capacity]u8 = undefined;
-    self.listener.setAdvertisement(renderAdvertisement(&self.config, &buffer, health.onlinePlayers())) catch |err|
-        log.warn("advertisement not updated: {t}", .{err});
-}
-
-fn pollListener(self: *Proxy) void {
-    const span = trace.zone(@src(), "raknet receive");
-    defer span.end();
-    const result = self.listener.poll(no_wait, .{
-        .context = self,
-        .connected = onConnected,
-        .message = onMessage,
-        .disconnected = onDisconnected,
-    });
-    const stats = result catch |err| {
-        self.listener_busy = false;
-        if (err == error.Canceled) return self.stop();
-        self.stats.bump(.listener_errors, 1);
-        self.listener_failures += 1;
-        if (self.listener_failures < max_listener_failures) return log.warn("listener poll failed: {t}", .{err});
-        log.err("listener keeps failing, stopping: {t}", .{err});
-        return self.stop();
-    };
-    self.listener_failures = 0;
-    self.listener_busy = stats.datagrams != 0;
 }
 
 fn serviceReady(self: *Proxy) error{Canceled}!void {
@@ -396,15 +336,20 @@ fn serviceReady(self: *Proxy) error{Canceled}!void {
         if (link.isFinished() and !link.queued.load(.acquire)) {
             const removed = self.links.swapRemove(link.id);
             std.debug.assert(removed);
-            link.destroy();
-            self.stats.bump(.links_closed, 1);
+            self.retire(link);
         }
     }
 }
 
-fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationFailure}!void {
-    const self: *Proxy = @ptrCast(@alignCast(context));
-    self.accept(session) catch |err| {
+fn retire(self: *Proxy, link: *Link) void {
+    self.admission.leave(self.io, link.address);
+    link.destroy();
+    self.stats.bump(.links_closed, 1);
+}
+
+fn welcome(self: *Proxy, connection: *NetherNet.Connection) void {
+    self.accept(connection, NetherNet.remoteAddress(connection) orelse unknown_address) catch |err| {
+        connection.destroy();
         self.stats.bump(.sessions_rejected, 1);
         const now_ms = nowMs(self.io);
         if (now_ms -| self.rejections_logged_ms >= rejection_log_interval_ms or self.rejections_logged_ms == 0) {
@@ -412,72 +357,43 @@ fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationF
             self.rejections_logged_ms = now_ms;
             self.rejections_unlogged = 0;
         } else self.rejections_unlogged += 1;
-        // Returning an error here drops the player without telling them
-        session.close();
     };
 }
 
-fn accept(self: *Proxy, session: *raknet.Session) !void {
-    try self.admission.enter(self.io, session.address);
-    errdefer self.admission.leave(self.io, session.address);
+/// The connection stays with the caller on error.
+fn accept(self: *Proxy, connection: *NetherNet.Connection, address: std.Io.net.IpAddress) !void {
+    try self.admission.enter(self.io, address);
+    errdefer self.admission.leave(self.io, address);
     try self.links.ensureUnusedCapacity(self.gpa, 1);
-    const link = try Link.create(&self.env, session);
-    errdefer link.destroy();
+    const link = try Link.create(&self.env, connection, address);
+    errdefer link.release();
     link.id = std.math.add(u64, self.next_player, 1) catch return error.PlayerIdExhausted;
     self.next_player = link.id;
-    link.player = self.env.events.connected(.{ .context = self, .worker = self.env.events.worker, .link = link.id, .transfer = routeTransfer, .network = routeNetwork, .gameplay = routeGameplay, .io = self.io }, session.address, if (self.env.events.plugins != null) link.playerState() else .{});
+    link.player = self.env.events.connected(.{ .context = self, .worker = self.env.events.worker, .link = link.id, .transfer = routeTransfer, .network = routeNetwork, .gameplay = routeGameplay, .io = self.io }, address, if (self.env.events.plugins != null) link.playerState() else .{});
     if (link.managed) |managed| managed.plugin_player = link.player;
 
     try link.connect();
     self.links.putAssumeCapacityNoClobber(link.id, link);
-    session.setUserData(link);
+    link.watch();
     self.stats.bump(.sessions_accepted, 1);
 }
 
-fn linkOf(session: *const raknet.Session) ?*Link {
-    return @ptrCast(@alignCast(session.userData() orelse return null));
-}
-
-fn onMessage(_: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-    const link = linkOf(session) orelse return error.ApplicationFailure;
-    const span = trace.zone(@src(), "player packet");
-    defer span.end();
-    link.forwardToBackend(payload.bytes) catch |err| {
-        log.debug("dropping player: {t}", .{err});
-        _ = link.disconnect("");
-    };
-}
-
-fn onDisconnected(context: *anyopaque, session: *raknet.Session) void {
-    const self: *Proxy = @ptrCast(@alignCast(context));
-    const link = linkOf(session) orelse return;
-    session.setUserData(null);
-    link.detachSession();
-    self.admission.leave(self.io, session.address);
-}
-
 fn closeAll(self: *Proxy) void {
-    defer @atomicStore(u64, &self.stats.session_memory_bytes, self.listener.session_quota.used_bytes, .monotonic);
-    self.listener_watch.cancel(self.io);
-    self.listener.close();
-    while (self.links.pop()) |entry| {
-        const link = entry.value;
-        // The session outlives the link until listener.destroy()
-        if (link.session) |session| {
-            session.setUserData(null);
-            self.admission.leave(self.io, session.address);
-        }
-        link.session = null;
-        link.destroy();
-        self.stats.bump(.links_closed, 1);
+    {
+        self.mailbox_mutex.lockUncancelable(self.io);
+        defer self.mailbox_mutex.unlock(self.io);
+        for (self.inbox[0..self.inbox_len]) |connection| connection.destroy();
+        self.inbox_len = 0;
     }
+    while (self.links.pop()) |entry| self.retire(entry.value);
     self.scheduler.ready.store(null, .monotonic);
 }
 
 test "stopped workers reject transfer mailbox submissions without waking" {
     var config: Config = .{ .bind = .{ .ip4 = .loopback(0) }, .max_players = 2 };
     try config.addBackend(null, .{ .ip4 = .loopback(9) });
-    const proxy = try Proxy.create(std.testing.allocator, std.testing.io, config, .{});
+    var transport: NetherNet = undefined;
+    const proxy = try Proxy.create(std.testing.allocator, std.testing.io, config, .{ .transport = &transport });
     defer proxy.destroy();
     for (0..mailbox_capacity) |id| try proxy.requestTransfer(id + 1, .of(0));
     try std.testing.expectError(error.MailboxFull, proxy.requestTransfer(1, .of(0)));
@@ -499,18 +415,19 @@ test "worker link IDs are retired after failed connections and never wrap" {
     try config.addBackend(null, .{ .ip4 = .loopback(9) });
     var health: Health = .init(config.backends(), 1000, 100);
     health.markFailed(.of(0));
-    const proxy = try Proxy.create(gpa, io, config, .{ .health = &health });
+    var transport: NetherNet = undefined;
+    const proxy = try Proxy.create(gpa, io, config, .{ .transport = &transport, .health = &health });
     defer proxy.destroy();
-    var session: raknet.Session = undefined;
-    session.address = .{ .ip4 = .loopback(1) };
+    const connection: *NetherNet.Connection = undefined;
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(1) };
     for (1..3) |id| {
-        try std.testing.expectError(error.NoBackendAvailable, proxy.accept(&session));
+        try std.testing.expectError(error.NoBackendAvailable, proxy.accept(connection, address));
         try std.testing.expectEqual(id, proxy.next_player);
         try std.testing.expectEqual(@as(usize, 0), proxy.links.count());
         try std.testing.expectEqual(@as(u32, 0), proxy.admission.active.load(.monotonic));
     }
     proxy.next_player = std.math.maxInt(u64);
-    try std.testing.expectError(error.PlayerIdExhausted, proxy.accept(&session));
+    try std.testing.expectError(error.PlayerIdExhausted, proxy.accept(connection, address));
     try std.testing.expectEqual(std.math.maxInt(u64), proxy.next_player);
     try std.testing.expectEqual(@as(u32, 0), proxy.admission.active.load(.monotonic));
 }
@@ -543,11 +460,11 @@ test "worker link registration cleans up allocation failures" {
             try config.addBackend(null, .{ .ip4 = .loopback(9) });
             var health: Health = .init(config.backends(), 1000, 100);
             health.markFailed(.of(0));
-            const proxy = try Proxy.create(gpa, std.testing.io, config, .{ .health = &health });
+            var transport: NetherNet = undefined;
+            const proxy = try Proxy.create(gpa, std.testing.io, config, .{ .transport = &transport, .health = &health });
             defer proxy.destroy();
-            var session: raknet.Session = undefined;
-            session.address = .{ .ip4 = .loopback(1) };
-            if (proxy.accept(&session)) |_| return error.ExpectedRejection else |err| {
+            const connection: *NetherNet.Connection = undefined;
+            if (proxy.accept(connection, .{ .ip4 = .loopback(1) })) |_| return error.ExpectedRejection else |err| {
                 if (err != error.NoBackendAvailable) return err;
             }
             try std.testing.expectEqual(@as(u32, 0), proxy.admission.active.load(.monotonic));

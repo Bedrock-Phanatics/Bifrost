@@ -1,5 +1,4 @@
 const std = @import("std");
-const raknet = @import("raknet");
 const bifrost = @import("bifrost");
 const fixtures = @import("../support/fixtures.zig");
 const managed = @import("../support/managed.zig");
@@ -67,7 +66,7 @@ test "queues within their own limits still share one budget" {
     defer extra.deinit();
     try extra.send(&payload);
     try extra.awaitClosed();
-    for (players[0..connected]) |*player| try std.testing.expect(!player.client.isClosed());
+    for (players[0..connected]) |*player| try std.testing.expect(!player.isClosed());
     try std.testing.expectEqual(@as(u64, 1), running.proxy.budget.refusals.load(.monotonic));
 
     for (players[0..connected]) |*player| player.deinit();
@@ -103,19 +102,11 @@ test "connect and disconnect cycles return every queued byte" {
     try std.testing.expectEqual(@as(u32, 0), running.proxy.admission.active.load(.monotonic));
 }
 
-const Collector = struct {
-    next: u32 = 0,
-    broken: bool = false,
-
-    fn collect(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-        const self: *Collector = @ptrCast(@alignCast(context));
-        if (payload.bytes.len < 5 or std.mem.readInt(u32, payload.bytes[1..5], .little) != self.next) self.broken = true;
-        self.next += 1;
-    }
-};
+// Well past what the player's own receive queue holds, so the proxy has to hold the rest
+const burst_count = 3000;
 
 test "a player that falls behind pauses its backend instead of losing packets" {
-    const count = 600;
+    const count = burst_count;
     var backend: Backend = undefined;
     try backend.start(io, .{ .burst_count = count, .burst_bytes = 2048 });
     defer backend.deinit();
@@ -127,20 +118,22 @@ test "a player that falls behind pauses its backend instead of losing packets" {
     defer player.deinit();
     try player.roundTrip("\xfehello");
     try player.send(fixtures.burst);
-    // Not polling means no acks, so the proxy's queue to us fills up
+    // Not reading lets our queue fill, then SCTP stops taking more and the proxy's send buffer grows
     try io.sleep(.fromMilliseconds(1_500), .awake);
     try std.testing.expect(running.proxy.stats.snapshot().backlog_pauses >= 1);
 
-    var collector: Collector = .{};
+    var next: u32 = 0;
     const started = std.Io.Clock.awake.now(io);
-    while (collector.next < count and started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 10_000) {
-        _ = player.client.poll(fixtures.millis(10), &collector, Collector.collect) catch |err| switch (err) {
-            error.Timeout => {},
+    while (next < count and started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 20_000) {
+        const payload = player.next(20) catch |err| switch (err) {
+            error.NoMessage => continue,
             else => return err,
         };
+        try std.testing.expect(payload.len >= 5);
+        try std.testing.expectEqual(next, std.mem.readInt(u32, payload[1..5], .little));
+        next += 1;
     }
-    try std.testing.expect(!collector.broken);
-    try std.testing.expectEqual(@as(u32, count), collector.next);
+    try std.testing.expectEqual(@as(u32, count), next);
     try player.roundTrip("\xfestill here");
     running.stop();
     try std.testing.expectEqual(@as(u64, 0), running.stats().slow_players);
@@ -148,7 +141,7 @@ test "a player that falls behind pauses its backend instead of losing packets" {
 
 test "a player that stays behind too long is disconnected" {
     var backend: Backend = undefined;
-    try backend.start(io, .{ .burst_count = 600, .burst_bytes = 2048 });
+    try backend.start(io, .{ .burst_count = burst_count, .burst_bytes = 2048 });
     defer backend.deinit();
     var proxy_config = try fixtures.config(&.{backend.address()});
     proxy_config.slow_player_timeout_ms = 300;

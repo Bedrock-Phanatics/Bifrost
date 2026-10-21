@@ -1,11 +1,10 @@
 const std = @import("std");
-const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const Backend = @import("../backend/Backend.zig");
 const Dial = @import("../backend/Dial.zig");
 const Notify = @import("../net/Notify.zig");
-const Watch = @import("../net/watch.zig").Watch;
-const no_wait = @import("../net/watch.zig").no_wait;
+const NetherNet = @import("../net/NetherNet.zig");
+const Peer = @import("../net/Peer.zig");
 const Managed = @import("../session/Managed.zig");
 const Upstream = Managed.Upstream;
 const self_id = @import("../session/self_id.zig");
@@ -24,23 +23,23 @@ const Handoff = @import("Handoff.zig");
 const Transfer = @This();
 const log = std.log.scoped(.transfer);
 
-const max_polls_per_turn = 4;
+const max_messages_per_turn = 64;
 const max_queued_packets = 256;
 
 pub const Host = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     stats: *Stats,
+    transport: *const NetherNet,
     managed: *Managed,
-    player: *raknet.Session,
+    player: *Peer,
     notify: Notify,
-    backend: *?*raknet.Client,
-    backend_watch: *Watch(raknet.Client),
+    backend: *?Peer,
     events: Events = .{},
     source_backend: u32 = abi.no_backend,
 
     fn ends(self: Host) Managed.Ends {
-        return .{ .io = self.io, .stats = self.stats, .player = self.player, .backend = self.backend.* };
+        return .{ .io = self.io, .stats = self.stats, .player = self.player, .backend = if (self.backend.*) |*backend| backend else null };
     }
 };
 
@@ -66,13 +65,12 @@ state: State,
 target: Backend.Id,
 dial: Dial = .{},
 dial_task: ?std.Io.Future(void) = null,
-client: ?*raknet.Client = null,
+client: ?Peer = null,
 upstream: Upstream,
-watch: Watch(raknet.Client) = .{},
 timer: ?std.Io.Future(void) = null,
 timer_fired: std.atomic.Value(bool) = .init(false),
 queue: Queue,
-source: ?*raknet.Client = null,
+source: ?Peer = null,
 seen: Seen = .{},
 result: Result = .running,
 outcome: ?State.Outcome = null,
@@ -85,7 +83,6 @@ target_modes: struct { player: i32, world: i32 } = .{ .player = 0, .world = 0 },
 handoff: ?Handoff = null,
 managed: *Managed,
 mismatch: ?content.Mismatch = null,
-host: ?Host = null,
 
 pub fn create(host: Host, target: Backend.Id, address: std.Io.net.IpAddress, epoch: State.Epoch, settings: Settings) !*Transfer {
     const self = try host.gpa.create(Transfer);
@@ -99,8 +96,7 @@ pub fn create(host: Host, target: Backend.Id, address: std.Io.net.IpAddress, epo
         .managed = host.managed,
     };
     errdefer self.upstream.deinit();
-    const options: raknet.ClientOptions = .{ .handshake_timeout_ms = settings.limits.dial_ms };
-    self.dial_task = try host.io.concurrent(Dial.run, .{ &self.dial, host.gpa, host.io, address, options, host.notify });
+    self.dial_task = try host.io.concurrent(Dial.run, .{ &self.dial, host.transport, address, host.notify });
     errdefer self.cancelTasks(host.io);
     try self.armTimer(host);
     host.stats.bump(.transfers_started, 1);
@@ -112,8 +108,8 @@ pub fn destroy(self: *Transfer, gpa: std.mem.Allocator, io: std.Io) void {
     if (self.managed.hold == &self.queue) self.managed.hold = null;
     if (self.handoff != null) self.managed.syncing = false;
     self.cancelTasks(io);
-    if (self.client) |client| client.destroy();
-    if (self.source) |source| source.destroy();
+    if (self.client) |*client| client.destroy();
+    if (self.source) |*source| source.destroy();
     self.upstream.deinit();
     self.queue.deinit(gpa);
     gpa.destroy(self);
@@ -131,8 +127,9 @@ pub fn service(self: *Transfer, host: Host) error{Canceled}!Result {
     if (self.dial_task) |*task| if (self.dial.finished()) |result| {
         task.await(host.io);
         self.dial_task = null;
-        if (result) |client| {
-            self.client = client;
+        if (result) |connection| {
+            self.client = .init(connection);
+            self.client.?.watch(host.notify);
             self.on(host, .dialed);
             if (self.result == .running) self.upstream.connected(self.context(host)) catch self.on(host, .target_failed);
         } else |err| {
@@ -153,26 +150,26 @@ pub fn service(self: *Transfer, host: Host) error{Canceled}!Result {
         return self.result;
     }
 
-    _ = self.watch.take(host.io);
-    const client = self.client orelse return self.result;
-    self.host = host;
-    defer self.host = null;
+    if (self.client == null) return self.result;
+
+    const client = &self.client.?;
     var drained = false;
-    for (0..max_polls_per_turn) |_| {
-        _ = client.poll(no_wait, self, onTargetMessage) catch |err| switch (err) {
-            error.Timeout => {
-                drained = true;
-                break;
-            },
-            error.Canceled => return error.Canceled,
-            else => self.seen.failed = true,
+    for (0..max_messages_per_turn) |_| {
+        const message = client.next() catch {
+            self.seen.failed = true;
+            break;
+        } orelse {
+            drained = true;
+            break;
+        };
+        if (message.reliability == .reliable) self.receive(host, message.data) catch |err| {
+            log.info("transfer {d}: target failed: {t}", .{ self.state.epoch, err });
+            self.seen.failed = true;
         };
         if (self.seen.failed) break;
     }
-    if (client.isClosed()) self.seen.failed = true;
     self.settle(host);
     if (self.result != .running or self.client == null) return self.result;
-    self.watch.arm(host.io, client, host.notify) catch self.on(host, .target_failed);
     if (!drained) host.notify.send();
     return self.result;
 }
@@ -203,16 +200,6 @@ fn incompatibility(self: *const Transfer, managed: *const Managed) ?content.Mism
     };
 }
 
-// Returning an error would make RakNet drop the target without telling it
-fn onTargetMessage(opaque_self: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-    const self: *Transfer = @ptrCast(@alignCast(opaque_self));
-    if (self.seen.failed) return;
-    self.receive(self.host.?, payload.bytes) catch |err| {
-        log.info("transfer {d}: target failed: {t}", .{ self.state.epoch, err });
-        self.seen.failed = true;
-    };
-}
-
 fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
     var packets = try self.upstream.session.ingest(frame);
     defer packets.deinit();
@@ -220,14 +207,14 @@ fn receive(self: *Transfer, host: Host, frame: []const u8) !void {
     var buffer: [64]u8 = undefined;
     if (self.upstream.phase != .ready) {
         const packet = packets.next() orelse return error.MalformedBatch;
-        switch (try self.upstream.receive(ctx, packet)) {
-            .wants_login => try host.managed.loginUpstream(&self.upstream, ctx),
+        switch (try self.upstream.receive(packet)) {
+            .wants_login => return host.managed.loginUpstream(&self.upstream, ctx),
+            // The player already has its LoginSuccess, the rest of the batch still counts
             .logged_in => {
                 self.seen.logged_in = true;
                 if (host.managed.cache_supported) |supported| try self.upstream.send(ctx, &.{try Managed.encodeTyped(&buffer, .{ .client_cache_status = .{ .is_cache_supported = supported } })});
             },
         }
-        return;
     }
     while (packets.next()) |packet| {
         if (registries.isRegistry(packet.kind)) {
@@ -294,7 +281,7 @@ fn on(self: *Transfer, host: Host, event: State.Event) void {
             return self.on(host, .target_failed);
         },
         .close_source => {
-            if (self.source) |source| source.destroy();
+            if (self.source) |*source| source.destroy();
             self.source = null;
             return self.on(host, .source_closed);
         },
@@ -334,8 +321,6 @@ fn publish(self: *const Transfer, host: Host) void {
 
 fn commit(self: *Transfer, host: Host) !void {
     const managed = host.managed;
-    self.watch.cancel(host.io);
-    host.backend_watch.cancel(host.io);
     self.source = host.backend.*;
     host.backend.* = self.client;
     self.client = null;
@@ -406,7 +391,7 @@ fn record(self: *Transfer, stats: *Stats, step: State.Step) void {
 }
 
 fn context(self: *Transfer, host: Host) Upstream.Context {
-    return host.managed.upstreamContext(host.ends(), self.client.?);
+    return host.managed.upstreamContext(host.ends(), &self.client.?);
 }
 
 fn armTimer(self: *Transfer, host: Host) !void {
@@ -425,13 +410,9 @@ fn wake(io: std.Io, deadline_ns: u64, fired: *std.atomic.Value(bool), notify: No
 fn cancelTasks(self: *Transfer, io: std.Io) void {
     if (self.timer) |*timer| timer.cancel(io);
     self.timer = null;
-    self.watch.cancel(io);
     var task = self.dial_task orelse return;
     self.dial_task = null;
-    task.cancel(io);
-    if (self.dial.finished()) |result| {
-        if (result) |client| client.destroy() else |_| {}
-    }
+    self.dial.cancel(&task, io);
 }
 
 fn now(io: std.Io) u64 {

@@ -1,12 +1,12 @@
 const std = @import("std");
-const raknet = @import("raknet");
 const bedwire = @import("bedwire");
+const Peer = @import("../net/Peer.zig");
 const Managed = @import("Managed.zig");
 const Stats = @import("../proxy/Stats.zig");
 
 const Upstream = @This();
 
-pub const Phase = enum { connecting, settings, waiting_for_login, handshake, ready };
+pub const Phase = enum { connecting, settings, waiting_for_login, logging_in, ready };
 pub const Progress = enum { wants_login, logged_in };
 
 pub const Context = struct {
@@ -14,14 +14,14 @@ pub const Context = struct {
     io: std.Io,
     stats: *Stats,
     shared: *Managed.Shared,
-    client: *raknet.Client,
+    backend: *Peer,
 };
 
 session: Managed.BackendSession,
 phase: Phase = .connecting,
 
 pub fn init(shared: *Managed.Shared) !Upstream {
-    return .{ .session = try .init(.client, .{ .pool = &shared.pool }) };
+    return .{ .session = try .init(.client, .{ .pool = &shared.pool, .policy = Managed.session_policy }) };
 }
 
 pub fn deinit(self: *Upstream) void {
@@ -46,22 +46,22 @@ pub fn login(self: *Upstream, ctx: Context, identity: *const bedwire.Identity, c
     defer ctx.gpa.free(storage);
     try self.send(ctx, &.{try bedwire.auth.login.encodeLoginPacket(Managed.BackendProfile, storage, request, Managed.limits)});
     ctx.stats.bump(.proxy_logins, 1);
-    self.phase = .handshake;
+    self.phase = .logging_in;
 }
 
-pub fn receive(self: *Upstream, ctx: Context, packet: Managed.BackendSession.Packet) !Progress {
-    if (packet.kind == .disconnect or packet.kind == .play_status) return error.BackendRefused;
+/// Over NetherNet the backend answers the Login with PlayStatus straight away, no handshake.
+pub fn receive(self: *Upstream, packet: Managed.BackendSession.Packet) !Progress {
+    if (packet.kind == .disconnect) return error.BackendRefused;
     switch (self.phase) {
         .settings => {
             try self.session.negotiateFromSettings(packet);
             self.phase = .waiting_for_login;
             return .wants_login;
         },
-        .handshake => {
-            try self.session.acceptServerHandshakePacket(ctx.gpa, packet, ctx.shared.key.secret_key);
-            var buffer: [8]u8 = undefined;
-            try self.send(ctx, &.{try Managed.encodeTyped(&buffer, .{ .client_to_server_handshake = .{} })});
-            try self.session.advance(.resource_packs);
+        .logging_in => {
+            if (packet.kind != .play_status) return error.UnexpectedPacket;
+            const status = (try Managed.typed(try self.session.decodePacket(packet), .play_status)).status;
+            if (status != .loginsuccess or self.session.state != .resource_packs) return error.BackendRefused;
             self.phase = .ready;
             return .logged_in;
         },
@@ -70,5 +70,5 @@ pub fn receive(self: *Upstream, ctx: Context, packet: Managed.BackendSession.Pac
 }
 
 pub fn send(self: *Upstream, ctx: Context, packets: []const []const u8) !void {
-    try Managed.send(&self.session, ctx.client, ctx.stats, .bytes_to_backend, packets);
+    try Managed.send(&self.session, ctx.backend, ctx.stats, .bytes_to_backend, packets);
 }

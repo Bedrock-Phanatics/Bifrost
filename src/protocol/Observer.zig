@@ -1,11 +1,12 @@
 const std = @import("std");
 const bedwire = @import("bedwire");
 const Rate = @import("../proxy/Rate.zig");
+const NetherNet = @import("../net/NetherNet.zig");
 
 const Observer = @This();
 const log = std.log.scoped(.observer);
 
-// Login is the biggest thing we see before encryption
+// Login is the biggest thing we look at
 pub const limits: bedwire.Limits = .{
     .max_frame_bytes = 512 * 1024,
     .max_batch_bytes = 2 * 1024 * 1024,
@@ -23,11 +24,15 @@ pub const Context = struct {
     auth: Auth,
     now_ms: u64 = 0,
     logins: ?*Rate = null,
+    // What the player proved at the transport. NetherNet has no Minecraft encryption, so this is what stops a replayed Login
+    transport_key: ?NetherNet.PublicKey = null,
 };
+
+pub const session_policy: bedwire.SessionPolicy = .{ .encryption = .disabled, .batch_header = false };
 
 pub const Event = enum {
     none,
-    encrypted,
+    logged_in,
     gave_up,
     login_verified,
     login_rejected,
@@ -38,7 +43,7 @@ pub const Event = enum {
     pub fn rejects(self: Event) bool {
         return switch (self) {
             .login_rejected, .auth_unavailable, .login_throttled, .flooded => true,
-            .none, .encrypted, .gave_up, .login_verified => false,
+            .none, .logged_in, .gave_up, .login_verified => false,
         };
     }
 };
@@ -50,8 +55,16 @@ identity: ?bedwire.Identity = null,
 inbound: Rate,
 
 pub fn loadKeys(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bedwire.auth.KeySet {
-    const json = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(limits.max_jwks_bytes));
+    const json = try readKeys(gpa, io, path);
     defer gpa.free(json);
+    return parseKeys(gpa, json);
+}
+
+pub fn readKeys(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(limits.max_jwks_bytes));
+}
+
+pub fn parseKeys(gpa: std.mem.Allocator, json: []const u8) !bedwire.auth.KeySet {
     return bedwire.auth.KeySet.parse(gpa, json, limits);
 }
 
@@ -60,7 +73,7 @@ pub fn initPool(gpa: std.mem.Allocator) !bedwire.BufferPool {
 }
 
 pub fn init(pool: *bedwire.BufferPool, player_bytes_per_second: u32) !Observer {
-    return .{ .tap = try bedwire.Tap.init(.{ .pool = pool }), .inbound = .bytes(player_bytes_per_second) };
+    return .{ .tap = try bedwire.Tap.init(.{ .pool = pool, .policy = session_policy }), .inbound = .bytes(player_bytes_per_second) };
 }
 
 pub fn deinit(self: *Observer) void {
@@ -85,9 +98,10 @@ pub fn observe(self: *Observer, ctx: Context, direction: bedwire.TapDirection, p
         self.watching = false;
         return event;
     }
-    if (self.tap.phase() == .encrypted) {
+    // Nothing after the Login matters to the proxy
+    if (self.tap.phase() == .awaiting_handshake) {
         self.watching = false;
-        if (event == .none) event = .encrypted;
+        if (event == .none) event = .logged_in;
     }
     return event;
 }
@@ -106,6 +120,13 @@ fn verify(self: *Observer, ctx: Context, packet: bedwire.Tap.Packet) Event {
         log.info("login rejected: {t}", .{err});
         return .login_rejected;
     };
+    const bound = if (ctx.transport_key) |key| std.mem.eql(u8, &key.toUncompressedSec1(), &identity.public_key.toUncompressedSec1()) else false;
+    if (!bound) {
+        log.info("login rejected: {s} signed in with a key the connection never proved", .{identity.display_name});
+        var copy = identity;
+        copy.deinit();
+        return .login_rejected;
+    }
     self.verified = true;
     log.info("verified {s} (xuid {s})", .{ identity.display_name, identity.xuid });
     self.dropIdentity();

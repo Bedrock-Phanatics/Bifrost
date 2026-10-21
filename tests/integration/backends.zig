@@ -1,5 +1,4 @@
 const std = @import("std");
-const raknet = @import("raknet");
 const bifrost = @import("bifrost");
 const fixtures = @import("../support/fixtures.zig");
 
@@ -9,10 +8,6 @@ const RunningWorkers = fixtures.RunningWorkers;
 const Player = fixtures.Player;
 const gpa = std.testing.allocator;
 const io = std.testing.io;
-
-fn listing(players: u32) ![]u8 {
-    return std.fmt.allocPrint(gpa, "MCPE;Backend;944;1.26.0;{d};100;1;Sub;Survival;1;19132;19133;", .{players});
-}
 
 fn startWorkers(running: *RunningWorkers, backends: []const *Backend) !void {
     var addresses: [8]std.Io.net.IpAddress = undefined;
@@ -24,18 +19,10 @@ fn startWorkers(running: *RunningWorkers, backends: []const *Backend) !void {
     try running.start(io, workers_config);
 }
 
+// Reads the proxy's own server list status, the way the game does
 fn expectAdvertised(running: *RunningWorkers, players: u32) !void {
-    var buffer: [1024]u8 = undefined;
-    // The listener answers 20 pings a second per address, so stay under that
     for (0..100) |_| {
-        const pong = raknet.ping(io, running.address(), &buffer, 500) catch |err| switch (err) {
-            error.Timeout => continue,
-            else => return err,
-        };
-        var fields = std.mem.splitScalar(u8, pong.advertisement, ';');
-        for (0..5) |_| _ = fields.next();
-        try std.testing.expectEqualStrings("64", fields.next().?);
-        if (bifrost.advertisedPlayers(pong.advertisement) == players) return;
+        if (try bifrost.Health.probe(io, running.address(), 500) == players) return;
         try io.sleep(.fromMilliseconds(100), .awake);
     }
     return error.AdvertisementNeverUpdated;
@@ -68,15 +55,11 @@ test "players are spread round-robin across backends" {
 }
 
 test "the server list shows the summed players of healthy backends" {
-    const seven = try listing(7);
-    defer gpa.free(seven);
-    const five = try listing(5);
-    defer gpa.free(five);
     var first: Backend = undefined;
-    try first.start(io, .{ .advertisement = seven });
+    try first.start(io, .{ .players = 7 });
     defer first.deinit();
     var second: Backend = undefined;
-    try second.start(io, .{ .advertisement = five });
+    try second.start(io, .{ .players = 5 });
     defer second.deinit();
 
     var running: RunningWorkers = undefined;
@@ -84,22 +67,16 @@ test "the server list shows the summed players of healthy backends" {
     defer running.deinit();
     try expectAdvertised(&running, 12);
 
-    const nine = try listing(9);
-    defer gpa.free(nine);
-    try second.listener.setAdvertisement(nine);
+    second.players.store(9, .monotonic);
     try expectAdvertised(&running, 16);
 }
 
 test "a dead backend is skipped, then used again once it recovers" {
-    const one = try listing(1);
-    defer gpa.free(one);
-    const two = try listing(2);
-    defer gpa.free(two);
     var live: Backend = undefined;
-    try live.start(io, .{ .advertisement = one });
+    try live.start(io, .{ .players = 1 });
     defer live.deinit();
     var dead: Backend = undefined;
-    try dead.start(io, .{ .advertisement = two, .serving = false });
+    try dead.start(io, .{ .players = 2, .serving = false });
     defer dead.deinit();
 
     var running: RunningWorkers = undefined;
@@ -158,7 +135,7 @@ test "a failed dial marks the backend down before the next ping" {
 }
 
 const Silent = struct {
-    sockets: [4]std.Io.net.Socket = undefined,
+    sockets: [4]fixtures.Silent = undefined,
     len: usize = 0,
 
     fn open(self: *Silent, count: usize) !void {

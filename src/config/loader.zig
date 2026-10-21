@@ -85,6 +85,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Erro
         return fail(diag, .{ .section = "auth", .name = "keys_file" }, "is required when mode = \"verify\"", .{});
     if (config.total_pending_bytes < config.pending_bytes)
         return fail(diag, .{ .section = "limits", .name = "total_pending_bytes" }, "can't be less than pending_bytes", .{});
+    if ((config.port_min == 0) != (config.port_max == 0) or config.port_min > config.port_max)
+        return fail(diag, .{ .section = "nethernet", .name = "port_max" }, "set port_min and port_max together, with port_min <= port_max", .{});
     if (config.transfer_timeout_ms < config.transfer_phase_timeout_ms)
         return fail(diag, .{ .section = "transfer", .name = "timeout_ms" }, "can't be shorter than phase_timeout_ms", .{});
     if (config.session_mode == .managed) {
@@ -119,6 +121,8 @@ fn readRoot(config: *Config, root: *const toml.Table, diag: *Diagnostic) Error!v
             for (value.array.items, 0..) |item, i| {
                 try readBackend(config, try table(diag, .{ .section = name, .index = i }, item), i, diag);
             }
+        } else if (eql(name, "nethernet")) {
+            try readNetherNet(config, try table(diag, key, value), diag);
         } else if (eql(name, "plugins")) {
             try readPlugins(config, try table(diag, key, value), diag);
         } else if (eql(name, "plugin")) {
@@ -155,12 +159,13 @@ fn readServer(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
         } else if (eql(key.name.?, "metrics")) {
             config.metrics_bind = try address(diag, key, value, false);
         } else if (eql(key.name.?, "motd")) {
-            config.setMotd(try string(diag, key, value)) catch
-                return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_motd_len});
+            const text = try string(diag, key, value);
+            if (std.mem.startsWith(u8, text, "MCPE;"))
+                return fail(diag, key, "is now just the server name, the RakNet \"MCPE;...\" form is gone", .{});
+            config.setMotd(text) catch
+                return fail(diag, key, "must be 1 to {d} bytes of UTF-8", .{Config.max_motd_len});
         } else if (eql(key.name.?, "workers")) {
             config.workers = try integer(u8, diag, key, value, 1, Config.max_workers);
-            if (config.workers > 1 and !Config.multi_worker_supported)
-                return fail(diag, key, "more than 1 needs Linux (SO_REUSEPORT)", .{});
         } else if (eql(key.name.?, "max_players")) {
             config.max_players = try integer(u32, diag, key, value, 1, 100_000);
         } else if (eql(key.name.?, "max_players_per_ip")) {
@@ -198,8 +203,40 @@ fn readLimits(config: *Config, section: *const toml.Table, diag: *Diagnostic) Er
             config.slow_plugin_callback_ms = try integer(u32, diag, key, value, 1, 60_000);
         } else if (eql(key.name.?, "plugin_task_threads")) {
             config.plugin_task_threads = try integer(u8, diag, key, value, 1, 64);
-        } else if (eql(key.name.?, "handshake_rate_per_ip")) {
-            config.handshake_rate_per_ip = try integer(u32, diag, key, value, 1, 1_000_000);
+        } else return fail(diag, key, "unknown key", .{});
+    }
+}
+
+fn readNetherNet(config: *Config, section: *const toml.Table, diag: *Diagnostic) Error!void {
+    var it = section.iterator();
+    while (it.next()) |entry| {
+        const key: Key = .{ .section = "nethernet", .name = entry.key_ptr.* };
+        const value = entry.value_ptr.*;
+        if (eql(key.name.?, "identity_file")) {
+            config.setIdentityFile(try string(diag, key, value)) catch
+                return fail(diag, key, "must be 1 to {d} bytes", .{Config.max_path_len});
+        } else if (eql(key.name.?, "threads")) {
+            config.native_threads = try integer(u8, diag, key, value, 0, 64);
+        } else if (eql(key.name.?, "port_min")) {
+            config.port_min = try integer(u16, diag, key, value, 1, 65535);
+        } else if (eql(key.name.?, "port_max")) {
+            config.port_max = try integer(u16, diag, key, value, 1, 65535);
+        } else if (eql(key.name.?, "ice_bind")) {
+            const text = try string(diag, key, value);
+            config.setIceBind(text) catch return fail(diag, key, "expected an IP address without a port, got \"{s}\"", .{text});
+        } else if (eql(key.name.?, "ice_servers")) {
+            if (value != .array) return fail(diag, key, "expected a list of stun: or turn: URLs", .{});
+            for (value.array.items) |item| config.addIceServer(try string(diag, key, item)) catch |err| return switch (err) {
+                error.InvalidUrl => fail(diag, key, "expected stun:, turn: or turns: URLs up to {d} bytes", .{Config.max_ice_url_len}),
+                error.TooManyServers => fail(diag, key, "at most {d} servers", .{Config.max_ice_servers}),
+            };
+        } else if (eql(key.name.?, "udp_mux")) {
+            if (value != .boolean) return fail(diag, key, "expected true or false", .{});
+            config.udp_mux = value.boolean;
+        } else if (eql(key.name.?, "max_negotiations")) {
+            config.max_negotiations = try integer(u32, diag, key, value, 1, 1024);
+        } else if (eql(key.name.?, "max_negotiations_per_ip")) {
+            config.max_negotiations_per_ip = try integer(u32, diag, key, value, 1, 1024);
         } else return fail(diag, key, "unknown key", .{});
     }
 }
@@ -346,9 +383,9 @@ test "full config reads every key" {
     const config = try parse(std.testing.allocator,
         \\[server]
         \\bind = "127.0.0.1:1000"
-        \\motd = "MCPE;Test"
+        \\motd = "Test"
         \\max_players = 10
-        \\workers = 1
+        \\workers = 2
         \\
         \\[limits]
         \\connect_timeout_ms = 2000
@@ -356,7 +393,6 @@ test "full config reads every key" {
         \\pending_bytes = 4096
         \\slow_plugin_callback_ms = 20
         \\plugin_task_threads = 2
-        \\handshake_rate_per_ip = 50
         \\total_pending_bytes = 8388608
         \\login_timeout_ms = 10000
         \\resource_pack_timeout_ms = 900000
@@ -364,6 +400,17 @@ test "full config reads every key" {
         \\slow_player_timeout_ms = 3000
         \\logins_per_second = 25
         \\player_bytes_per_second = 1048576
+        \\
+        \\[nethernet]
+        \\identity_file = "id.der"
+        \\threads = 2
+        \\port_min = 50000
+        \\port_max = 50100
+        \\ice_bind = "127.0.0.1"
+        \\ice_servers = ["stun:stun.example.com:3478"]
+        \\udp_mux = true
+        \\max_negotiations = 16
+        \\max_negotiations_per_ip = 2
         \\
         \\[[backend]]
         \\name = "lobby"
@@ -374,14 +421,23 @@ test "full config reads every key" {
         \\
     , &diag);
     try std.testing.expectEqual(@as(u16, 1000), config.bind.getPort());
-    try std.testing.expectEqualStrings("MCPE;Test", config.motd());
+    try std.testing.expectEqualStrings("Test", config.motd());
+    try std.testing.expectEqual(@as(u8, 2), config.workers);
     try std.testing.expectEqual(@as(u32, 10), config.max_players);
+    try std.testing.expectEqualStrings("id.der", config.identityFile());
+    try std.testing.expectEqual(@as(u8, 2), config.native_threads);
+    try std.testing.expectEqual(@as(u16, 50000), config.port_min);
+    try std.testing.expectEqual(@as(u16, 50100), config.port_max);
+    try std.testing.expectEqualStrings("127.0.0.1", config.iceBind().?);
+    try std.testing.expectEqualStrings("stun:stun.example.com:3478", config.iceServer(0));
+    try std.testing.expect(config.udp_mux);
+    try std.testing.expectEqual(@as(u32, 16), config.max_negotiations);
+    try std.testing.expectEqual(@as(u32, 2), config.max_negotiations_per_ip);
     try std.testing.expectEqual(@as(u32, 2000), config.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 8), config.pending_packets);
     try std.testing.expectEqual(@as(u32, 4096), config.pending_bytes);
     try std.testing.expectEqual(@as(u32, 20), config.slow_plugin_callback_ms);
     try std.testing.expectEqual(@as(u8, 2), config.plugin_task_threads);
-    try std.testing.expectEqual(@as(u32, 50), config.handshake_rate_per_ip);
     try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), config.total_pending_bytes);
     try std.testing.expectEqual(@as(u32, 10_000), config.login_timeout_ms);
     try std.testing.expectEqual(@as(u32, 900_000), config.resource_pack_timeout_ms);
@@ -420,11 +476,17 @@ test "invalid values name the offending key" {
     try expectInvalid("[server]\nmetrics = \"127.0.0.1:0\"\n" ++ backend, "server.metrics: needs a non-zero port, got \"127.0.0.1:0\"");
     try expectInvalid("[server]\nworkers = 0\n" ++ backend, "server.workers: must be between 1 and 64");
     try expectInvalid("[limits]\nplugin_task_threads = 65\n" ++ backend, "limits.plugin_task_threads: must be between 1 and 64");
-    try expectInvalid("[limits]\nhandshake_rate_per_ip = 0\n" ++ backend, "limits.handshake_rate_per_ip: must be between 1 and 1000000");
-    if (!Config.multi_worker_supported) try expectInvalid("[server]\nworkers = 2\n" ++ backend, "server.workers: more than 1 needs Linux (SO_REUSEPORT)");
+    try expectInvalid("[limits]\nhandshake_rate_per_ip = 1\n" ++ backend, "limits.handshake_rate_per_ip: unknown key");
+    try expectInvalid("[server]\nmotd = \"MCPE;Bifrost;2193\"\n" ++ backend, "server.motd: is now just the server name, the RakNet \"MCPE;...\" form is gone");
+    try expectInvalid("[nethernet]\nport_min = 50000\n" ++ backend, "nethernet.port_max: set port_min and port_max together, with port_min <= port_max");
+    try expectInvalid("[nethernet]\nport_min = 50001\nport_max = 50000\n" ++ backend, "nethernet.port_max: set port_min and port_max together, with port_min <= port_max");
+    try expectInvalid("[nethernet]\nice_servers = [\"http://x\"]\n" ++ backend, "nethernet.ice_servers: expected stun:, turn: or turns: URLs up to 255 bytes");
+    try expectInvalid("[nethernet]\nice_bind = \"0.0.0.0:1\"\n" ++ backend, "nethernet.ice_bind: expected an IP address without a port, got \"0.0.0.0:1\"");
+    try expectInvalid("[nethernet]\nudp_mux = 1\n" ++ backend, "nethernet.udp_mux: expected true or false");
+    try expectInvalid("[nethernet]\nmax_negotiations = 0\n" ++ backend, "nethernet.max_negotiations: must be between 1 and 1024");
     try expectInvalid("[server]\nmax_players = 2\nmax_players_per_ip = 3\n" ++ backend, "server.max_players_per_ip: can't be more than max_players");
     try expectInvalid("[server]\nmax_players = 0\n" ++ backend, "server.max_players: must be between 1 and 100000");
-    try expectInvalid("[server]\nmotd = \"\"\n" ++ backend, "server.motd: must be 1 to 256 bytes");
+    try expectInvalid("[server]\nmotd = \"\"\n" ++ backend, "server.motd: must be 1 to 256 bytes of UTF-8");
     try expectInvalid("[limits]\nconnect_timeout_ms = \"5s\"\n" ++ backend, "limits.connect_timeout_ms: expected an integer");
     try expectInvalid("[limits]\nconnect_timeout_ms = 100\n" ++ backend, "limits.connect_timeout_ms: must be between 500 and 60000");
     try expectInvalid("[limits]\npending_bytes = 1048576\ntotal_pending_bytes = 65536\n" ++ backend, "limits.total_pending_bytes: can't be less than pending_bytes");
@@ -520,7 +582,7 @@ test "loadFile reports missing and oversized files" {
 test "parse frees everything when allocation fails" {
     const source =
         \\[server]
-        \\motd = "MCPE;Test"
+        \\motd = "Test"
         \\[[backend]]
         \\address = "127.0.0.1:2000"
         \\

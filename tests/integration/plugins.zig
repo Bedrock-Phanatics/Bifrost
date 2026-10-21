@@ -230,7 +230,8 @@ test "a managed player is named, followed across a transfer and goes stale on le
     var network: abi.NetworkStats = undefined;
     try std.testing.expectEqual(abi.Status.wrong_thread, host.network_stats(host.context, player, .player, &network, @sizeOf(abi.NetworkStats)));
     try Recorder.query(player);
-    try std.testing.expect(Recorder.player_network.available & abi.NetworkMetric.reliability != 0);
+    try std.testing.expect(Recorder.player_network.available & abi.NetworkMetric.queues != 0);
+    try std.testing.expectEqual(@as(u64, 0), Recorder.player_network.available & (abi.NetworkMetric.rtt | abi.NetworkMetric.reliability | abi.NetworkMetric.loss_estimate));
     try std.testing.expectEqual(@as(u64, 0), Recorder.player_network.available & abi.NetworkMetric.rates);
     try std.testing.expectEqual(@as(u64, 0), Recorder.backend_network.available & abi.NetworkMetric.rates);
     try io.sleep(.fromMilliseconds(260), .awake);

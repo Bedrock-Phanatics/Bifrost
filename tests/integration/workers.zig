@@ -9,18 +9,11 @@ const Player = fixtures.Player;
 const gpa = std.testing.allocator;
 const io = std.testing.io;
 
-const multi = bifrost.Config.multi_worker_supported;
-
 fn workersConfig(backend: std.Io.net.IpAddress, count: u8) !bifrost.Config {
     var result = try fixtures.config(&.{backend});
     result.workers = count;
     result.max_players = 64;
     return result;
-}
-
-test "more than one worker is refused where reuse_port isn't supported" {
-    if (multi) return error.SkipZigTest;
-    try std.testing.expectError(error.InvalidLimit, bifrost.Workers.create(gpa, io, try workersConfig(fixtures.nowhere, 2), .{}));
 }
 
 test "max_players is shared by proxies using one admission" {
@@ -62,8 +55,7 @@ test "max_players is shared by proxies using one admission" {
     try std.testing.expectEqual(@as(u64, 1), proxies[1].stats().sessions_rejected);
 }
 
-test "reuse_port workers share one port and spread players" {
-    if (!multi) return error.SkipZigTest;
+test "workers share one listener and spread players" {
     var backend: Backend = undefined;
     try backend.start(io, .{});
     defer backend.deinit();
@@ -71,9 +63,7 @@ test "reuse_port workers share one port and spread players" {
     try running.start(io, try workersConfig(backend.address(), 4));
     defer running.deinit();
 
-    const port = running.address().getPort();
-    try std.testing.expect(port != 0);
-    for (running.workers.proxies) |proxy| try std.testing.expectEqual(port, proxy.localAddress().getPort());
+    try std.testing.expect(running.address().getPort() != 0);
 
     var players: [12]Player = undefined;
     var connected: usize = 0;
@@ -91,8 +81,7 @@ test "reuse_port workers share one port and spread players" {
     try std.testing.expect(busy > 1);
 }
 
-test "global max_players holds across reuse_port workers" {
-    if (!multi) return error.SkipZigTest;
+test "global max_players holds across workers" {
     var backend: Backend = undefined;
     try backend.start(io, .{});
     defer backend.deinit();
@@ -106,11 +95,7 @@ test "global max_players holds across reuse_port workers" {
     var connected: usize = 0;
     defer for (players[0..connected]) |*player| player.deinit();
     for (0..players.len) |_| {
-        // raknet's own cap can turn players away before we do
-        players[connected] = Player.connect(io, running.address()) catch |err| switch (err) {
-            error.NoFreeIncomingConnections => continue,
-            else => return err,
-        };
+        players[connected] = try Player.connect(io, running.address());
         connected += 1;
     }
     var admitted: usize = 0;
@@ -125,7 +110,6 @@ test "global max_players holds across reuse_port workers" {
 }
 
 test "one worker stopping stops the rest" {
-    if (!multi) return error.SkipZigTest;
     var running: RunningWorkers = undefined;
     try running.start(io, try workersConfig(fixtures.nowhere, 3));
     defer running.deinit();
@@ -137,7 +121,7 @@ test "one worker stopping stops the rest" {
 test "workers start and stop repeatedly" {
     for (0..5) |_| {
         var running: RunningWorkers = undefined;
-        try running.start(io, try workersConfig(fixtures.nowhere, if (multi) 4 else 1));
+        try running.start(io, try workersConfig(fixtures.nowhere, 4));
         defer running.deinit();
         try running.stop();
     }
@@ -146,7 +130,7 @@ test "workers start and stop repeatedly" {
 test "workers clean up after allocation failures" {
     try std.testing.checkAllAllocationFailures(gpa, struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const workers = try bifrost.Workers.create(allocator, io, try workersConfig(fixtures.nowhere, if (multi) 3 else 1), .{});
+            const workers = try bifrost.Workers.create(allocator, io, try workersConfig(fixtures.nowhere, 3), .{ .identity = fixtures.identity(io) });
             workers.destroy();
         }
     }.run, .{});

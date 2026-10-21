@@ -1,7 +1,9 @@
 const std = @import("std");
+const bedwire = @import("bedwire");
 const Config = @import("../config/Config.zig");
 const Health = @import("../backend/Health.zig");
-const Notify = @import("../net/Notify.zig");
+const NetherNet = @import("../net/NetherNet.zig");
+const Listener = @import("../net/Listener.zig");
 const Observer = @import("../protocol/Observer.zig");
 const proxy_key = @import("../session/proxy_key.zig");
 const Admission = @import("Admission.zig");
@@ -24,8 +26,10 @@ config: Config,
 admission: Admission,
 budget: Budget,
 health: Health,
-watchers: []Notify,
+transport: NetherNet,
+listener: ?*Listener = null,
 proxies: []*Proxy,
+next_proxy: std.atomic.Value(usize) = .init(0),
 plugins: ?*Plugins,
 metrics: ?std.Io.net.Server = null,
 
@@ -33,6 +37,9 @@ pub const Options = struct {
     auth: Observer.Auth = .off,
     proxy_key: ?proxy_key.Ecdsa.KeyPair = null,
     plugins: ?*Plugins = null,
+    identity: NetherNet.KeyPair,
+    // The JWKS behind auth, so clients prove at the transport the key their Login uses
+    issuer_keys: ?[]const u8 = null,
 };
 
 pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Options) !*Workers {
@@ -46,24 +53,35 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
         .admission = try .init(gpa, config.max_players, config.max_players_per_ip),
         .budget = .init(std.math.cast(usize, config.total_pending_bytes) orelse std.math.maxInt(usize)),
         .health = undefined,
-        .watchers = &.{},
+        .transport = undefined,
         .proxies = &.{},
         .plugins = options.plugins,
     };
     errdefer self.admission.deinit();
+    var ice_servers: [Config.max_ice_servers][]const u8 = undefined;
+    for (ice_servers[0..config.ice_server_count], 0..) |*url, i| url.* = config.iceServer(i);
+    try self.transport.init(gpa, io, .{
+        .identity = options.identity,
+        .issuer_keys = options.issuer_keys,
+        .connect_timeout_ms = config.connect_timeout_ms,
+        .port_min = config.port_min,
+        .port_max = config.port_max,
+        .ice_bind = config.iceBind(),
+        .ice_servers = ice_servers[0..config.ice_server_count],
+        .udp_mux = config.udp_mux,
+    });
+    errdefer self.transport.deinit();
     if (config.metrics_bind) |address| self.metrics = try address.listen(io, .{ .reuse_address = true });
     errdefer if (self.metrics) |*server| server.deinit(io);
     self.health = .init(self.config.backends(), config.health_interval_ms, config.health_timeout_ms);
     self.proxies = try gpa.alloc(*Proxy, config.workers);
     errdefer gpa.free(self.proxies);
-    self.watchers = try gpa.alloc(Notify, config.workers);
-    errdefer gpa.free(self.watchers);
 
     var created: usize = 0;
     errdefer for (self.proxies[0..created]) |proxy| proxy.destroy();
-    var worker_config = config;
-    for (self.proxies, self.watchers, 0..) |*proxy, *watcher, worker| {
-        proxy.* = try Proxy.create(gpa, io, worker_config, .{
+    for (self.proxies, 0..) |*proxy, worker| {
+        proxy.* = try Proxy.create(gpa, io, config, .{
+            .transport = &self.transport,
             .auth = options.auth,
             .admission = &self.admission,
             .budget = &self.budget,
@@ -72,26 +90,53 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, options: Optio
             .plugins = options.plugins,
             .worker = @intCast(worker),
         });
-        watcher.* = proxy.*.healthNotify();
         created += 1;
-        // Needed when bind uses port 0
-        worker_config.bind = self.proxies[0].localAddress();
     }
-    self.health.watchers = self.watchers;
+    self.listener = try Listener.start(gpa, io, &self.transport, config.bind, .{ .context = self, .accept = dispatch }, .{
+        .max_negotiations = config.max_negotiations,
+        .max_negotiations_per_ip = config.max_negotiations_per_ip,
+        .status = .{ .context = self, .get = serverStatus },
+    });
     return self;
 }
 
 pub fn destroy(self: *Workers) void {
+    if (self.listener) |listener| listener.destroy(self.gpa);
     for (self.proxies) |proxy| proxy.destroy();
+    self.transport.deinit();
     if (self.metrics) |*server| server.deinit(self.io);
     self.admission.deinit();
-    self.gpa.free(self.watchers);
     self.gpa.free(self.proxies);
     self.gpa.destroy(self);
 }
 
 pub fn localAddress(self: *const Workers) std.Io.net.IpAddress {
-    return self.proxies[0].localAddress();
+    return self.listener.?.localAddress();
+}
+
+// Round robin; a full worker passes the player on to the next one
+fn dispatch(context: *anyopaque, connection: *NetherNet.Connection) void {
+    const self: *Workers = @ptrCast(@alignCast(context));
+    const first = self.next_proxy.fetchAdd(1, .monotonic);
+    for (0..self.proxies.len) |offset| {
+        self.proxies[(first + offset) % self.proxies.len].adopt(connection) catch continue;
+        return;
+    }
+    connection.destroy();
+}
+
+// The server list asks for this on every refresh, from the HTTP tasks
+fn serverStatus(context: ?*anyopaque) anyerror!Listener.ServerStatus {
+    const self: *Workers = @ptrCast(@alignCast(context.?));
+    return .{
+        .name = self.config.motd(),
+        .protocol = bedwire.protocol.protocol_version,
+        .version = bedwire.protocol.minecraft_version,
+        .level = "Bifrost",
+        .players = @min(self.health.onlinePlayers(), self.config.max_players),
+        .max_players = self.config.max_players,
+        .game_type = 0,
+    };
 }
 
 pub fn metricsAddress(self: *const Workers) ?std.Io.net.IpAddress {
@@ -136,16 +181,14 @@ pub fn writeMetrics(self: *const Workers, w: *std.Io.Writer) std.Io.Writer.Error
     try Metrics.value(w, "links_active", "gauge", "Player links the workers hold.", totals_now.links_active);
     try Metrics.value(w, "sessions_accepted_total", "counter", "Players accepted.", totals_now.sessions_accepted);
     try Metrics.value(w, "sessions_rejected_total", "counter", "Players turned away.", totals_now.sessions_rejected);
-    try Metrics.value(w, "session_memory_bytes", "gauge", "RakNet session memory in use.", totals_now.session_memory_bytes);
-    try Metrics.header(w, "messages_total", "counter", "RakNet messages forwarded.");
+    try Metrics.header(w, "messages_total", "counter", "NetherNet messages forwarded.");
     try w.print("bifrost_messages_total{{direction=\"to_backend\"}} {d}\nbifrost_messages_total{{direction=\"to_player\"}} {d}\n", .{ totals_now.messages_to_backend, totals_now.messages_to_player });
     try Metrics.header(w, "bytes_total", "counter", "Bytes forwarded.");
     try w.print("bifrost_bytes_total{{direction=\"to_backend\"}} {d}\nbifrost_bytes_total{{direction=\"to_player\"}} {d}\n", .{ totals_now.bytes_to_backend, totals_now.bytes_to_player });
     try Metrics.value(w, "managed_relayed_batches_total", "counter", "Managed batches relayed without decoding.", totals_now.managed_relayed_batches);
     try Metrics.value(w, "managed_decoded_batches_total", "counter", "Managed batches decoded.", totals_now.managed_decoded_batches);
-    try Metrics.value(w, "raknet_retransmits_total", "counter", "Datagrams RakNet sent again.", totals_now.raknet_retransmits);
-    try Metrics.value(w, "raknet_lost_datagrams_total", "counter", "Datagrams RakNet counted as lost.", totals_now.raknet_lost_datagrams);
-    try Metrics.value(w, "player_queued_packets", "gauge", "Packets waiting in RakNet for players.", totals_now.player_queued_packets);
+    try Metrics.value(w, "player_buffered_bytes", "gauge", "Bytes waiting in the data channels to players.", totals_now.player_buffered_bytes);
+    try Metrics.value(w, "unreliable_dropped_total", "counter", "Unreliable messages managed sessions dropped.", totals_now.unreliable_dropped);
     try Metrics.value(w, "queued_bytes", "gauge", "Bytes held in the shared pending budget.", self.budget.used.load(.monotonic));
     try Metrics.value(w, "queued_bytes_limit", "gauge", "Size of the shared pending budget.", self.budget.limit);
     try Metrics.value(w, "queue_refusals_total", "counter", "Packets refused because the budget was full.", self.budget.refusals.load(.monotonic));

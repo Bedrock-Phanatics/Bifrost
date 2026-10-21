@@ -1,8 +1,8 @@
 const std = @import("std");
-const raknet = @import("raknet");
 const bedwire = @import("bedwire");
 const bifrost = @import("bifrost");
 const fixtures = @import("fixtures.zig");
+const net = @import("net.zig");
 const sample = @import("sample.zig");
 
 const protocol = bedwire.protocol;
@@ -36,19 +36,18 @@ pub fn config(backends: []const IpAddress) !bifrost.Config {
     return result;
 }
 
-fn sendFrame(session: anytype, sink: anytype, packets: []const []const u8) !void {
+fn sendFrame(session: anytype, client: *net.Server.Client, packets: []const []const u8) !void {
     const frame = try session.encode(packets);
     defer frame.release();
-    try sink.send(frame.bytes, .reliable_ordered, 0);
+    try client.send(frame.bytes);
 }
 
 pub const Player = struct {
     io: std.Io,
-    client: *raknet.Client,
+    connection: *net.Connection,
     pool: *bedwire.BufferPool,
     session: bedwire.Session,
     key: Ecdsa.KeyPair,
-    frames: std.ArrayList([]u8) = .empty,
     current: ?[]u8 = null,
     timeout_ms: i64 = 5_000,
     game_packets: std.ArrayList([]u8) = .empty,
@@ -66,24 +65,23 @@ pub const Player = struct {
         errdefer gpa.destroy(pool);
         pool.* = try .init(gpa, limits, .conservative());
         errdefer pool.deinit();
+        const key = try proxyKey(seed);
         self.* = .{
             .io = io,
-            .client = try raknet.Client.connect(gpa, io, address, .{ .handshake_retry_ms = 10 }),
+            .connection = try fixtures.dialAs(io, address, key),
             .pool = pool,
-            .session = try .init(.client, .{ .pool = pool }),
-            .key = try proxyKey(seed),
+            .session = try .init(.client, .{ .pool = pool, .policy = bifrost.Managed.session_policy }),
+            .key = key,
         };
         return self;
     }
 
     pub fn destroy(self: *Player) void {
         self.session.deinit();
-        self.client.destroy();
+        self.connection.destroy();
         self.pool.deinit();
         gpa.destroy(self.pool);
         if (self.current) |frame| gpa.free(frame);
-        for (self.frames.items) |frame| gpa.free(frame);
-        self.frames.deinit(gpa);
         for (self.game_packets.items) |packet| gpa.free(packet);
         self.game_packets.deinit(gpa);
         self.kinds.deinit(gpa);
@@ -97,7 +95,6 @@ pub const Player = struct {
     pub fn login(self: *Player, name: []const u8, xuid: []const u8) !void {
         try self.settings(@intCast(Current.protocol_number));
         try self.sendLogin(name, xuid, self.key);
-        try self.finishHandshake();
         try self.awaitLoginStatus();
     }
 
@@ -118,18 +115,7 @@ pub const Player = struct {
         try self.send(&.{try bedwire.auth.login.encodeLoginPacket(Current, storage, request, limits)});
     }
 
-    pub fn finishHandshake(self: *Player) !void {
-        {
-            var packets = try self.receive();
-            defer packets.deinit();
-            try self.session.acceptServerHandshakePacket(gpa, packets.next() orelse return error.NoPacket, self.key.secret_key);
-        }
-        var buffer: [8]u8 = undefined;
-        try self.send(&.{try typedPacket(&buffer, .{ .client_to_server_handshake = .{} })});
-        try self.session.advance(.resource_packs);
-    }
-
-    // Only the backend sends this, so both handshakes are done
+    // Only the backend sends this, so the proxy logged in upstream too
     pub fn awaitLoginStatus(self: *Player) !void {
         var packets = try self.receive();
         defer packets.deinit();
@@ -164,7 +150,9 @@ pub const Player = struct {
     }
 
     pub fn send(self: *Player, packets: []const []const u8) !void {
-        try sendFrame(&self.session, self.client, packets);
+        const frame = try self.session.encode(packets);
+        defer frame.release();
+        try self.connection.send(frame.bytes, .reliable);
     }
 
     pub fn receive(self: *Player) !bedwire.Session.Packets {
@@ -292,35 +280,13 @@ pub const Player = struct {
     fn awaitFrame(self: *Player) ![]const u8 {
         if (self.current) |frame| gpa.free(frame);
         self.current = null;
-        const started = std.Io.Clock.awake.now(self.io);
-        while (self.frames.items.len == 0) {
-            if (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() >= self.timeout_ms) return error.NoMessage;
-            _ = self.client.poll(fixtures.millis(10), self, collect) catch |err| switch (err) {
-                error.Timeout => {},
-                else => return err,
-            };
-            if (self.frames.items.len == 0 and self.client.isClosed()) return error.ConnectionClosed;
-        }
-        self.current = self.frames.orderedRemove(0);
+        const message = (try net.receive(self.connection, self.timeout_ms)) orelse return error.NoMessage;
+        self.current = try gpa.dupe(u8, message.data);
         return self.current.?;
     }
 
     pub fn awaitClosed(self: *Player) !void {
-        const started = std.Io.Clock.awake.now(self.io);
-        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < 10_000) {
-            _ = self.client.poll(fixtures.millis(10), self, collect) catch |err| switch (err) {
-                error.Timeout => {},
-                else => return,
-            };
-            if (self.client.isClosed()) return;
-        }
-        return error.NotClosed;
-    }
-
-    fn collect(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-        const self: *Player = @ptrCast(@alignCast(context));
-        self.frames.ensureUnusedCapacity(gpa, 1) catch return error.ApplicationFailure;
-        self.frames.appendAssumeCapacity(gpa.dupe(u8, payload.bytes) catch return error.ApplicationFailure);
+        return net.awaitClosed(self.connection);
     }
 };
 
@@ -329,15 +295,14 @@ pub const Backend = struct {
 
     const Connection = struct {
         session: Session,
-        key: Ecdsa.KeyPair,
-        carrier: *raknet.Session,
+        carrier: *net.Server.Client,
     };
 
     pub const Mode = enum { normal, silent_login, kick_login, silent_stack, kick_packs, welcome, flood, chatter, spawn_first, early_start, double_stack };
     pub const scene_entities = 200;
 
     io: std.Io,
-    listener: *raknet.Server,
+    server: net.Server = undefined,
     pool: *bedwire.BufferPool,
     trusted: Ecdsa.PublicKey,
     task: ?std.Io.Future(void) = null,
@@ -345,7 +310,7 @@ pub const Backend = struct {
     connections: std.ArrayList(*Connection) = .empty,
     logins: std.atomic.Value(u32) = .init(0),
     echoes: std.atomic.Value(u32) = .init(0),
-    handshakes: std.atomic.Value(u32) = .init(0),
+    admitted: std.atomic.Value(u32) = .init(0),
     chunk_requests: std.atomic.Value(u32) = .init(0),
     requested_max_radius: std.atomic.Value(u32) = .init(0),
     requested_radius: std.atomic.Value(i32) = .init(0),
@@ -425,7 +390,7 @@ pub const Backend = struct {
     }
 
     // Sends back the length-prefixed packets the player asked for, then a marker
-    fn relay(session: *Session, carrier: *raknet.Session, list: []const u8) !void {
+    fn relay(session: *Session, carrier: *net.Server.Client, list: []const u8) !void {
         var packets: [32][]const u8 = undefined;
         var count: usize = 0;
         var rest = list;
@@ -446,25 +411,21 @@ pub const Backend = struct {
         errdefer pool.deinit();
         self.* = .{
             .io = io,
-            // Every transfer dials from the same address, faster than RakNet's default per-address limit
-            .listener = try raknet.Server.listen(gpa, io, fixtures.loopback, .{
-                .advertisement = "MCPE;backend",
-                .offline_rate_per_second = 10_000,
-                .offline_burst = 10_000,
-            }),
             .pool = pool,
             .trusted = trusted,
         };
-        errdefer self.listener.destroy();
+        try self.server.start(gpa, io, net.loopback, null);
+        errdefer self.server.deinit();
         self.task = try io.concurrent(run, .{self});
     }
 
     pub fn deinit(self: *Backend) void {
         if (self.task) |*task| {
             self.stopping.store(true, .release);
+            self.server.wakeup.signal(self.io);
             task.await(self.io);
         }
-        self.listener.destroy();
+        self.server.deinit();
         for (self.connections.items) |connection| freeConnection(connection);
         self.connections.deinit(gpa);
         self.pool.deinit();
@@ -472,7 +433,7 @@ pub const Backend = struct {
     }
 
     pub fn address(self: *const Backend) IpAddress {
-        return self.listener.localAddress();
+        return self.server.address();
     }
 
     pub fn name(self: *const Backend) []const u8 {
@@ -481,12 +442,7 @@ pub const Backend = struct {
 
     fn run(self: *Backend) void {
         while (!self.stopping.load(.acquire)) {
-            _ = self.listener.poll(fixtures.millis(5), .{
-                .context = self,
-                .connected = onConnected,
-                .message = onMessage,
-                .disconnected = onDisconnected,
-            }) catch {};
+            self.server.poll(5, self);
             if (self.mode == .chatter) self.chatter();
             if (self.held) |connection| if (!self.hold_spawn.load(.acquire)) {
                 self.held = null;
@@ -566,27 +522,22 @@ pub const Backend = struct {
         }
     }
 
-    fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationFailure}!void {
-        const self: *Backend = @ptrCast(@alignCast(context));
-        self.connections.ensureUnusedCapacity(gpa, 1) catch return error.ApplicationFailure;
-        const connection = gpa.create(Connection) catch return error.ApplicationFailure;
+    pub fn connected(self: *Backend, client: *net.Server.Client) !void {
+        try self.connections.ensureUnusedCapacity(gpa, 1);
+        const connection = try gpa.create(Connection);
+        errdefer gpa.destroy(connection);
         connection.* = .{
-            .session = Session.init(.server, .{ .pool = self.pool }) catch {
-                gpa.destroy(connection);
-                return error.ApplicationFailure;
-            },
-            .key = proxyKey(99) catch unreachable,
-            .carrier = session,
+            .session = try Session.init(.server, .{ .pool = self.pool, .policy = bifrost.Managed.session_policy }),
+            .carrier = client,
         };
         self.connections.appendAssumeCapacity(connection);
-        session.setUserData(connection);
+        client.user = connection;
     }
 
-    fn onDisconnected(context: *anyopaque, session: *raknet.Session) void {
-        const self: *Backend = @ptrCast(@alignCast(context));
+    pub fn disconnected(self: *Backend, client: *net.Server.Client) void {
         _ = self.disconnects.fetchAdd(1, .release);
-        const connection: *Connection = @ptrCast(@alignCast(session.userData() orelse return));
-        session.setUserData(null);
+        const connection: *Connection = @ptrCast(@alignCast(client.user orelse return));
+        client.user = null;
         if (self.held == connection) self.held = null;
         for (self.connections.items, 0..) |item, i| if (item == connection) {
             _ = self.connections.swapRemove(i);
@@ -600,13 +551,12 @@ pub const Backend = struct {
         gpa.destroy(connection);
     }
 
-    fn onMessage(context: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-        const self: *Backend = @ptrCast(@alignCast(context));
-        const connection: *Connection = @ptrCast(@alignCast(session.userData() orelse return error.ApplicationFailure));
-        self.handle(connection, session, payload.bytes) catch return error.ApplicationFailure;
+    pub fn message(self: *Backend, client: *net.Server.Client, frame: []const u8) !void {
+        const connection: *Connection = @ptrCast(@alignCast(client.user orelse return error.UnknownClient));
+        try self.handle(connection, client, frame);
     }
 
-    fn handle(self: *Backend, connection: *Connection, carrier: *raknet.Session, frame: []const u8) !void {
+    fn handle(self: *Backend, connection: *Connection, carrier: *net.Server.Client, frame: []const u8) !void {
         const session = &connection.session;
         var packets = try session.ingest(frame);
         defer packets.deinit();
@@ -662,17 +612,9 @@ pub const Backend = struct {
                     try sendFrame(session, carrier, &.{try typedPacket(&buffer, .{ .play_status = .{ .status = .loginfailed_serverold } })});
                     return;
                 }
-                const salt: [16]u8 = @splat(7);
-                const token = try bedwire.auth.login.serverHandshake(gpa, connection.key, salt, limits);
-                defer gpa.free(token);
-                const storage = try gpa.alloc(u8, token.len + 16);
-                defer gpa.free(storage);
-                try sendFrame(session, carrier, &.{try typedPacket(storage, .{ .server_to_client_handshake = .{ .handshake_web_token = token } })});
-                try session.installServerCrypto(connection.key.secret_key, salt);
-            },
-            .client_to_server_handshake => {
+                // NetherNet has no encryption handshake, the login is done
                 try session.advance(.resource_packs);
-                _ = self.handshakes.fetchAdd(1, .release);
+                _ = self.admitted.fetchAdd(1, .release);
                 const status = try typedPacket(&buffer, .{ .play_status = .{ .status = .loginsuccess } });
                 if (self.mode == .silent_stack) return sendFrame(session, carrier, &.{status});
                 var stack: [128]u8 = undefined;

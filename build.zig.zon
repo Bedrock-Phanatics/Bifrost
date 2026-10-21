@@ -4,13 +4,13 @@
     .fingerprint = 0x690b25d757c41963,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .zig_raknet = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/raknet-zig?ref=prod-audit#38b1da97f77311a686cbb2c162b479c80f94e70a",
-            .hash = "zig_raknet-0.3.4-1HPoU_pMDADFUDbUNPXiwXnnKBj9bH1LHhgjFQFdd3KH",
+        .nethernet = .{
+            .url = "git+https://github.com/Bedrock-Phanatics/nethernet-zig#eab6d0e788ea14f4a87a8512aac785593d118f18",
+            .hash = "nethernet-1.3.0-dprTqCiSCgAd8A6Lbs-nCYLicVplrQUArbpN9oQ3uPTE",
         },
         .bedwire = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#6b0057c51948ab3012e581bf5c94cbfc5031cfb7",
-            .hash = "bedwire-0.2.3-6vrYrT2nBgAlHYdQDj470-6WgZX8S114xtxlPiE5jJ8g",
+            .url = "git+https://github.com/Bedrock-Phanatics/bedwire#c10622fbc07ee9667990142b073ea66bbc421a4c",
+            .hash = "bedwire-0.4.0-6vrYrda9EgDrAo5TB4goP82IJzdHu-6fk7pjhy5ef9Y6",
         },
         .zio = .{
             .url = "git+https://github.com/EuroZig/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",
@@ -35,6 +35,7 @@
         "cmake",
         "examples",
         "tests",
+        "tools",
         "README.md",
         "LICENSE",
         "NOTICE",

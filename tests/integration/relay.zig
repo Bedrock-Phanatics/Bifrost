@@ -31,7 +31,6 @@ fn relayBothWays(io: std.Io) !void {
     const large = try gpa.alloc(u8, 20_000);
     defer gpa.free(large);
     for (large, 0..) |*byte, i| byte.* = @truncate(i);
-    large[0] = 0xfe; // RakNet treats low first bytes as control packets
     try player.roundTrip(large);
     player.deinit();
 

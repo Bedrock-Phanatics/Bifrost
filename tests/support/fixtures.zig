@@ -1,11 +1,14 @@
 const std = @import("std");
-const raknet = @import("raknet");
+const nethernet = @import("nethernet");
 const bifrost = @import("bifrost");
+const net = @import("net.zig");
+const oidc_key = @import("oidc_key.zig");
+const sample = @import("sample.zig");
 
 const gpa = std.testing.allocator;
 const IpAddress = std.Io.net.IpAddress;
 
-pub const loopback: IpAddress = .{ .ip4 = .loopback(0) };
+pub const loopback = net.loopback;
 pub const nowhere: IpAddress = .{ .ip4 = .loopback(9) };
 pub const kick = "\xfekick";
 pub const burst = "\xfeburst";
@@ -20,8 +23,24 @@ pub fn config(backends: []const IpAddress) !bifrost.Config {
     return result;
 }
 
-pub fn silent(io: std.Io) !std.Io.net.Socket {
-    return loopback.bind(io, .{ .mode = .dgram, .protocol = .udp });
+/// Takes TCP connections and never answers them, so signaling to it hangs until the dial gives up.
+pub const Silent = struct {
+    server: std.Io.net.Server,
+    address: IpAddress,
+
+    pub fn close(self: Silent, io: std.Io) void {
+        var server = self.server;
+        server.deinit(io);
+    }
+};
+
+pub fn silent(io: std.Io) !Silent {
+    return silentAt(io, loopback);
+}
+
+fn silentAt(io: std.Io, address: IpAddress) !Silent {
+    const server = try address.listen(io, .{ .reuse_address = true });
+    return .{ .server = server, .address = server.socket.address };
 }
 
 pub fn waitFor(io: std.Io, counter: *const std.atomic.Value(u32), value: u32) !void {
@@ -42,12 +61,16 @@ pub fn eventually(io: std.Io, context: anytype, comptime check: fn (@TypeOf(cont
 
 pub const Backend = struct {
     io: std.Io,
-    listener: *raknet.Server,
+    server: net.Server = undefined,
+    serving: bool = false,
+    parked: ?Silent = null,
+    bound: IpAddress = loopback,
     task: ?std.Io.Future(void) = null,
     stopping: std.atomic.Value(bool) = .init(false),
     greeting: ?[]const u8,
     replies: []const []const u8,
     replied: usize = 0,
+    players: std.atomic.Value(u32),
     received: std.atomic.Value(u32) = .init(0),
     connects: std.atomic.Value(u32) = .init(0),
     disconnects: std.atomic.Value(u32) = .init(0),
@@ -55,7 +78,8 @@ pub const Backend = struct {
     burst_bytes: u32,
 
     pub const Options = struct {
-        advertisement: []const u8 = "MCPE;backend",
+        // What its server list status reports
+        players: u32 = 0,
         greeting: ?[]const u8 = null,
         replies: []const []const u8 = &.{},
         serving: bool = true,
@@ -65,98 +89,152 @@ pub const Backend = struct {
     };
 
     pub fn start(self: *Backend, io: std.Io, options: Options) !void {
-        var raknet_config: raknet.Config = .{};
-        raknet_config.session.maximum_queued_outbound_packets = 8192;
         self.* = .{
             .io = io,
-            .listener = try raknet.Server.listen(gpa, io, loopback, .{ .advertisement = options.advertisement, .offline_rate_per_second = 1_000_000, .offline_burst = 1_000_000, .config = raknet_config }),
             .greeting = options.greeting,
             .replies = options.replies,
+            .players = .init(options.players),
             .burst_count = options.burst_count,
             .burst_bytes = options.burst_bytes,
         };
-        errdefer self.listener.destroy();
-        if (options.serving) try self.serve();
+        if (options.serving) return self.serve();
+        // Holds the port so serve() can come back on the same address
+        self.parked = try silent(io);
+        self.bound = self.parked.?.address;
     }
 
     pub fn deinit(self: *Backend) void {
         self.pause();
-        self.listener.destroy();
+        if (self.parked) |parked| parked.close(self.io);
     }
 
     pub fn address(self: *const Backend) IpAddress {
-        return self.listener.localAddress();
+        return self.bound;
     }
 
     pub fn serve(self: *Backend) !void {
+        if (self.serving) return;
+        if (self.parked) |parked| parked.close(self.io);
+        self.parked = null;
+        try self.server.start(gpa, self.io, self.bound, .{ .context = self, .get = status });
+        self.bound = self.server.address();
+        self.serving = true;
         self.stopping.store(false, .release);
         self.task = try self.io.concurrent(run, .{self});
     }
 
+    /// Stops answering and drops everyone, like a crashed server.
     pub fn pause(self: *Backend) void {
-        var task = self.task orelse return;
+        if (!self.serving) return;
         self.stopping.store(true, .release);
-        task.await(self.io);
+        self.server.wakeup.signal(self.io);
+        if (self.task) |*task| task.await(self.io);
         self.task = null;
+        self.server.deinit();
+        self.serving = false;
+    }
+
+    fn status(context: ?*anyopaque) anyerror!nethernet.EndpointServerStatus {
+        const self: *Backend = @ptrCast(@alignCast(context.?));
+        return .{ .name = "backend", .protocol = 1, .version = "1", .level = "test", .players = self.players.load(.monotonic), .max_players = 100, .game_type = 0 };
     }
 
     fn run(self: *Backend) void {
-        while (!self.stopping.load(.acquire)) {
-            _ = self.listener.poll(millis(5), .{
-                .context = self,
-                .connected = onConnected,
-                .message = onMessage,
-                .disconnected = onDisconnected,
-            }) catch {};
-        }
+        while (!self.stopping.load(.acquire)) self.server.poll(50, self);
     }
 
-    fn onConnected(context: *anyopaque, session: *raknet.Session) error{ApplicationFailure}!void {
-        const self: *Backend = @ptrCast(@alignCast(context));
+    pub fn connected(self: *Backend, client: *net.Server.Client) !void {
         _ = self.connects.fetchAdd(1, .release);
-        if (self.greeting) |greeting| session.send(greeting, .reliable_ordered, 0) catch return error.ApplicationFailure;
+        if (self.greeting) |greeting| try client.send(greeting);
     }
 
-    fn onMessage(context: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-        const self: *Backend = @ptrCast(@alignCast(context));
+    pub fn message(self: *Backend, client: *net.Server.Client, payload: []const u8) !void {
         _ = self.received.fetchAdd(1, .release);
-        if (std.mem.eql(u8, payload.bytes, kick)) return session.close();
-        if (std.mem.eql(u8, payload.bytes, burst)) {
-            var message: [64 * 1024]u8 = @splat(0xfe);
+        if (std.mem.eql(u8, payload, kick)) return client.close();
+        if (std.mem.eql(u8, payload, burst)) {
+            var buffer: [64 * 1024]u8 = @splat(0xfe);
             for (0..self.burst_count) |i| {
-                std.mem.writeInt(u32, message[1..5], @intCast(i), .little);
-                session.send(message[0..self.burst_bytes], .reliable_ordered, 0) catch return error.ApplicationFailure;
+                std.mem.writeInt(u32, buffer[1..5], @intCast(i), .little);
+                try client.send(buffer[0..self.burst_bytes]);
             }
             return;
         }
-        var reply = payload.bytes;
+        var reply = payload;
         if (self.replied < self.replies.len) {
             reply = self.replies[self.replied];
             self.replied += 1;
         }
-        session.send(reply, .reliable_ordered, 0) catch return error.ApplicationFailure;
+        // Echoes are best effort, so a closing proxy can still hand over everything it sent
+        client.send(reply) catch {};
     }
 
-    fn onDisconnected(context: *anyopaque, _: *raknet.Session) void {
-        const self: *Backend = @ptrCast(@alignCast(context));
+    pub fn disconnected(self: *Backend, _: *net.Server.Client) void {
         _ = self.disconnects.fetchAdd(1, .release);
     }
 };
 
+/// Dials with a token from the test issuer vouching for `key`.
+pub fn dialAs(io: std.Io, address: IpAddress, key: net.KeyPair) !*net.Connection {
+    const token = try sample.transportToken(gpa, key, std.Io.Clock.real.now(io).toSeconds());
+    defer gpa.free(token);
+    return net.dial(gpa, io, address, .{ .key = key, .token = token });
+}
+
+pub fn identity(io: std.Io) bifrost.NetherNet.KeyPair {
+    return .generate(io);
+}
+
+/// One worker with its own listener, the shape most tests need.
 pub const Running = struct {
     io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: bifrost.NetherNet,
     proxy: *bifrost.Proxy,
+    listener: *bifrost.Listener,
     task: std.Io.Future(void),
     stopped: bool = false,
 
-    pub fn start(self: *Running, io: std.Io, proxy_config: bifrost.Config, options: bifrost.Proxy.Options) !void {
+    pub const Options = struct {
+        auth: bifrost.Auth = .off,
+        admission: ?*bifrost.Admission = null,
+        health: ?*bifrost.Health = null,
+        proxy_key: ?bifrost.Managed.Ecdsa.KeyPair = null,
+        plugins: ?*bifrost.Plugins = null,
+        worker: u32 = 0,
+    };
+
+    pub fn start(self: *Running, io: std.Io, proxy_config: bifrost.Config, options: Options) !void {
         return self.startWith(io, gpa, proxy_config, options);
     }
 
-    pub fn startWith(self: *Running, io: std.Io, allocator: std.mem.Allocator, proxy_config: bifrost.Config, options: bifrost.Proxy.Options) !void {
-        const proxy = try bifrost.Proxy.create(allocator, io, proxy_config, options);
-        errdefer proxy.destroy();
-        self.* = .{ .io = io, .proxy = proxy, .task = try io.concurrent(bifrost.Proxy.run, .{proxy}) };
+    pub fn startWith(self: *Running, io: std.Io, allocator: std.mem.Allocator, proxy_config: bifrost.Config, options: Options) !void {
+        self.io = io;
+        self.allocator = allocator;
+        self.stopped = false;
+        try self.transport.init(allocator, io, .{
+            .identity = identity(io),
+            .issuer_keys = if (options.auth == .verify) oidc_key.jwks_json else null,
+            .connect_timeout_ms = proxy_config.connect_timeout_ms,
+        });
+        errdefer self.transport.deinit();
+        self.proxy = try bifrost.Proxy.create(allocator, io, proxy_config, .{
+            .transport = &self.transport,
+            .auth = options.auth,
+            .admission = options.admission,
+            .health = options.health,
+            .proxy_key = options.proxy_key,
+            .plugins = options.plugins,
+            .worker = options.worker,
+        });
+        errdefer self.proxy.destroy();
+        self.listener = try bifrost.Listener.start(allocator, io, &self.transport, proxy_config.bind, .{ .context = self, .accept = adopt }, .{ .max_negotiations = 64, .max_negotiations_per_ip = 64 });
+        errdefer self.listener.destroy(allocator);
+        self.task = try io.concurrent(bifrost.Proxy.run, .{self.proxy});
+    }
+
+    fn adopt(context: *anyopaque, connection: *bifrost.NetherNet.Connection) void {
+        const self: *Running = @ptrCast(@alignCast(context));
+        self.proxy.adopt(connection) catch connection.destroy();
     }
 
     pub fn stop(self: *Running) void {
@@ -168,11 +246,13 @@ pub const Running = struct {
 
     pub fn deinit(self: *Running) void {
         self.stop();
+        self.listener.destroy(self.allocator);
         self.proxy.destroy();
+        self.transport.deinit();
     }
 
     pub fn address(self: *const Running) IpAddress {
-        return self.proxy.localAddress();
+        return self.listener.localAddress();
     }
 
     pub fn stats(self: *const Running) bifrost.Stats {
@@ -198,7 +278,7 @@ pub const RunningWorkers = struct {
     stopped: bool = false,
 
     pub fn start(self: *RunningWorkers, io: std.Io, workers_config: bifrost.Config) !void {
-        const workers = try bifrost.Workers.create(gpa, io, workers_config, .{});
+        const workers = try bifrost.Workers.create(gpa, io, workers_config, .{ .identity = identity(io) });
         errdefer workers.destroy();
         self.* = .{ .io = io, .workers = workers, .task = try io.concurrent(bifrost.Workers.run, .{workers}) };
     }
@@ -225,23 +305,28 @@ pub const RunningWorkers = struct {
     }
 };
 
+/// A passthrough player, sending raw messages.
 pub const Player = struct {
     io: std.Io,
-    client: *raknet.Client,
+    connection: *net.Connection,
     received: std.ArrayList(u8) = .empty,
-    got_message: bool = false,
 
     pub fn connect(io: std.Io, address: IpAddress) !Player {
-        return .{ .io = io, .client = try raknet.Client.connect(gpa, io, address, .{ .handshake_retry_ms = 10 }) };
+        return .{ .io = io, .connection = try net.dial(gpa, io, address, null) };
+    }
+
+    /// Proves `key` at the transport, as a signed-in client does.
+    pub fn connectAs(io: std.Io, address: IpAddress, key: net.KeyPair) !Player {
+        return .{ .io = io, .connection = try dialAs(io, address, key) };
     }
 
     pub fn deinit(self: *Player) void {
-        self.client.destroy();
+        self.connection.destroy();
         self.received.deinit(gpa);
     }
 
     pub fn send(self: *Player, payload: []const u8) !void {
-        try self.client.send(payload, .reliable_ordered, 0);
+        try self.connection.send(payload, .reliable);
     }
 
     pub fn roundTrip(self: *Player, payload: []const u8) !void {
@@ -250,34 +335,27 @@ pub const Player = struct {
     }
 
     pub fn expect(self: *Player, payload: []const u8) !void {
-        self.got_message = false;
-        const started = std.Io.Clock.awake.now(self.io);
-        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < 4_000) {
-            _ = self.client.poll(millis(10), self, collect) catch |err| switch (err) {
-                error.Timeout => {},
-                else => return err,
-            };
-            if (self.got_message) return std.testing.expectEqualSlices(u8, payload, self.received.items);
-        }
-        return error.NoMessage;
+        try std.testing.expectEqualSlices(u8, payload, try self.next(4_000));
+    }
+
+    /// The next message, copied so it outlives later reads.
+    pub fn next(self: *Player, timeout_ms: i64) ![]const u8 {
+        const message = (try net.receive(self.connection, timeout_ms)) orelse return error.NoMessage;
+        self.received.clearRetainingCapacity();
+        try self.received.appendSlice(gpa, message.data);
+        return self.received.items;
     }
 
     pub fn awaitClosed(self: *Player) !void {
-        const started = std.Io.Clock.awake.now(self.io);
-        while (started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds() < 10_000) {
-            _ = self.client.poll(millis(10), self, collect) catch |err| switch (err) {
-                error.Timeout => {},
-                else => return,
-            };
-            if (self.client.isClosed()) return;
-        }
-        return error.NotClosed;
+        return net.awaitClosed(self.connection);
     }
 
-    fn collect(context: *anyopaque, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
-        const self: *Player = @ptrCast(@alignCast(context));
-        self.received.clearRetainingCapacity();
-        self.received.appendSlice(gpa, payload.bytes) catch return error.ApplicationFailure;
-        self.got_message = true;
+    /// Lets everything already sent arrive first, like a client quitting.
+    pub fn leave(self: *Player) !void {
+        try self.connection.closeGracefully();
+    }
+
+    pub fn isClosed(self: *Player) bool {
+        return net.closed(self.connection);
     }
 };
