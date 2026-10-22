@@ -9,6 +9,7 @@ const Context = struct {
     bedwire: *std.Build.Module,
     zio: *std.Build.Module,
     native_prefix: []const u8,
+    sanitize_thread: bool,
 
     fn module(self: Context, path: []const u8, imports: []const std.Build.Module.Import) *std.Build.Module {
         return self.b.createModule(.{ .root_source_file = self.b.path(path), .target = self.target, .optimize = self.optimize, .imports = imports });
@@ -58,8 +59,9 @@ pub fn build(b: *std.Build) void {
         .zio = undefined,
         .native_prefix = b.option([]const u8, "native-prefix", "Where tools/setup-native installed libdatachannel") orelse
             (b.root.joinString(b.allocator, ".deps/native") catch @panic("out of memory")),
+        .sanitize_thread = b.option(bool, "sanitize-thread", "Instrument Bifrost and nethernet with TSan, see tools/tsan.sh") orelse false,
     };
-    ctx.nethernet = b.dependency("nethernet", .{ .target = ctx.target, .optimize = ctx.optimize, .@"native-prefix" = ctx.native_prefix }).module("nethernet");
+    ctx.nethernet = b.dependency("nethernet", .{ .target = ctx.target, .optimize = ctx.optimize, .@"native-prefix" = ctx.native_prefix, .@"sanitize-thread" = ctx.sanitize_thread }).module("nethernet");
     ctx.bedwire = ctx.dependency("bedwire", "bedwire");
     ctx.zio = ctx.dependency("zio", "zio");
     ctx.bifrost = b.addModule("bifrost", .{
@@ -71,6 +73,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "toml", .module = ctx.dependency("toml", "toml") },
             .{ .name = "bedwire", .module = ctx.bedwire },
         },
+        .sanitize_thread = ctx.sanitize_thread,
     });
     addTracy(ctx);
 
@@ -222,6 +225,8 @@ fn addTests(ctx: Context, plugin: Plugin) void {
         .{ .name = "zio", .module = ctx.zio },
         .{ .name = "bifrost_plugin_h", .module = plugin.header },
     }), .filters = filters });
+    // Plugins stay uninstrumented, a TSan shared library cannot be loaded
+    integration_tests.root_module.sanitize_thread = ctx.sanitize_thread;
     integration_tests.root_module.addAnonymousImport("default_config", .{ .root_source_file = b.path("config/bifrost.toml") });
     integration_tests.root_module.addAnonymousImport("maintenance_manifest", .{ .root_source_file = b.path("examples/maintenance/plugin.toml") });
     integration_tests.root_module.addAnonymousImport("packet_manifest", .{ .root_source_file = b.path("examples/packets/plugin.toml") });

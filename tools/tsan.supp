@@ -1,0 +1,2 @@
+# libdatachannel is not instrumented, so its own locking is invisible to TSan
+race:libdatachannel.so
