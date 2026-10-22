@@ -150,7 +150,9 @@ const Silent = struct {
         var addresses: [8]std.Io.net.IpAddress = undefined;
         for (self.sockets[0..self.len], 0..) |socket, i| addresses[i] = socket.address;
         @memcpy(addresses[self.len..][0..live.len], live);
-        return fixtures.config(addresses[0 .. self.len + live.len]);
+        var result = try fixtures.config(addresses[0 .. self.len + live.len]);
+        result.connect_timeout_ms = fixtures.dead_timeout_ms;
+        return result;
     }
 };
 
@@ -202,7 +204,9 @@ test "a healthy backend is still tried after several others fail their dials" {
     defer running.deinit();
     var player: Player = try .connect(io, running.address());
     defer player.deinit();
-    try player.roundTrip("þhello");
+    try player.send("þhello");
+    // Three dials time out first, each after the full connect timeout
+    try std.testing.expectEqualSlices(u8, "þhello", try player.next(20_000));
 
     running.stop();
     try std.testing.expectEqual(@as(u32, 1), backends[3].connects.load(.acquire));

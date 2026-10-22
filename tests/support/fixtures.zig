@@ -17,8 +17,13 @@ pub fn millis(ms: i64) std.Io.Timeout {
     return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
 }
 
+// A dial signs and verifies P-384 several times, which Debug builds do about 150 times slower
+pub const connect_timeout_ms: u32 = if (@import("builtin").mode == .debug) 5_000 else 500;
+// For backends that never answer, where only the timeout ends the dial
+pub const dead_timeout_ms: u32 = 500;
+
 pub fn config(backends: []const IpAddress) !bifrost.Config {
-    var result: bifrost.Config = .{ .bind = loopback, .max_players = 8, .connect_timeout_ms = 500 };
+    var result: bifrost.Config = .{ .bind = loopback, .max_players = 8, .connect_timeout_ms = connect_timeout_ms };
     for (backends) |backend| try result.addBackend(null, backend);
     return result;
 }
