@@ -25,7 +25,7 @@ pub const Rig = struct {
         b_content: sample.Content = .{},
         content_policy: @FieldType(bifrost.Config, "content_policy") = .initial,
         target: ?IpAddress = null,
-        connect_timeout_ms: u32 = 500,
+        connect_timeout_ms: u32 = fixtures.connect_timeout_ms,
         phase_timeout_ms: u32 = 5_000,
         timeout_ms: u32 = 15_000,
         cache: ?bool = null,
@@ -40,14 +40,10 @@ pub const Rig = struct {
         const proxy_key = try managed.proxyKey(1);
         self.keys = try managed.keySet();
         errdefer self.keys.deinit();
-        try self.a.start(io, proxy_key.public_key);
+        try self.a.startAs(io, proxy_key.public_key, options.a, options.a_content);
         errdefer self.a.deinit();
-        try self.b.start(io, proxy_key.public_key);
+        try self.b.startAs(io, proxy_key.public_key, options.b, options.b_content);
         errdefer self.b.deinit();
-        self.a.mode = options.a;
-        self.b.mode = options.b;
-        self.a.content = options.a_content;
-        self.b.content = options.b_content;
         var proxy_config = try managed.config(&.{ self.a.address(), options.target orelse self.b.address() });
         proxy_config.connect_timeout_ms = options.connect_timeout_ms;
         proxy_config.transfer_phase_timeout_ms = options.phase_timeout_ms;

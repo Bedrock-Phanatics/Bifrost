@@ -1511,11 +1511,14 @@ test "native plugins are discovered in filename order, skipping disabled ones" {
     const before = shutdowns();
 
     var plugins: bifrost.Plugins = try .init(gpa, &.{}, .{});
-    try bifrost.Plugins.Package.discover(&plugins, io, files.root, &.{"d-off"});
-    try std.testing.expectEqual(@as(usize, 3), plugins.loaded.items.len);
-    for ([_][]const u8{ "cpp-fixture", "c-fixture", "maintenance" }, [_][]const u8{ "A-Cpp", "B-C", "C-Zig" }, 0..) |name, dir, i| {
-        try std.testing.expectEqualStrings(name, plugins.metadata(i).name());
-        try std.testing.expectEqualStrings(dir, std.fs.path.stem(plugins.metadata(i).package));
+    {
+        errdefer plugins.deinit();
+        try bifrost.Plugins.Package.discover(&plugins, io, files.root, &.{"d-off"});
+        try std.testing.expectEqual(@as(usize, 3), plugins.loaded.items.len);
+        for ([_][]const u8{ "cpp-fixture", "c-fixture", "maintenance" }, [_][]const u8{ "A-Cpp", "B-C", "C-Zig" }, 0..) |name, dir, i| {
+            try std.testing.expectEqualStrings(name, plugins.metadata(i).name());
+            try std.testing.expectEqualStrings(dir, std.fs.path.stem(plugins.metadata(i).package));
+        }
     }
     plugins.deinit();
     try std.testing.expectEqual(before + 1, shutdowns());

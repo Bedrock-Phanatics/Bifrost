@@ -405,6 +405,11 @@ pub const Backend = struct {
     }
 
     pub fn start(self: *Backend, io: std.Io, trusted: Ecdsa.PublicKey) !void {
+        return self.startAs(io, trusted, .normal, .{});
+    }
+
+    // Set before the poll task starts, which reads them
+    pub fn startAs(self: *Backend, io: std.Io, trusted: Ecdsa.PublicKey, mode: Mode, content: sample.Content) !void {
         const pool = try gpa.create(bedwire.BufferPool);
         errdefer gpa.destroy(pool);
         pool.* = try .init(gpa, limits, .{ .rx_slots = 4, .tx_slots = 4 });
@@ -413,6 +418,8 @@ pub const Backend = struct {
             .io = io,
             .pool = pool,
             .trusted = trusted,
+            .mode = mode,
+            .content = content,
         };
         try self.server.start(gpa, io, net.loopback, null);
         errdefer self.server.deinit();
