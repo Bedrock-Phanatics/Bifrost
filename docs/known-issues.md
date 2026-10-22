@@ -7,8 +7,8 @@ What's open as of 2.0.0-rc.2. Details live in the linked docs.
 - **No real client has joined through Bifrost.** Every test uses in-process players and backends built on bedwire
   and nethernet-zig. Neither a vanilla Bedrock client joining Bifrost nor a full Bifrost-to-Quark session has
   been run. The Quark login path was checked by verifying a bedwire-built login with Quark's own code.
-- **No sanitizer runs yet.** The full suite passes on Windows and Linux in Debug and ReleaseSafe, but nothing has
-  been run under ThreadSanitizer or AddressSanitizer since the NetherNet switch.
+- **No AddressSanitizer run.** The full suite passes on Windows and Linux in Debug, ReleaseSafe and ReleaseFast,
+  and under ThreadSanitizer on Linux (`tools/tsan.sh`), which only instruments the Zig code.
 - **`udp_mux` hasn't been tried with vanilla clients** (`config/bifrost.toml`).
 - **Other backends:** gophertunnel servers and vanilla BDS have no way to trust a proxy, and neither was tested.
   See [Backend support](backends.md).
