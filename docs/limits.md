@@ -36,6 +36,7 @@ A handshake over these limits gets HTTP 503 before any WebRTC state is created. 
 | what | scope | limit | default |
 |---|---|---|---|
 | packets waiting for a backend dial, the managed login or a transfer target | per player | `pending_packets` / `pending_bytes` | 64 / 1 MiB |
+| room past that for the batch a transfer target already has in flight | per transfer | fixed | 1024 packets / 4 MiB |
 | the same queues, all players together | whole proxy | `total_pending_bytes` | 256 MiB |
 | one NetherNet message | per connection | fixed | 2 MiB |
 | received messages not yet read | per connection | fixed | 512 KiB / 512 messages |
@@ -81,8 +82,9 @@ The other way works the same: a backend that falls 1 MiB behind stops Bifrost re
 never fail for lack of room, because reading always stops before the native send buffer could fill. A link
 waiting on one side is woken by the transport the moment that side drains, nothing polls for it.
 
-During a transfer, what the target sends waits until the client is in its dimension. Once that hold is half
-full the target isn't read either, so its own flow control slows it down instead of the transfer failing.
+During a transfer, what the target sends waits until the client is in its dimension. Once that hold reaches
+`pending_bytes` the target isn't read either, so its own flow control slows it down instead of the transfer
+failing, and the batch already on its way still fits.
 
 Closing a connection waits, for up to 2 s, until the far end has acknowledged everything already sent, so a
 Disconnect reason or a player's last packets still arrive at the proxy and go on to the backend. A receive queue

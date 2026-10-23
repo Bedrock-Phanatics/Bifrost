@@ -7,6 +7,9 @@ bytes: std.ArrayList(u8) = .empty,
 lengths: std.ArrayList(u32) = .empty,
 max_packets: usize,
 max_bytes: usize,
+// Kept free past nearlyFull, so a batch already on its way still fits
+reserve_packets: usize = 0,
+reserve_bytes: usize = 0,
 budget: ?*Budget = null,
 
 pub fn push(self: *Queue, gpa: std.mem.Allocator, packet: []const u8) !void {
@@ -18,9 +21,8 @@ pub fn push(self: *Queue, gpa: std.mem.Allocator, packet: []const u8) !void {
     self.lengths.appendAssumeCapacity(@intCast(packet.len));
 }
 
-// Half the limits, so a batch still fits after the sender is told to wait.
 pub fn nearlyFull(self: *const Queue) bool {
-    return self.lengths.items.len >= self.max_packets / 2 or self.bytes.items.len >= self.max_bytes / 2;
+    return self.lengths.items.len + self.reserve_packets >= self.max_packets or self.bytes.items.len + self.reserve_bytes >= self.max_bytes;
 }
 
 pub fn slices(self: *const Queue, out: [][]const u8) []const []const u8 {
@@ -58,9 +60,9 @@ test "held packets count against the shared budget until cleared" {
     try queue.push(gpa, "ab");
 }
 
-test "nearly full means half the packets or half the bytes" {
+test "nearly full leaves the reserve free" {
     const gpa = std.testing.allocator;
-    var queue: Queue = .{ .max_packets = 4, .max_bytes = 16 };
+    var queue: Queue = .{ .max_packets = 4, .max_bytes = 16, .reserve_packets = 2, .reserve_bytes = 8 };
     defer queue.deinit(gpa);
     try queue.push(gpa, "a");
     try std.testing.expect(!queue.nearlyFull());

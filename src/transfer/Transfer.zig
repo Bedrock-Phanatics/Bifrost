@@ -25,6 +25,7 @@ const log = std.log.scoped(.transfer);
 
 const max_messages_per_turn = 64;
 const max_queued_packets = 256;
+const max_held_packets = max_queued_packets + Managed.limits.max_packets_per_batch;
 
 pub const Host = struct {
     gpa: std.mem.Allocator,
@@ -91,7 +92,13 @@ pub fn create(host: Host, target: Backend.Id, address: std.Io.net.IpAddress, epo
         .state = .init(epoch, settings.limits, now(host.io)),
         .target = target,
         .upstream = try .init(host.managed.shared),
-        .queue = .{ .max_packets = @min(settings.queue_packets, max_queued_packets), .max_bytes = settings.queue_bytes, .budget = settings.budget },
+        .queue = .{
+            .max_packets = @min(settings.queue_packets, max_queued_packets) + Managed.limits.max_packets_per_batch,
+            .max_bytes = settings.queue_bytes + Managed.limits.max_batch_bytes,
+            .reserve_packets = Managed.limits.max_packets_per_batch,
+            .reserve_bytes = Managed.limits.max_batch_bytes,
+            .budget = settings.budget,
+        },
         .content_policy = settings.content_policy,
         .managed = host.managed,
     };
@@ -351,7 +358,7 @@ fn commit(self: *Transfer, host: Host) !void {
 fn release(self: *Transfer, host: Host) !void {
     const managed = host.managed;
     managed.hold = null;
-    var slices: [max_queued_packets][]const u8 = undefined;
+    var slices: [max_held_packets][]const u8 = undefined;
     const skipped = try managed.deliver(host.ends(), self.queue.slices(&slices));
     if (skipped != 0) log.debug("transfer {d}: held back {d} world packets for client sync", .{ self.state.epoch, skipped });
     self.queue.clear();

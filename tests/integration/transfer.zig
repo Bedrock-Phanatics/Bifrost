@@ -158,15 +158,15 @@ test "target packets sent before the switch reach the player after it" {
     try rig.expectOn(&rig.b);
 }
 
-test "a target that overflows the queue is rolled back and its packets dropped" {
+test "a target that floods before the switch is held, not rolled back" {
     var rig: Rig = undefined;
     try rig.start(.{ .b = .flood });
     defer rig.deinit();
 
     try rig.transfer(1);
-    try rig.waitFor(.transfers_failed_before_commit, 1);
-    try std.testing.expectEqual(@as(usize, 0), try rig.player.countGamePackets("flood", 200));
-    try rig.expectOn(&rig.a);
+    try rig.waitFor(.transfers_committed, 1);
+    try std.testing.expectEqual(@as(usize, 300), try rig.player.countGamePackets("flood", 500));
+    try rig.expectOn(&rig.b);
 }
 
 test "an allocation failure anywhere in a transfer fails cleanly" {
