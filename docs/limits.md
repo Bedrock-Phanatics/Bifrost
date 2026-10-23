@@ -80,7 +80,7 @@ behind after `slow_player_timeout_ms` (5 s) is disconnected with "Connection too
 
 The other way works the same: a backend that falls 1 MiB behind stops Bifrost reading from its player. Sends
 never fail for lack of room, because reading always stops before the native send buffer could fill. A link
-waiting on one side is woken by the transport the moment that side drains, nothing polls for it.
+waiting on one side is woken by the transport the moment that side drains to half, nothing polls for it.
 
 During a transfer, what the target sends waits until the client is in its dimension. Once that hold reaches
 `pending_bytes` the target isn't read either, so its own flow control slows it down instead of the transfer

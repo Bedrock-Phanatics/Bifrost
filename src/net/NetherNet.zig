@@ -60,6 +60,7 @@ pub fn init(self: *NetherNet, gpa: std.mem.Allocator, io: std.Io, settings: Sett
             .queue_bytes = 512 * 1024,
             // A reliable send never fails for space as long as callers stop at backlog_bytes
             .maximum_buffered_send = backlog_bytes + max_message_bytes + nethernet.framing.maximum_segments,
+            .buffered_amount_low_threshold = backlog_bytes / 2,
             .port_range_begin = settings.port_min,
             .port_range_end = settings.port_max,
             .enable_ice_udp_mux = settings.udp_mux,
