@@ -160,10 +160,37 @@ test "a leaving player's last packets all reach the proxy and go on to the backe
     try player.roundTrip("\xfehello");
     var payload: [8000]u8 = @splat(7);
     payload[0] = 0xfe;
-    // Under the receive queue's pause point: a peer that closes while reading is paused loses what was paused
     const burst = 20;
     for (0..burst) |_| try player.send(&payload);
     try player.leave();
+
+    try running.waitForStat(.messages_to_backend, burst + 1);
+    try fixtures.waitFor(io, &backend.disconnects, 1);
+    try std.testing.expectEqual(@as(u32, burst + 1), backend.received.load(.acquire));
+}
+
+// Reading pauses once the receive queue has less than 256 KiB free; what SCTP accepted meanwhile used to go down with the connection
+test "a leaving player's packets still arrive when the proxy had paused reading them" {
+    var backend: Backend = undefined;
+    try backend.start(io, .{});
+    defer backend.deinit();
+    var running: Running = undefined;
+    var proxy_config = try fixtures.config(&.{backend.address()});
+    proxy_config.connect_timeout_ms = 60_000;
+    try running.start(io, proxy_config, .{});
+    defer running.deinit();
+
+    var player: Player = try .connect(io, running.address());
+    defer player.deinit();
+    try player.roundTrip("þhello");
+    // The worker takes this every turn, so holding it stalls the worker
+    running.proxy.mailbox_mutex.lockUncancelable(io);
+    var payload: [8000]u8 = @splat(7);
+    payload[0] = 0xfe;
+    const burst = 100;
+    for (0..burst) |_| try player.send(&payload);
+    try player.leave();
+    running.proxy.mailbox_mutex.unlock(io);
 
     try running.waitForStat(.messages_to_backend, burst + 1);
     try fixtures.waitFor(io, &backend.disconnects, 1);

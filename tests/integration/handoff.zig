@@ -182,6 +182,27 @@ test "a target spawn before the client acks waits for the ack" {
     try std.testing.expectEqual(@as(usize, 2), rig.player.received(.level_chunk));
 }
 
+test "a target that floods during the switch is paused, not failed" {
+    var rig: Rig = undefined;
+    try rig.start(.{ .b = .chatter });
+    defer rig.deinit();
+    rig.player.hold_acks = true;
+
+    try rig.transfer(1);
+    try waitForChanges(&rig, 1);
+    try pumpFor(rig.player, 2_000);
+    try std.testing.expect(rig.stats().backlog_pauses >= 1);
+    try std.testing.expectEqual(@as(u64, 0), rig.stats().transfers_failed_after_commit);
+
+    try rig.player.releaseAcks();
+    try rig.waitFor(.transfers_committed, 1);
+    try std.testing.expect(try rig.player.countGamePackets("chatter", 300) >= 128);
+    const echoes = rig.b.echoes.load(.acquire);
+    var buffer: [32]u8 = undefined;
+    try rig.player.send(&.{try managed.rawPacket(&buffer, managed.game_packet_id, "still here")});
+    try fixtures.waitFor(io, &rig.b.echoes, echoes + 1);
+}
+
 test "a target that spawns before sending its world still lands once" {
     var rig: Rig = undefined;
     try rig.start(.{ .b = .spawn_first });

@@ -384,7 +384,7 @@ fn pumpBackend(self: *Link) void {
     var drained = false;
     var paused = false;
     for (0..max_messages_per_turn) |_| {
-        if (self.playerBacklogged()) {
+        if (self.stalled()) {
             paused = true;
             break;
         }
@@ -400,7 +400,7 @@ fn pumpBackend(self: *Link) void {
         return self.fail(err);
     }
     if (self.transfer) |transfer| if (self.session) |*session| transfer.syncClient(self.transferHost(session)) catch |err| return self.fail(err);
-    if (paused) return self.pause();
+    if (paused and self.stalled()) return self.pause();
     self.backlogged_since_ms = null;
     self.env.scheduler.unpark(self);
     if (!drained) self.env.scheduler.schedule(self);
@@ -422,6 +422,14 @@ fn pause(self: *Link) void {
         self.env.stats.bump(.backlog_pauses, 1);
     }
     self.env.scheduler.park(self);
+}
+
+// Not reading the backend lets its own flow control slow it down.
+fn stalled(self: *Link) bool {
+    if (self.playerBacklogged()) return true;
+    const managed = self.managed orelse return false;
+    const hold = managed.hold orelse return false;
+    return hold.nearlyFull();
 }
 
 pub fn playerBacklogged(self: *Link) bool {

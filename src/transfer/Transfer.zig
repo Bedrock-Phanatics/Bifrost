@@ -166,7 +166,8 @@ pub fn service(self: *Transfer, host: Host) error{Canceled}!Result {
             log.info("transfer {d}: target failed: {t}", .{ self.state.epoch, err });
             self.seen.failed = true;
         };
-        if (self.seen.failed) break;
+        // Once the world is in, the link reads the target with backpressure
+        if (self.seen.failed or self.worldSeen(host.managed)) break;
     }
     self.settle(host);
     if (self.result != .running or self.client == null) return self.result;
@@ -178,8 +179,7 @@ fn settle(self: *Transfer, host: Host) void {
     if (self.seen.failed) return self.on(host, .target_failed);
     if (self.seen.logged_in and self.state.phase == .logging_in) self.on(host, .logged_in);
     const managed = host.managed;
-    const complete = self.seen.world or self.target_registries.covers(&managed.initial_registries);
-    if (self.seen.started and complete and self.state.phase == .joining) {
+    if (self.worldSeen(managed) and self.state.phase == .joining) {
         if (self.incompatibility(managed)) |mismatch| {
             self.mismatch = mismatch;
             switch (mismatch) {
@@ -190,6 +190,10 @@ fn settle(self: *Transfer, host: Host) void {
         }
         self.on(host, .target_ready);
     }
+}
+
+fn worldSeen(self: *const Transfer, managed: *const Managed) bool {
+    return self.seen.started and (self.seen.world or self.target_registries.covers(&managed.initial_registries));
 }
 
 fn incompatibility(self: *const Transfer, managed: *const Managed) ?content.Mismatch {

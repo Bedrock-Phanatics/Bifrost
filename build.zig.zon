@@ -1,12 +1,12 @@
 .{
     .name = .bifrost,
-    .version = "2.0.0-rc.2",
+    .version = "2.0.0-rc.3",
     .fingerprint = 0x690b25d757c41963,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .nethernet = .{
-            .url = "git+https://github.com/Bedrock-Phanatics/nethernet-zig#d371285aff1dbaee615048b3a167e3c630b562a5",
-            .hash = "nethernet-1.4.0-dprTqMzNCgA2U-yR-wDab1N1qYnFs5imB7wXo4wHfwaz",
+            .url = "git+https://github.com/Bedrock-Phanatics/nethernet-zig#206a40a7c707336ce26865ae66efd43c28c878d7",
+            .hash = "nethernet-1.4.0-dprTqKPwCgDoKYVL2l_itSOlAIod6ak1VwSrYuxA6bG2",
         },
         .bedwire = .{
             .url = "git+https://github.com/Bedrock-Phanatics/bedwire#a6678d0c8cd8c56b28063129532c69fb12552c1c",

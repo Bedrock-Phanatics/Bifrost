@@ -1,6 +1,6 @@
 # Known issues
 
-What's open as of 2.0.0-rc.2. Details live in the linked docs.
+What's open as of 2.0.0-rc.3. Details live in the linked docs.
 
 ## Not yet verified
 
@@ -12,12 +12,6 @@ What's open as of 2.0.0-rc.2. Details live in the linked docs.
 - **`udp_mux` hasn't been tried with vanilla clients** (`config/bifrost.toml`).
 - **Other backends:** gophertunnel servers and vanilla BDS have no way to trust a proxy, and neither was tested.
   See [Backend support](backends.md).
-
-## Bugs
-
-- **A close while SCTP reading is paused drops what SCTP still held.** Reading pauses when a receive queue has
-  less than 256 KiB free. Players who stay connected aren't affected. See
-  [Resource limits](limits.md#backpressure).
 
 ## Limits of the design
 

@@ -40,6 +40,7 @@ A handshake over these limits gets HTTP 503 before any WebRTC state is created. 
 | one NetherNet message | per connection | fixed | 2 MiB |
 | received messages not yet read | per connection | fixed | 512 KiB / 512 messages |
 | messages sent but not yet taken by the peer | per connection | fixed | 1 MiB, then reading stops (see below) |
+| what SCTP had accepted when the peer closed while reading was paused | per connection | fixed | 1 MiB / 1024 messages |
 | Bedwire buffer pools | per worker | fixed, sized by the packet limits | 2.5 MiB for the passthrough observer |
 | plugin messages, posts, actions and injections | whole proxy / per plugin | fixed | 1024 / 256 items |
 | copied injection payloads | whole proxy / per plugin | fixed | 4 MiB / 1 MiB |
@@ -80,10 +81,13 @@ The other way works the same: a backend that falls 1 MiB behind stops Bifrost re
 never fail for lack of room, because reading always stops before the native send buffer could fill. A link
 waiting on one side is woken by the transport the moment that side drains, nothing polls for it.
 
+During a transfer, what the target sends waits until the client is in its dimension. Once that hold is half
+full the target isn't read either, so its own flow control slows it down instead of the transfer failing.
+
 Closing a connection waits, for up to 2 s, until the far end has acknowledged everything already sent, so a
-Disconnect reason or a player's last packets still arrive at the proxy and go on to the backend. One gap remains in the transport. A
-receive queue with less than 256 KiB free stops SCTP reading, and if the far end closes while reading is stopped,
-what SCTP still held is dropped with the connection. It doesn't affect players that stay connected.
+Disconnect reason or a player's last packets still arrive at the proxy and go on to the backend. A receive queue
+with less than 256 KiB free stops SCTP reading; if the far end closes meanwhile, what SCTP had already accepted is
+handed over on the close and read before the connection is let go, so a peer's last packets never go down with it.
 
 ## Diagnostics
 
