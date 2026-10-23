@@ -28,6 +28,14 @@ pub const Settings = struct {
 };
 
 pub const max_ice_servers = 4;
+// Backends check the token's age against its 60 s life, so reuse stays well under that
+const token_reuse_s = 20;
+
+const Token = struct {
+    mutex: std.Io.Mutex = .init,
+    text: []u8 = &.{},
+    issued: i64 = 0,
+};
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -36,6 +44,7 @@ dial_identity: KeyPair,
 issuer: ?nethernet.identity_issuer.Keys,
 native: @FieldType(nethernet.ConnectionOptions, "native"),
 connect_timeout_ms: u32,
+token: *Token,
 // libdatachannel reads these on every new peer, so they live as long as the transport
 ice_bind: [64:0]u8 = @splat(0),
 ice_urls: [max_ice_servers][256:0]u8 = @splat(@splat(0)),
@@ -48,6 +57,9 @@ pub fn init(self: *NetherNet, gpa: std.mem.Allocator, io: std.Io, settings: Sett
         try .init(gpa, json, nethernet.identity_issuer.minecraft_issuer, nethernet.identity_issuer.minecraft_audience)
     else
         null;
+    errdefer if (issuer) |keys| keys.deinit();
+    const token = try gpa.create(Token);
+    token.* = .{};
     self.* = .{
         .gpa = gpa,
         .io = io,
@@ -66,6 +78,7 @@ pub fn init(self: *NetherNet, gpa: std.mem.Allocator, io: std.Io, settings: Sett
             .enable_ice_udp_mux = settings.udp_mux,
         },
         .connect_timeout_ms = settings.connect_timeout_ms,
+        .token = token,
     };
     errdefer self.deinit();
     if (settings.ice_bind) |address| {
@@ -84,6 +97,8 @@ pub fn init(self: *NetherNet, gpa: std.mem.Allocator, io: std.Io, settings: Sett
 pub fn deinit(self: *NetherNet) void {
     if (self.issuer) |keys| keys.deinit();
     self.issuer = null;
+    self.gpa.free(self.token.text);
+    self.gpa.destroy(self.token);
 }
 
 pub fn verifies(self: *const NetherNet) bool {
@@ -109,7 +124,7 @@ fn verify(context: ?*anyopaque, token: []const u8) anyerror!?nethernet.sdp_ident
 pub fn dial(self: *const NetherNet, address: std.Io.net.IpAddress) !*Connection {
     var origin_buffer: [64]u8 = undefined;
     const origin = try std.fmt.bufPrint(&origin_buffer, "http://{f}", .{address});
-    const token = try nethernet.identity.serverToken(self.gpa, self.dial_identity, std.Io.Clock.real.now(self.io).toSeconds());
+    const token = try self.dialToken(std.Io.Clock.real.now(self.io).toSeconds());
     defer self.gpa.free(token);
     var id: [8]u8 = undefined;
     self.io.random(&id);
@@ -121,6 +136,20 @@ pub fn dial(self: *const NetherNet, address: std.Io.net.IpAddress) !*Connection 
         .allow_anonymous = true,
         .identity = .{ .key = self.dial_identity, .token = token, .domain = "bifrost" },
     });
+}
+
+// One P-384 signature per dial otherwise, and dials run on several tasks at once
+fn dialToken(self: *const NetherNet, now: i64) ![]u8 {
+    const cache = self.token;
+    cache.mutex.lockUncancelable(self.io);
+    defer cache.mutex.unlock(self.io);
+    if (cache.text.len == 0 or now < cache.issued or now - cache.issued >= token_reuse_s) {
+        const fresh = try nethernet.identity.serverToken(self.gpa, self.dial_identity, now);
+        self.gpa.free(cache.text);
+        cache.text = fresh;
+        cache.issued = now;
+    }
+    return self.gpa.dupe(u8, cache.text);
 }
 
 /// The UDP address ICE settled on, if libdatachannel can tell.
