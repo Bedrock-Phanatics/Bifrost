@@ -1,6 +1,6 @@
 # Known issues
 
-What's open as of 2.0.0-rc.3. Details live in the linked docs.
+What's open as of 2.0.0-rc.4. Details live in the linked docs.
 
 ## Not yet verified
 
