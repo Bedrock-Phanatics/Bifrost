@@ -169,7 +169,6 @@ test "a leaving player's last packets all reach the proxy and go on to the backe
     try std.testing.expectEqual(@as(u32, burst + 1), backend.received.load(.acquire));
 }
 
-// Reading pauses once the receive queue has less than 256 KiB free; what SCTP accepted meanwhile used to go down with the connection
 test "a leaving player's packets still arrive when the proxy had paused reading them" {
     var backend: Backend = undefined;
     try backend.start(io, .{});
@@ -182,7 +181,7 @@ test "a leaving player's packets still arrive when the proxy had paused reading 
 
     var player: Player = try .connect(io, running.address());
     defer player.deinit();
-    try player.roundTrip("þhello");
+    try player.roundTrip("\xfehello");
     // The worker takes this every turn, so holding it stalls the worker
     running.proxy.mailbox_mutex.lockUncancelable(io);
     var payload: [8000]u8 = @splat(7);

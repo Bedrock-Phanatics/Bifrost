@@ -647,7 +647,8 @@ fn onBackendMessage(self: *Link, message: NetherNet.Message) void {
     defer self.publishState();
     if (self.session == null) return;
     const session = &self.session.?;
-    if (session.closing_since_ms != null) return;
+    // A gone player can't take this, but what it sent last still drains to the backend.
+    if (!session.open()) return;
     const payload = message.data;
     if (message.reliability != .reliable) {
         if (self.managed == null) session.sendAs(payload, .unreliable) catch self.closeSession() else self.env.stats.bump(.unreliable_dropped, 1);
