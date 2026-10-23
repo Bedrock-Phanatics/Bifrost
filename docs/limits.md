@@ -90,6 +90,8 @@ Closing a connection waits, for up to 2 s, until the far end has acknowledged ev
 Disconnect reason or a player's last packets still arrive at the proxy and go on to the backend. A receive queue
 with less than 256 KiB free stops SCTP reading; if the far end closes meanwhile, what SCTP had already accepted is
 handed over on the close and read before the connection is let go, so a peer's last packets never go down with it.
+Stopping the proxy tells managed players "Proxy shutting down" and gives every connection the same 2 s to
+drain before it is closed.
 
 ## Diagnostics
 

@@ -4,6 +4,7 @@ const Config = @import("../config/Config.zig");
 const Health = @import("../backend/Health.zig");
 const Router = @import("../backend/Router.zig");
 const NetherNet = @import("../net/NetherNet.zig");
+const Peer = @import("../net/Peer.zig");
 const Observer = @import("../protocol/Observer.zig");
 const Managed = @import("../session/Managed.zig");
 const proxy_key = @import("../session/proxy_key.zig");
@@ -288,7 +289,25 @@ pub fn stop(self: *Proxy) void {
 pub fn run(self: *Proxy) void {
     self.env.events.proxyStarted();
     while (!self.stop_requested.load(.acquire)) self.turn();
+    self.drain();
     self.closeAll();
+}
+
+// Players hear why and their last packets get through, a dead peer can't hold this up for long
+fn drain(self: *Proxy) void {
+    for (self.links.values()) |link| _ = link.disconnect("Proxy shutting down");
+    const deadline_ms = nowMs(self.io) + Peer.drain_timeout_ms;
+    while (self.links.count() != 0) {
+        const now_ms = nowMs(self.io);
+        if (now_ms >= deadline_ms) return;
+        self.scheduler.wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(@min(deadline_ms - now_ms, 100)), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => return,
+        };
+        self.scheduler.wake.reset();
+        for (self.links.values()) |link| self.scheduler.schedule(link);
+        self.serviceReady() catch return;
+    }
 }
 
 fn turn(self: *Proxy) void {

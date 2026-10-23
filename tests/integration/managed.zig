@@ -257,6 +257,21 @@ test "stopping the proxy frees managed links in every state" {
     try joining.awaitClosed();
 }
 
+test "stopping tells managed players why before closing them" {
+    var setup: Setup = undefined;
+    try setup.start(try trusted());
+    defer setup.deinit();
+    const player = try managed.Player.connect(io, setup.running.address(), 2);
+    defer player.destroy();
+    try player.login("Steve", "2535400000000001");
+    try player.spawn();
+
+    setup.running.stop();
+    while (player.received(.disconnect) == 0) try player.pump();
+    try player.awaitClosed();
+    try std.testing.expectEqual(@as(u64, 1), setup.running.stats().links_closed);
+}
+
 test "passthrough ignores the proxy key and relays bytes untouched" {
     var backend: fixtures.Backend = undefined;
     try backend.start(io, .{});
